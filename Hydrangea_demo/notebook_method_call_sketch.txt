@@ -1,0 +1,53 @@
+# Hydrangea object call sketch
+# Human judgement enters at key points: normalization choice, PCA review, fold strategy, K selection, report mode.
+
+# 0. prepare data
+# Notebook context: /notebooks/CumulantDynamicsGuiltByAssociation/test_GonzalezHpSpatialNavTask_dandiset.ipynb
+# Need spike_group, maze_ep, position_xy, and relevant time bins.
+
+obj = HyDan(
+    spike_group=spike_group_maze,
+    bin_size_s=0.050,
+    maze_epoch=maze_ep,
+    random_state=0,
+    report="selected",
+)
+
+# 1. normalization step
+obj.normalize(method="proportion_zscore", zscore=True, restrict_to_epoch=True)
+obj.normalization_report(show=True)
+# Human judgement: decide if binning, epoch restriction, or normalization method is sensible.
+
+# 2. global reduction step
+obj.global_pca(n_components=10, whiten=False, standardize=True)
+obj.pca_report(show=True)
+# Human judgement: decide whether PCA variance is stable, whether to keep more or fewer PCs, whether to inspect another reduction.
+
+# 3. fold construction step
+obj.build_folds(n_folds=5, strategy="temporal_block_randomized", seed=0)
+# Human judgement: decide whether block-shuffled folds are appropriate for the time series.
+
+# 4. HMM fitting step
+obj.fit_hmm(
+    k_values=list(range(10, 1, -1)),
+    n_iter=100,
+    covariance_type="diag",
+    verbose=False,
+    use_cv=True,
+    report="selected",
+)
+# Human judgement: inspect ranked CV scores and choose a working K.
+
+# 5. HMM reporting step
+obj.hmm_report(report="selected")
+# Human judgement: inspect the main model and decide whether to re-run with a different K range or different binning.
+
+# Optional full diagnostic mode
+# obj.hmm_report(report="full")
+# Optional no reporting
+# obj.hmm_report(report="none")
+
+# 6. future step: local_state_embeddings
+# This step is deliberately left empty for now.
+# obj.find_local_embedding_windows(...)
+# Human judgement: choose time windows and local embedding design after examining HMM states.

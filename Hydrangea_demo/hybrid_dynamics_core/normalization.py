@@ -1,0 +1,97 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+class NormalizationStep:
+    """Normalize spike matrix."""
+
+    def normalize(self, method="proportion_zscore", zscore=True, smooth_sigma_bins=None, restrict_to_epoch=True):
+        if restrict_to_epoch and self.maze_epoch is not None:
+            source = self.spike_group.restrict(self.maze_epoch)
+        else:
+            source = self.spike_group
+
+        self._source_spike_group = source
+        self.unit_ids = np.asarray(source.index)
+
+        if len(self.unit_ids) == 0:
+            raise ValueError("No units found in selected spike group.")
+
+        spike_arrays = [source[u].index.values for u in self.unit_ids]
+        t_start = min(s[0] for s in spike_arrays if len(s))
+        t_end = max(s[-1] for s in spike_arrays if len(s))
+        edges = np.arange(t_start, t_end + self.bin_size_s, self.bin_size_s)
+        self.bin_times_s = edges[:-1]
+
+        counts = np.stack([np.histogram(spk, bins=edges)[0] for spk in spike_arrays], axis=1).astype(float)
+
+        if method == "proportion_zscore":
+            neuron_totals = np.array([spk.size for spk in spike_arrays], dtype=float)
+            neuron_totals[neuron_totals == 0] = 1.0
+            prop = counts / neuron_totals[:, None]
+            matrix = prop
+            if zscore:
+                mu = prop.mean(axis=0)
+                sigma = prop.std(axis=0)
+                sigma[sigma == 0] = 1.0
+                matrix = (prop - mu) / sigma
+            self.normalization_method = "proportion_zscore"
+
+        elif method == "count_zscore":
+            matrix = counts
+            if zscore:
+                mu = counts.mean(axis=0)
+                sigma = counts.std(axis=0)
+                sigma[sigma == 0] = 1.0
+                matrix = (counts - mu) / sigma
+            self.normalization_method = "count_zscore"
+
+        elif method == "raw_counts":
+            matrix = counts
+            self.normalization_method = "raw_counts"
+
+        else:
+            raise ValueError(f"Unknown normalization method: {method}")
+
+        if smooth_sigma_bins is not None:
+            from scipy.ndimage import gaussian_filter1d
+            matrix = gaussian_filter1d(matrix, smooth_sigma_bins, axis=0)
+
+        self.spike_matrix = matrix.astype(float)
+        return self.spike_matrix.copy(), self.bin_times_s.copy()
+
+    def normalization_report(self, show=True):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+
+        M = self.spike_matrix
+        fig, ax = plt.subplots(2, 3, figsize=(16, 9))
+
+        ax[0, 0].hist(M.ravel(), bins=100, log=True)
+        ax[0, 0].set(title="Normalized values", xlabel="value", ylabel="count")
+
+        frac_zero = (M == 0).mean(0)
+        ax[0, 1].hist(frac_zero, bins=30)
+        ax[0, 1].set(title="Fraction empty bins", xlabel="P(count=0)", ylabel="count")
+
+        m = M.mean(axis=0)
+        v = M.var(axis=0)
+        ax[0, 2].loglog(m + 1e-3, v + 1e-6, ".", alpha=0.5)
+        lims = [max(m.min() + 1e-3, 1e-3), max(m.max(), 1e-3)]
+        ax[0, 2].plot(lims, lims, "k--", label="var = mean")
+        ax[0, 2].set(title="Mean vs variance", xlabel="mean", ylabel="variance")
+        ax[0, 2].legend()
+
+        ax[1, 0].hist(M.std(axis=0), bins=30)
+        ax[1, 0].set(title="Per-neuron std", xlabel="std", ylabel="count")
+
+        idx = np.argsort(np.abs(M.mean(axis=0)))[len(M.T) // 2]
+        ax[1, 1].hist(M[:, idx], bins=50)
+        ax[1, 1].set(title=f"Example neuron {idx}", xlabel="normalized value", ylabel="count")
+
+        ax[1, 2].axis("off")
+        fig.suptitle(f"Normalization: {self.normalization_method}")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
