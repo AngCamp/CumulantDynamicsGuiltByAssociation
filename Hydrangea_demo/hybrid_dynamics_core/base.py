@@ -1,49 +1,27 @@
 from .normalization import NormalizationStep
-from .global_reduction import GlobalReductionStep
+from .embeddings import EmbeddingStep
 from .hmm_fitting import HMMFittingStep
-from .hmm_report import HMMReportStep
 
 
 class HybridDynamicsAnalysis(
     NormalizationStep,
-    GlobalReductionStep,
+    EmbeddingStep,
     HMMFittingStep,
-    HMMReportStep,
 ):
-    """Pipeline object for spike normalization, reduction, HMM fitting, and reporting.
+    """Pipeline object for session-wide embeddings, HMM fitting, and local state embeddings.
 
     Typical call order:
         hybdyn.normalize(...)
-        hybdyn.global_pca(...)
-        hybdyn.build_folds(...)
+        hybdyn.global_embedding(...)
         hybdyn.fit_hmm(...)
+        hybdyn.local_embedding(...)
+        hybdyn.report_embeddings(...)
         hybdyn.hmm_report(...)
 
-    Parameters
-    ----------
-    spike_group : pynapple object
-        Spike train object passed into the workflow. This may already be a
-        restricted object, or may be a full TsGroup whose metadata and session
-        context are supplied separately.
-    bin_size_s : float
-        Temporal bin width used for spike counts.
-    maze_epoch : pynapple.IntervalSet or None
-        Optional epoch restriction before fitting.
-    unit_metadata : dict or None
-        Optional mapping from metadata names to per-unit arrays or labels
-        (e.g. {"cell_type": ..., "cell_area": ...}). This lets the analysis
-        operate on real session metadata without assuming fixed variable names.
-    unit_id_key : str or None
-        Optional identifier for the unit key column when metadata are provided.
-    region_key : str or None
-        Optional metadata field used to label a region or anatomical group.
-    condition_key : str or None
-        Optional metadata field used to label behavioral or experimental
-        conditions.
-    random_state : int
-        Seed used for reproducible folds and HMM initialisation.
-    report : {'full', 'selected', 'none'}
-        Default reporting mode for Hmm output.
+    The global embedding is the session-wide representation that feeds the HMM.
+    Local embeddings are computed later from subsets of the same session, usually
+    after HMM states are available, so the same embedding machinery can be reused
+    across the workflow.
     """
 
     def __init__(
@@ -73,10 +51,27 @@ class HybridDynamicsAnalysis(
         self.bin_times_s = None
         self.unit_ids = None
         self.normalization_method = None
+        self.raw_counts = None
+        self.neuron_totals = None
+        self.unit_metadata_filtered = {}
 
-        self.pca_model = None
-        self.pca_scores = None
-        self.pca_variance_ratio = None
+        self.embedding_results = None
+        self.embedding_model = None
+        self.embedding_scores = None
+        self.embedding_variance_ratio = None
+        self.embedding_scope = None
+        self.embedding_label = None
+
+        self.global_embedding_results = None
+        self.global_embedding_model = None
+        self.global_embedding_scores = None
+        self.global_embedding_variance_ratio = None
+
+        self.local_embedding_results = {}
+        self.local_embedding_model = None
+        self.local_embedding_scores = None
+        self.local_embedding_variance_ratio = None
+        self.local_embedding_label = None
 
         self.fold_idx = None
         self.hmm_models = {}

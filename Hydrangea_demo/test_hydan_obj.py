@@ -17,11 +17,13 @@ import pynapple as nap
 from hybrid_dynamics_core.base import HybridDynamicsAnalysis
 
 DOWNLOAD_DIR = Path("/storage/dandi_downloads").resolve()
+MODEL_DIR = DOWNLOAD_DIR / "hydrangea_models"
 DANDISET_ID = "001695"
 VERSION_ID = "0.260319.2023"
 SUBJECTS = ["sub-M01", "sub-M02", "sub-M03", "sub-M05"]
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def print_session_table(download_root: Path):
@@ -87,9 +89,9 @@ hybdyn = HybridDynamicsAnalysis(
 hybdyn.normalize(method="proportion_zscore", zscore=True, restrict_to_epoch=True)
 hybdyn.normalization_report(show=False)
 
-# 2) global reduction
-hybdyn.global_pca(n_components=10, whiten=False, standardize=True)
-hybdyn.pca_report(show=False)
+# 2) global embedding (PCA for now)
+hybdyn.global_embedding(method="pca", n_components=10, whiten=False, standardize=True)
+hybdyn.report_embeddings(show=False)
 
 # 3) build folds
 hybdyn.build_folds(
@@ -117,6 +119,14 @@ hybdyn.fit_hmm(
 hybdyn.hmm_report(report="selected")
 # hybdyn.hmm_report(report="full")
 # hybdyn.hmm_report(report="none")
+
+# 6) save and reload the selected model
+saved_model_path = MODEL_DIR / f"{session_nwb_path.stem}_best_hmm.pkl"
+hybdyn.save_hmm_model(saved_model_path)
+reloaded_artifact = hybdyn.load_hmm_model(saved_model_path)
+
+print("Saved model path:", saved_model_path)
+print("Reloaded model states:", reloaded_artifact["n_states"])
 
 print("Notebook working directory:", ROOT)
 print("Download dir:", DOWNLOAD_DIR)

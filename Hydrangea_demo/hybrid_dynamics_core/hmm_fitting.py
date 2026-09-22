@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import pickle
 from hmmlearn.hmm import GaussianHMM
 
 
@@ -218,3 +220,224 @@ class HMMFittingStep:
             print(self.hmm_scores[["AIC", "BIC", "loglik", "median_cv_loglik"]])
 
         return self.hmm_scores.copy()
+
+    def _summarize_sequence(self, seq, n_states, dt):
+        seq = np.asarray(seq, dtype=int)
+        total = len(seq)
+        occ_pct = np.array([(seq == s).mean() * 100 for s in range(n_states)])
+
+        visit_counts = np.zeros(n_states, dtype=int)
+        dwell_runs = {s: [] for s in range(n_states)}
+
+        start = 0
+        for i in range(1, total + 1):
+            if i == total or seq[i] != seq[start]:
+                s = seq[start]
+                run_len = i - start
+                dwell_runs[s].append(run_len * dt)
+                visit_counts[s] += 1
+                start = i
+
+        mean_dwell = np.array([
+            np.mean(dwell_runs[s]) if len(dwell_runs[s]) else 0.0
+            for s in range(n_states)
+        ])
+
+        median_dwell = np.array([
+            np.median(dwell_runs[s]) if len(dwell_runs[s]) else 0.0
+            for s in range(n_states)
+        ])
+
+        switch_rate = np.sum(np.diff(seq) != 0) / ((total - 1) * dt) if total > 1 else 0.0
+        return {
+            "occupancy_pct": occ_pct,
+            "visit_counts": visit_counts,
+            "mean_dwell_s": mean_dwell,
+            "median_dwell_s": median_dwell,
+            "switch_rate_per_s": switch_rate,
+        }
+
+    def plot_selected_cv_curve(self, ax=None, show=True):
+        if self.hmm_scores is None:
+            raise ValueError("Run fit_hmm() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        else:
+            fig = ax.figure
+        ax.plot(self.hmm_scores.index, self.hmm_scores["median_cv_loglik"], marker="o", color="tab:green")
+        ax.set_title("Median temporal CV log-likelihood by K")
+        ax.set_xlabel("n states")
+        ax.set_ylabel("CV log-likelihood")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_state_sequence(self, seq, n_states, ax=None, show=True, title=None):
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 3))
+        else:
+            fig = ax.figure
+        ax.scatter(self.bin_times_s, seq, c=seq, cmap="tab10", s=2, marker="s")
+        ax.set(
+            title=title or f"State sequence (K={n_states})",
+            xlabel="time (s)",
+            ylabel="state",
+            yticks=range(n_states),
+        )
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_state_occupancy(self, occ, n_states, ax=None, show=True, title="Occupancy (%)"):
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 3))
+        else:
+            fig = ax.figure
+        bars = ax.bar(np.arange(n_states), occ, color="tab:blue")
+        ax.set(title=title, xlabel="state", ylabel="% of time", xticks=range(n_states))
+        ax.grid(alpha=0.3, axis="y")
+        for b, v in zip(bars, occ):
+            ax.text(b.get_x() + b.get_width() / 2, b.get_height(), f"{v:.1f}%", ha="center", va="bottom", fontsize=8)
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_state_dwell(self, dwell, n_states, ax=None, show=True, title="Mean dwell time"):
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 3))
+        else:
+            fig = ax.figure
+        bars = ax.bar(np.arange(n_states), dwell, color="tab:green")
+        ax.set(title=title, xlabel="state", ylabel="seconds", xticks=range(n_states))
+        ax.grid(alpha=0.3, axis="y")
+        for b, v in zip(bars, dwell):
+            ax.text(b.get_x() + b.get_width() / 2, b.get_height(), f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_transition_matrix(self, T, n_states, ax=None, show=True, title="Transition matrix"):
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+        else:
+            fig = ax.figure
+        im = ax.imshow(T, cmap="viridis", vmin=0, vmax=1)
+        ax.set(title=title, xlabel="to state", ylabel="from state", xticks=range(n_states), yticks=range(n_states))
+        for i in range(n_states):
+            for j in range(n_states):
+                ax.text(j, i, f"{T[i, j]:.2f}", ha="center", va="center", color="w" if T[i, j] < 0.6 else "k", fontsize=7)
+        fig.colorbar(im, ax=ax, label="P(to|from)")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def hmm_report(self, report=None):
+        """Display a selected or full HMM diagnostic report."""
+        if self.hmm_scores is None:
+            raise ValueError("Run fit_hmm() first.")
+
+        report = self.report if report is None else report
+
+        if report == "none":
+            return None
+
+        if report == "selected":
+            ranked = self.hmm_scores.sort_values("median_cv_loglik", ascending=False)
+            print("Ranked CV table:")
+            print(ranked[["median_cv_loglik", "AIC", "BIC", "loglik"]])
+            fig, ax = self.plot_selected_cv_curve(show=True)
+            return fig
+
+        if report == "full":
+            ranked = self.hmm_scores.sort_values("median_cv_loglik", ascending=False)
+            print("Full model comparison:")
+            print(ranked[["median_cv_loglik", "AIC", "BIC", "loglik"]])
+
+            dt = float(np.median(np.diff(self.bin_times_s))) if len(self.bin_times_s) > 1 else 1.0
+            diagnostic_rows = []
+
+            for n_states in sorted(self.hmm_models):
+                hmm = self.hmm_models[n_states]
+                seq = hmm.predict(self.spike_matrix)
+                T = hmm.transmat_
+                diag = self._summarize_sequence(seq, n_states, dt)
+                occ = diag["occupancy_pct"]
+                mean_dwell = diag["mean_dwell_s"]
+
+                diagnostic_rows.append({
+                    "n_states": n_states,
+                    "switch_rate_per_s": diag["switch_rate_per_s"],
+                    "min_occupancy_pct": occ.min(),
+                    "median_occupancy_pct": np.median(occ),
+                    "n_states_lt_1pct": int((occ < 1.0).sum()),
+                    "n_states_lt_5pct": int((occ < 5.0).sum()),
+                    "max_mean_dwell_s": mean_dwell.max(),
+                    "median_cv_loglik": self.hmm_scores.loc[n_states, "median_cv_loglik"],
+                })
+
+                fig, axes = plt.subplots(2, 2, figsize=(16, 9), gridspec_kw={"height_ratios": [2, 1]})
+                self.plot_state_sequence(seq, n_states, ax=axes[0, 0], show=False)
+                self.plot_state_occupancy(occ, n_states, ax=axes[0, 1], show=False)
+                self.plot_state_dwell(mean_dwell, n_states, ax=axes[1, 0], show=False)
+                self.plot_transition_matrix(T, n_states, ax=axes[1, 1], show=False)
+
+                fig.suptitle(
+                    f"K={n_states} | switch_rate={diag['switch_rate_per_s']:.3f}/s | "
+                    f"<1%={int((occ < 1).sum())} | <5%={int((occ < 5).sum())} | "
+                    f"median CV loglik={self.hmm_scores.loc[n_states, 'median_cv_loglik']:.1f}",
+                    y=1.02,
+                )
+                fig.tight_layout()
+                plt.show()
+
+            summary = pd.DataFrame(diagnostic_rows).sort_values("n_states", ascending=False)
+            print(summary)
+            return summary
+
+        raise ValueError("report must be one of: 'full', 'selected', or 'none'")
+
+    def save_hmm_model(self, path, n_states=None):
+        """Serialize a fitted HMM and its selection metadata to disk."""
+        if n_states is None:
+            if self.best_k is None:
+                raise ValueError("Run fit_hmm() first or provide n_states explicitly.")
+            n_states = self.best_k
+
+        if n_states not in self.hmm_models:
+            raise KeyError(f"No fitted HMM available for n_states={n_states}.")
+
+        artifact = {
+            "n_states": int(n_states),
+            "best_k": int(self.best_k) if self.best_k is not None else int(n_states),
+            "hmm_model": self.hmm_models[n_states],
+            "hmm_scores": self.hmm_scores,
+            "bin_size_s": self.bin_size_s,
+            "random_state": self.random_state,
+            "report": self.report,
+        }
+
+        with open(path, "wb") as handle:
+            pickle.dump(artifact, handle)
+
+        return path
+
+    def load_hmm_model(self, path):
+        """Restore a previously serialized HMM artifact from disk."""
+        with open(path, "rb") as handle:
+            artifact = pickle.load(handle)
+
+        n_states = int(artifact["n_states"])
+        hmm_model = artifact["hmm_model"]
+
+        self.hmm_models = {n_states: hmm_model}
+        self.best_k = int(artifact.get("best_k", n_states))
+        self.best_hmm = hmm_model
+        self.hmm_scores = artifact.get("hmm_scores", self.hmm_scores)
+
+        return artifact
