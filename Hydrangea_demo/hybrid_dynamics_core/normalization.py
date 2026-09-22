@@ -36,22 +36,32 @@ class NormalizationStep:
             raise ValueError("No units found in selected spike group.")
 
         spike_arrays = [source[u].index.values for u in self.unit_ids]
-        t_start = min(s[0] for s in spike_arrays if len(s))
-        t_end = max(s[-1] for s in spike_arrays if len(s))
+        non_empty = [s for s in spike_arrays if len(s)]
+        if len(non_empty) == 0:
+            raise ValueError("This is empty; please return non-spiking data.")
+
+        t_start = min(s[0] for s in non_empty)
+        t_end = max(s[-1] for s in non_empty)
         edges = np.arange(t_start, t_end + self.bin_size_s, self.bin_size_s)
         self.bin_times_s = edges[:-1]
 
         counts = np.stack([np.histogram(spk, bins=edges)[0] for spk in spike_arrays], axis=1).astype(float)
+        self.raw_counts = counts
+        if counts.size == 0 or np.sum(counts) == 0:
+            raise ValueError("This is empty; please return non-spiking data.")
 
         if method == "proportion_zscore":
             neuron_totals = np.array([spk.size for spk in spike_arrays], dtype=float)
-            neuron_totals[neuron_totals == 0] = 1.0
-            prop = counts / neuron_totals[:, None]
+            if np.any(neuron_totals == 0):
+                raise ValueError("This is empty; please return non-spiking data.")
+            prop = counts / neuron_totals
             matrix = prop
+            self.neuron_totals = neuron_totals
             if zscore:
                 mu = prop.mean(axis=0)
                 sigma = prop.std(axis=0)
-                sigma[sigma == 0] = 1.0
+                if np.any(sigma == 0):
+                    raise ValueError("This is empty; please return non-spiking data.")
                 matrix = (prop - mu) / sigma
             self.normalization_method = "proportion_zscore"
 
@@ -60,7 +70,8 @@ class NormalizationStep:
             if zscore:
                 mu = counts.mean(axis=0)
                 sigma = counts.std(axis=0)
-                sigma[sigma == 0] = 1.0
+                if np.any(sigma == 0):
+                    raise ValueError("This is empty; please return non-spiking data.")
                 matrix = (counts - mu) / sigma
             self.normalization_method = "count_zscore"
 
@@ -90,31 +101,40 @@ class NormalizationStep:
             raise ValueError("Run normalize() first.")
 
         M = self.spike_matrix
+        counts = self.raw_counts
+        neuron_totals = getattr(self, "neuron_totals", np.array([]))
         fig, ax = plt.subplots(2, 3, figsize=(16, 9))
 
         ax[0, 0].hist(M.ravel(), bins=100, log=True)
-        ax[0, 0].set(title="Normalized values", xlabel="value", ylabel="count")
+        ax[0, 0].set(title="Normalized values (log y)", xlabel="z", ylabel="freq")
 
-        frac_zero = (M == 0).mean(0)
+        frac_zero = (counts == 0).mean(0)
         ax[0, 1].hist(frac_zero, bins=30)
-        ax[0, 1].set(title="Fraction empty bins", xlabel="P(count=0)", ylabel="count")
+        ax[0, 1].set(title="Fraction empty bins/neuron", xlabel="P(count=0)", ylabel="count")
 
-        m = M.mean(axis=0)
-        v = M.var(axis=0)
+        m = counts.mean(axis=0)
+        v = counts.var(axis=0)
         ax[0, 2].loglog(m + 1e-3, v + 1e-6, ".", alpha=0.5)
         lims = [max(m.min() + 1e-3, 1e-3), max(m.max(), 1e-3)]
         ax[0, 2].plot(lims, lims, "k--", label="var = mean")
-        ax[0, 2].set(title="Mean vs variance", xlabel="mean", ylabel="variance")
+        ax[0, 2].set(title="Mean vs var — raw", xlabel="mean", ylabel="var")
         ax[0, 2].legend()
 
         ax[1, 0].hist(M.std(axis=0), bins=30)
-        ax[1, 0].set(title="Per-neuron std", xlabel="std", ylabel="count")
+        ax[1, 0].set(title="Per-neuron std after norm (~1)", xlabel="std", ylabel="count")
 
-        idx = np.argsort(np.abs(M.mean(axis=0)))[len(M.T) // 2]
+        if len(neuron_totals) > 0:
+            idx = np.argsort(neuron_totals)[len(neuron_totals) // 4]
+        else:
+            idx = np.argsort(np.abs(M.mean(axis=0)))[len(M.T) // 2]
         ax[1, 1].hist(M[:, idx], bins=50)
-        ax[1, 1].set(title=f"Example neuron {idx}", xlabel="normalized value", ylabel="count")
+        ax[1, 1].set(title=f"Neuron {idx}: normalized dist", xlabel="normalized value", ylabel="count")
 
-        ax[1, 2].axis("off")
+        if len(neuron_totals) > 0:
+            ax[1, 2].hist(neuron_totals, bins=40)
+            ax[1, 2].set(title="Total spikes/neuron (divisor)", xlabel="spike count", ylabel="count")
+        else:
+            ax[1, 2].axis("off")
         fig.suptitle(f"Normalization: {self.normalization_method}")
         fig.tight_layout()
         if show:

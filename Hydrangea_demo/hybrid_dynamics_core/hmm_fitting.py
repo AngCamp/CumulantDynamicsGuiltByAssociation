@@ -97,10 +97,19 @@ class HMMFittingStep:
             for idx, block_idx in enumerate(order):
                 fold_idx[idx % k_fold].append(candidates[block_idx])
 
-            self.fold_idx = [np.concatenate(x) if len(x) else np.array([], dtype=int) for x in fold_idx]
+            if any(len(x) == 0 for x in fold_idx):
+                raise ValueError(
+                    "event_intervals produced empty folds. Reduce k_fold or provide more interval blocks."
+                )
+            self.fold_idx = [np.concatenate(x) for x in fold_idx]
 
         else:
             raise ValueError(f"Unknown fold strategy: {fold_strategy}")
+
+        if any(len(fold) == 0 for fold in self.fold_idx):
+            raise ValueError(
+                "One or more validation folds are empty. Check fold strategy and k_fold for this dataset."
+            )
 
         return self.fold_idx
 
@@ -169,7 +178,11 @@ class HMMFittingStep:
             if self.fold_idx is not None and use_cv:
                 cv_scores = []
                 for fold in self.fold_idx:
+                    if len(fold) == 0:
+                        raise ValueError("Encountered an empty validation fold; cannot run CV scoring.")
                     train_idx = np.setdiff1d(np.arange(n_obs), fold, assume_unique=True)
+                    if len(train_idx) == 0:
+                        raise ValueError("Encountered an empty training fold; cannot run CV scoring.")
                     cv_hmm = GaussianHMM(
                         n_components=n_states,
                         covariance_type=covariance_type,
