@@ -55,6 +55,3 @@ class HybridDynamicsAnalysis(
         self.hmm_scores = None
         self.best_k = None
         self.best_hmm = None
-
-
-HyDan = HybridDynamicsAnalysis

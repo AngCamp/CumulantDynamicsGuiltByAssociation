@@ -11,7 +11,7 @@ ROOT = Path.cwd().resolve()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hybrid_dynamics_core.base import HyDan
+from hybrid_dynamics_core.base import HybridDynamicsAnalysis
 
 DOWNLOAD_DIR = Path("/storage/dandi_downloads").resolve()
 DANDISET_ID = "001695"
@@ -61,7 +61,7 @@ print_session_table(DOWNLOAD_DIR)
 #   session_nwb
 
 # Example usage: create a Hydrangea object and call steps in order.
-obj = HyDan(
+hybdyn = HybridDynamicsAnalysis(
     spike_group=spike_group_maze,
     bin_size_s=0.050,
     maze_epoch=maze_ep,
@@ -70,15 +70,15 @@ obj = HyDan(
 )
 
 # 1) normalize
-obj.normalize(method="proportion_zscore", zscore=True, restrict_to_epoch=True)
-obj.normalization_report(show=False)
+hybdyn.normalize(method="proportion_zscore", zscore=True, restrict_to_epoch=True)
+hybdyn.normalization_report(show=False)
 
 # 2) global reduction
-obj.global_pca(n_components=10, whiten=False, standardize=True)
-obj.pca_report(show=False)
+hybdyn.global_pca(n_components=10, whiten=False, standardize=True)
+hybdyn.pca_report(show=False)
 
 # 3) build folds
-obj.build_folds(
+hybdyn.build_folds(
     k_fold=5,
     fold_strategy="temporal_segments",
     shuffle_within_segments=True,
@@ -86,7 +86,7 @@ obj.build_folds(
 )
 
 # 4) fit HMM models
-obj.fit_hmm(
+hybdyn.fit_hmm(
     n_states_min=2,
     n_states_max=10,
     k_fold=5,
@@ -100,11 +100,11 @@ obj.fit_hmm(
 )
 
 # 5) reporting
-obj.hmm_report(report="selected")
-# obj.hmm_report(report="full")
-# obj.hmm_report(report="none")
+hybdyn.hmm_report(report="selected")
+# hybdyn.hmm_report(report="full")
+# hybdyn.hmm_report(report="none")
 
 print("Notebook working directory:", ROOT)
 print("Download dir:", DOWNLOAD_DIR)
-print("Best K:", obj.best_k)
-print("Model count:", len(obj.hmm_models))
+print("Best K:", hybdyn.best_k)
+print("Model count:", len(hybdyn.hmm_models))

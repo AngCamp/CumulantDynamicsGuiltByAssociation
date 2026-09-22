@@ -1,3 +1,3 @@
-from .base import HybridDynamicsAnalysis, HyDan
+from .base import HybridDynamicsAnalysis
 
-__all__ = ["HybridDynamicsAnalysis", "HyDan"]
+__all__ = ["HybridDynamicsAnalysis"]
