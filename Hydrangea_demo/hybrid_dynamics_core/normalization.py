@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import warnings
 
 
 class NormalizationStep:
@@ -46,14 +47,39 @@ class NormalizationStep:
         self.bin_times_s = edges[:-1]
 
         counts = np.stack([np.histogram(spk, bins=edges)[0] for spk in spike_arrays], axis=1).astype(float)
-        self.raw_counts = counts
         if counts.size == 0 or np.sum(counts) == 0:
             raise ValueError("This is empty; please return non-spiking data.")
 
+        neuron_totals_all = np.array([spk.size for spk in spike_arrays], dtype=float)
+        keep_mask = neuron_totals_all > 0
+        dropped = int((~keep_mask).sum())
+        if dropped > 0:
+            msg = (
+                f"Dropped {dropped} neurons with no spikes in analyzed time interval."
+            )
+
+            if hasattr(source, "metadata_columns") and "cell_area" in list(source.metadata_columns):
+                region_vals = np.asarray(source.get_info("cell_area"))
+                if len(region_vals) == len(keep_mask):
+                    regions, counts_by_region = np.unique(region_vals[~keep_mask], return_counts=True)
+                    if len(regions) > 0:
+                        region_txt = ", ".join(
+                            f"{r}:{n}" for r, n in zip(regions.tolist(), counts_by_region.tolist())
+                        )
+                        msg = f"{msg} Per-region dropped counts -> {region_txt}."
+
+            warnings.warn(msg)
+
+        if not np.any(keep_mask):
+            raise ValueError("This is empty; please return non-spiking data.")
+
+        counts = counts[:, keep_mask]
+        self.unit_ids = self.unit_ids[keep_mask]
+        spike_arrays = [spk for spk, keep in zip(spike_arrays, keep_mask) if keep]
+        self.raw_counts = counts
+
         if method == "proportion_zscore":
             neuron_totals = np.array([spk.size for spk in spike_arrays], dtype=float)
-            if np.any(neuron_totals == 0):
-                raise ValueError("This is empty; please return non-spiking data.")
             prop = counts / neuron_totals
             matrix = prop
             self.neuron_totals = neuron_totals
