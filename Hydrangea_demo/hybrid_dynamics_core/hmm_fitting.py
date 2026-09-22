@@ -17,6 +17,16 @@ class HMMFittingStep:
     def _hmm_param_count(self, n_states, n_features):
         return n_states * (n_states - 1) + (n_states - 1) + n_states * n_features + n_states * n_features
 
+    def fit_states(self, *args, **kwargs):
+        """Fit latent states using the object's locked state discovery method."""
+        if not hasattr(self, "state_discovery_method"):
+            raise ValueError("Object missing state_discovery_method lock.")
+        if self.state_discovery_method == "gaussian_hmm":
+            return self.fit_hmm(*args, **kwargs)
+        raise NotImplementedError(
+            f"State discovery method '{self.state_discovery_method}' is not implemented yet."
+        )
+
     def build_folds(self, k_fold=5, fold_strategy="temporal_segments", shuffle_within_segments=True, seed=None, event_intervals=None):
         """Build validation folds for HMM cross-validation.
 
@@ -145,6 +155,11 @@ class HMMFittingStep:
         """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
+        if hasattr(self, "state_discovery_method") and self.state_discovery_method != "gaussian_hmm":
+            raise NotImplementedError(
+                f"This object is locked to state_discovery_method='{self.state_discovery_method}', "
+                "but fit_hmm implements 'gaussian_hmm'."
+            )
 
         if n_states_min > n_states_max:
             raise ValueError("n_states_min must be <= n_states_max.")
@@ -215,6 +230,9 @@ class HMMFittingStep:
         self.hmm_scores = pd.DataFrame(rows).set_index("n_states").sort_index()
         self.best_k = int(self.hmm_scores["median_cv_loglik"].idxmax())
         self.best_hmm = self.hmm_models[self.best_k]
+        self.state_labels_ = self.best_hmm.predict(self.spike_matrix)
+        if hasattr(self, "_mark_checkpoint"):
+            self._mark_checkpoint("states_discovered")
 
         if report in ["full", "selected"]:
             print(self.hmm_scores[["AIC", "BIC", "loglik", "median_cv_loglik"]])
@@ -420,6 +438,9 @@ class HMMFittingStep:
             "bin_size_s": self.bin_size_s,
             "random_state": self.random_state,
             "report": self.report,
+            "embedding_method": getattr(self, "embedding_method", None),
+            "state_discovery_method": getattr(self, "state_discovery_method", None),
+            "analysis_stage": getattr(self, "analysis_stage", None),
         }
 
         with open(path, "wb") as handle:
@@ -435,9 +456,28 @@ class HMMFittingStep:
         n_states = int(artifact["n_states"])
         hmm_model = artifact["hmm_model"]
 
+        saved_embedding_method = artifact.get("embedding_method", None)
+        saved_state_method = artifact.get("state_discovery_method", None)
+        if saved_embedding_method is not None and hasattr(self, "embedding_method"):
+            if str(saved_embedding_method).lower() != str(self.embedding_method).lower():
+                raise ValueError(
+                    "Saved model embedding method does not match object lock: "
+                    f"saved='{saved_embedding_method}', current='{self.embedding_method}'."
+                )
+        if saved_state_method is not None and hasattr(self, "state_discovery_method"):
+            if str(saved_state_method).lower() != str(self.state_discovery_method).lower():
+                raise ValueError(
+                    "Saved model state discovery method does not match object lock: "
+                    f"saved='{saved_state_method}', current='{self.state_discovery_method}'."
+                )
+
         self.hmm_models = {n_states: hmm_model}
         self.best_k = int(artifact.get("best_k", n_states))
         self.best_hmm = hmm_model
         self.hmm_scores = artifact.get("hmm_scores", self.hmm_scores)
+        if self.spike_matrix is not None:
+            self.state_labels_ = self.best_hmm.predict(self.spike_matrix)
+        if hasattr(self, "_mark_checkpoint"):
+            self._mark_checkpoint("states_discovered")
 
         return artifact

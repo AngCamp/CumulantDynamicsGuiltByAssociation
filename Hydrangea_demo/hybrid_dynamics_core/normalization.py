@@ -119,6 +119,8 @@ class NormalizationStep:
             matrix = gaussian_filter1d(matrix, smooth_sigma_bins, axis=0)
 
         self.spike_matrix = matrix.astype(float)
+        if hasattr(self, "_mark_checkpoint"):
+            self._mark_checkpoint("normalized")
         return self.spike_matrix.copy(), self.bin_times_s.copy()
 
     def _safe_hist(self, ax_obj, values, bins=30, log=False, **kwargs):

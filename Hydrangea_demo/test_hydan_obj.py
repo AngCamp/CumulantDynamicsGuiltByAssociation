@@ -81,6 +81,10 @@ hybdyn = HybridDynamicsAnalysis(
     spike_group=spike_group_maze,
     bin_size_s=0.050,
     maze_epoch=maze_ep,
+    session_id="sub-M01_ses-20240313T100000",
+    mouse_id="M01",
+    embedding_method="pca",
+    state_discovery_method="gaussian_hmm",
     random_state=0,
     report="selected",
 )
@@ -101,8 +105,8 @@ hybdyn.build_folds(
     seed=0,
 )
 
-# 4) fit HMM models
-hybdyn.fit_hmm(
+# 4) fit state-discovery model (locked method: gaussian_hmm)
+hybdyn.fit_states(
     n_states_min=2,
     n_states_max=10,
     k_fold=5,
@@ -114,6 +118,10 @@ hybdyn.fit_hmm(
     use_cv=True,
     report="selected",
 )
+
+# Optional next step: local embedding inside one discovered state.
+# hybdyn.local_embedding(state_labels=hybdyn.state_labels_, state_value=0, method="pca", label="state_0")
+# hybdyn.report_embeddings(scope="local", label="state_0", show=False)
 
 # 5) reporting
 hybdyn.hmm_report(report="selected")
@@ -132,3 +140,6 @@ print("Notebook working directory:", ROOT)
 print("Download dir:", DOWNLOAD_DIR)
 print("Best K:", hybdyn.best_k)
 print("Model count:", len(hybdyn.hmm_models))
+
+# 7) object summary for workflow tracking
+hybdyn.describe(as_text=True)

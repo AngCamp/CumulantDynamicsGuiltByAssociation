@@ -11,6 +11,15 @@ class EmbeddingStep:
     in the API for later cross-region work.
     """
 
+    def _resolve_embedding_method(self, method=None):
+        requested = self.embedding_method if method is None else str(method).lower()
+        locked = str(self.embedding_method).lower()
+        if requested != locked:
+            raise ValueError(
+                f"Embedding method is locked to '{locked}' for this object; got '{requested}'."
+            )
+        return requested
+
     def _fit_pca_embedding(self, matrix, n_components=10, whiten=False, standardize=True):
         if matrix is None:
             raise ValueError("No matrix provided for embedding.")
@@ -78,10 +87,12 @@ class EmbeddingStep:
 
         raise ValueError("scope must be 'global' or 'local'.")
 
-    def global_embedding(self, method="pca", n_components=10, whiten=False, standardize=True, paired_matrix=None):
+    def global_embedding(self, method=None, n_components=10, whiten=False, standardize=True, paired_matrix=None):
         """Fit the session-wide embedding that will feed the HMM."""
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
+
+        method = self._resolve_embedding_method(method)
 
         scores, model = self._fit_embedding_matrix(
             self.spike_matrix,
@@ -110,6 +121,8 @@ class EmbeddingStep:
         self.embedding_variance_ratio = model.explained_variance_ratio_
         self.embedding_scope = "global"
         self.embedding_label = None
+        if hasattr(self, "_mark_checkpoint"):
+            self._mark_checkpoint("global_embedding")
         return scores, model
 
     def local_embedding(
@@ -118,7 +131,7 @@ class EmbeddingStep:
         sample_indices=None,
         state_labels=None,
         state_value=None,
-        method="pca",
+        method=None,
         n_components=10,
         whiten=False,
         standardize=True,
@@ -133,6 +146,8 @@ class EmbeddingStep:
         """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
+
+        method = self._resolve_embedding_method(method)
 
         X = self.spike_matrix
         if sample_mask is not None and sample_indices is not None:
@@ -187,6 +202,8 @@ class EmbeddingStep:
         self.embedding_variance_ratio = model.explained_variance_ratio_
         self.embedding_scope = "local"
         self.embedding_label = local_key
+        if hasattr(self, "_mark_checkpoint"):
+            self._mark_checkpoint("local_embedding")
         return scores, model
 
     def plot_embedding_variance(self, scope="global", label=None, ax=None, show=True):

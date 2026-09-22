@@ -13,7 +13,7 @@ class HybridDynamicsAnalysis(
     Typical call order:
         hybdyn.normalize(...)
         hybdyn.global_embedding(...)
-        hybdyn.fit_hmm(...)
+        hybdyn.fit_states(...)
         hybdyn.local_embedding(...)
         hybdyn.report_embeddings(...)
         hybdyn.hmm_report(...)
@@ -35,6 +35,10 @@ class HybridDynamicsAnalysis(
         condition_key=None,
         random_state=0,
         report="full",
+        embedding_method="pca",
+        state_discovery_method="gaussian_hmm",
+        session_id=None,
+        mouse_id=None,
     ):
         self.spike_group = spike_group
         self.bin_size_s = float(bin_size_s)
@@ -45,6 +49,14 @@ class HybridDynamicsAnalysis(
         self.condition_key = condition_key
         self.random_state = random_state
         self.report = report
+        self.embedding_method = str(embedding_method).lower()
+        self.state_discovery_method = str(state_discovery_method).lower()
+        self.analysis_stage = "State_EDA"
+
+        if self.embedding_method not in {"pca", "cca"}:
+            raise ValueError("embedding_method must be one of: 'pca' or 'cca'.")
+        if self.state_discovery_method not in {"gaussian_hmm"}:
+            raise ValueError("state_discovery_method must be one of: 'gaussian_hmm'.")
 
         self._source_spike_group = None
         self.spike_matrix = None
@@ -78,3 +90,82 @@ class HybridDynamicsAnalysis(
         self.hmm_scores = None
         self.best_k = None
         self.best_hmm = None
+        self.state_labels_ = None
+
+        self.analysis_checkpoints = {
+            "normalized": False,
+            "global_embedding": False,
+            "states_discovered": False,
+            "local_embedding": False,
+        }
+
+        self.sessions = []
+        self.register_session(
+            session_id=session_id,
+            mouse_id=mouse_id,
+            spike_group=spike_group,
+            maze_epoch=maze_epoch,
+            unit_metadata=unit_metadata,
+            note="primary",
+        )
+
+    def register_session(self, session_id=None, mouse_id=None, spike_group=None, maze_epoch=None, unit_metadata=None, note=None):
+        """Register session-level metadata for later multi-session analysis."""
+        entry = {
+            "session_id": session_id,
+            "mouse_id": mouse_id,
+            "has_spike_group": spike_group is not None,
+            "has_maze_epoch": maze_epoch is not None,
+            "has_unit_metadata": unit_metadata is not None,
+            "note": note,
+        }
+        self.sessions.append(entry)
+        return entry
+
+    def _mark_checkpoint(self, key):
+        if key in self.analysis_checkpoints:
+            self.analysis_checkpoints[key] = True
+
+    def set_analysis_stage(self, stage):
+        """Set high-level workflow stage for cross-session tracking."""
+        allowed = {"State_EDA", "OT_LINKING", "COMPLETED"}
+        if stage not in allowed:
+            raise ValueError(f"stage must be one of: {sorted(allowed)}")
+        self.analysis_stage = stage
+        return self.analysis_stage
+
+    def _current_analysis_point(self):
+        if self.analysis_checkpoints.get("local_embedding", False):
+            return "Local embeddings computed"
+        if self.analysis_checkpoints.get("states_discovered", False):
+            return "States discovered (HMM fit)"
+        if self.analysis_checkpoints.get("global_embedding", False):
+            return "Global embedding computed"
+        if self.analysis_checkpoints.get("normalized", False):
+            return "Normalized observations ready"
+        return "Initialized"
+
+    def describe(self, as_text=True):
+        """Summarize cohort scope, locked methods, and progress state."""
+        unique_mice = sorted({s["mouse_id"] for s in self.sessions if s.get("mouse_id") is not None})
+        summary = {
+            "n_sessions": len(self.sessions),
+            "n_mice": len(unique_mice),
+            "mouse_ids": unique_mice,
+            "state_discovery_method": self.state_discovery_method,
+            "embedding_method": self.embedding_method,
+            "analysis_stage": self.analysis_stage,
+            "analysis_point": self._current_analysis_point(),
+            "checkpoints": dict(self.analysis_checkpoints),
+        }
+
+        if as_text:
+            print("HybridDynamicsAnalysis summary")
+            print("-" * 36)
+            print(f"sessions: {summary['n_sessions']}")
+            print(f"mice: {summary['n_mice']} -> {summary['mouse_ids']}")
+            print(f"state_discovery_method: {summary['state_discovery_method']}")
+            print(f"embedding_method: {summary['embedding_method']}")
+            print(f"analysis_stage: {summary['analysis_stage']}")
+            print(f"analysis_point: {summary['analysis_point']}")
+        return summary
