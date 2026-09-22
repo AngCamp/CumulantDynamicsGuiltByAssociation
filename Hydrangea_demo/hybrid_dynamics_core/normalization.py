@@ -76,6 +76,8 @@ class NormalizationStep:
         counts = counts[:, keep_mask]
         self.unit_ids = self.unit_ids[keep_mask]
         spike_arrays = [spk for spk, keep in zip(spike_arrays, keep_mask) if keep]
+        neuron_totals = np.array([spk.size for spk in spike_arrays], dtype=float)
+        self.neuron_totals = neuron_totals
         self.raw_counts = counts
         self.unit_metadata_filtered = {}
         if hasattr(source, "metadata_columns"):
@@ -85,17 +87,15 @@ class NormalizationStep:
                     self.unit_metadata_filtered[key] = values[keep_mask]
 
         if method == "proportion_zscore":
-            neuron_totals = np.array([spk.size for spk in spike_arrays], dtype=float)
             prop = counts / neuron_totals
             matrix = prop
-            self.neuron_totals = neuron_totals
             if zscore:
                 mu = prop.mean(axis=0)
                 sigma = prop.std(axis=0)
                 if np.any(sigma == 0):
                     raise ValueError("This is empty; please return non-spiking data.")
                 matrix = (prop - mu) / sigma
-            self.normalization_method = "proportion_zscore"
+            self.normalization_method = "proportion_then_zscore" if zscore else "proportion"
 
         elif method == "count_zscore":
             matrix = counts
@@ -105,7 +105,7 @@ class NormalizationStep:
                 if np.any(sigma == 0):
                     raise ValueError("This is empty; please return non-spiking data.")
                 matrix = (counts - mu) / sigma
-            self.normalization_method = "count_zscore"
+            self.normalization_method = "count_then_zscore" if zscore else "count"
 
         elif method == "raw_counts":
             matrix = counts
@@ -138,6 +138,28 @@ class NormalizationStep:
         else:
             ax_obj.hist(arr, bins=bins, log=log, **kwargs)
 
+    def _plot_density(self, ax_obj, values, bins=120, center=False, color="tab:blue", lw=2):
+        arr = np.asarray(values, dtype=float).ravel()
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            ax_obj.text(0.5, 0.5, "No finite data", ha="center", va="center", transform=ax_obj.transAxes)
+            return None, None
+
+        if center:
+            arr = arr - np.mean(arr)
+
+        vmin = float(np.min(arr))
+        vmax = float(np.max(arr))
+        if np.isclose(vmin, vmax):
+            ax_obj.axvline(vmin, color=color, lw=lw)
+            return np.array([vmin]), np.array([1.0])
+
+        hist, edges = np.histogram(arr, bins=bins, density=True)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        ax_obj.plot(centers, hist, color=color, lw=lw)
+        ax_obj.fill_between(centers, hist, 0, color=color, alpha=0.2)
+        return centers, hist
+
     def plot_raw_population_counts(self, ax=None, show=True):
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
@@ -145,8 +167,10 @@ class NormalizationStep:
             fig, ax = plt.subplots(1, 1, figsize=(6, 4))
         else:
             fig = ax.figure
-        self._safe_hist(ax, self.raw_counts.ravel(), bins=np.arange(0, np.max(self.raw_counts) + 2) - 0.5, log=True)
-        ax.set(title="Raw bin counts (population, log y)", xlabel="count", ylabel="freq")
+        self._plot_density(ax, self.raw_counts.ravel(), bins=120, center=True, color="tab:blue")
+        ax.axvline(0.0, color="k", lw=1, ls="--", alpha=0.6)
+        ax.set(title="Raw binned counts density (centered)", xlabel="count - mean(count)", ylabel="density")
+        ax.grid(alpha=0.3)
         fig.tight_layout()
         if show:
             plt.show()
@@ -160,8 +184,9 @@ class NormalizationStep:
         else:
             fig = ax.figure
         frac_zero = (self.raw_counts == 0).mean(0)
-        self._safe_hist(ax, frac_zero, bins=30)
-        ax.set(title="Fraction empty bins/neuron", xlabel="P(count=0)", ylabel="count")
+        self._plot_density(ax, frac_zero, bins=80, center=False, color="tab:orange")
+        ax.set(title="Fraction empty bins/neuron", xlabel="P(count=0)", ylabel="density")
+        ax.grid(alpha=0.3)
         fig.tight_layout()
         if show:
             plt.show()
@@ -193,8 +218,10 @@ class NormalizationStep:
             fig, ax = plt.subplots(1, 1, figsize=(6, 4))
         else:
             fig = ax.figure
-        self._safe_hist(ax, self.spike_matrix.ravel(), bins=100, log=True)
-        ax.set(title="Normalized values (population, log y)", xlabel="z", ylabel="freq")
+        self._plot_density(ax, self.spike_matrix.ravel(), bins=120, center=True, color="tab:green")
+        ax.axvline(0.0, color="k", lw=1, ls="--", alpha=0.6)
+        ax.set(title="Z-scored values density (centered)", xlabel="z - mean(z)", ylabel="density")
+        ax.grid(alpha=0.3)
         fig.tight_layout()
         if show:
             plt.show()
@@ -209,10 +236,168 @@ class NormalizationStep:
             fig = ax.figure
         neuron_totals = getattr(self, "neuron_totals", np.array([]))
         if len(neuron_totals) > 0:
-            self._safe_hist(ax, neuron_totals, bins=40)
-            ax.set(title="Total spikes/neuron (divisor)", xlabel="spike count", ylabel="count")
+            self._plot_density(ax, neuron_totals, bins=80, center=False, color="tab:purple")
+            ax.set(title="Total spikes/neuron (divisor)", xlabel="spike count", ylabel="density")
+            ax.grid(alpha=0.3)
         else:
             ax.axis("off")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def _log10_firing_rate_hz(self):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if getattr(self, "neuron_totals", None) is None or len(self.neuron_totals) == 0:
+            raise ValueError("No neuron totals available for firing-rate diagnostics.")
+        duration_s = max(float(len(self.bin_times_s) * self.bin_size_s), 1e-9)
+        rates_hz = self.neuron_totals / duration_s
+        rates_hz = rates_hz[rates_hz > 0]
+        if len(rates_hz) == 0:
+            raise ValueError("No positive firing rates available.")
+        return np.log10(rates_hz)
+
+    def plot_log_firing_rate_density(self, ax=None, show=True):
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.figure
+
+        log_fr = self._log10_firing_rate_hz()
+        self._plot_density(ax, log_fr, bins=100, center=False, color="tab:red")
+        ax.set(title="log10 firing rate density", xlabel="log10 firing rate (Hz)", ylabel="density")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_log_firing_rate_density_by_region(self, ax=None, region_key=None, show=True):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.figure
+
+        region_key = region_key or getattr(self, "region_key", None) or "cell_area"
+        regions = self.unit_metadata_filtered.get(region_key)
+        if regions is None:
+            ax.text(0.5, 0.5, f"No region metadata for '{region_key}'", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return fig, ax
+
+        duration_s = max(float(len(self.bin_times_s) * self.bin_size_s), 1e-9)
+        rates_hz = self.neuron_totals / duration_s
+        uniq = np.unique(regions)
+        cmap = plt.get_cmap("tab10")
+        for i, region in enumerate(uniq):
+            mask = regions == region
+            vals = rates_hz[mask]
+            vals = vals[vals > 0]
+            if len(vals) == 0:
+                continue
+            log_vals = np.log10(vals)
+            centers, dens = self._plot_density(ax, log_vals, bins=80, center=False, color=cmap(i % 10), lw=1.8)
+            if centers is not None and dens is not None:
+                ax.lines[-1].set_label(str(region))
+
+        ax.set(title=f"log10 firing rate density by {region_key}", xlabel="log10 firing rate (Hz)", ylabel="density")
+        ax.grid(alpha=0.3)
+        if len(ax.lines) > 0:
+            ax.legend(fontsize=9)
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_region_unit_counts(self, ax=None, region_key=None, show=True):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.figure
+
+        region_key = region_key or getattr(self, "region_key", None) or "cell_area"
+        regions = self.unit_metadata_filtered.get(region_key)
+        if regions is None:
+            ax.text(0.5, 0.5, f"No region metadata for '{region_key}'", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return fig, ax
+
+        labels, counts = np.unique(regions, return_counts=True)
+        order = np.argsort(counts)[::-1]
+        labels = labels[order]
+        counts = counts[order]
+
+        ax.bar(labels.astype(str), counts, color="tab:cyan")
+        ax.set(title=f"Units per {region_key}", xlabel=region_key, ylabel="unit count")
+        ax.tick_params(axis="x", rotation=30)
+        for x, y in zip(labels.astype(str), counts):
+            ax.text(x, y, str(int(y)), ha="center", va="bottom", fontsize=9)
+        ax.grid(alpha=0.2, axis="y")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_region_celltype_counts(self, ax=None, region_key=None, cell_type_key="cell_type", show=True):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        else:
+            fig = ax.figure
+
+        region_key = region_key or getattr(self, "region_key", None) or "cell_area"
+        regions = self.unit_metadata_filtered.get(region_key)
+        cell_types = self.unit_metadata_filtered.get(cell_type_key)
+
+        if regions is None or cell_types is None:
+            ax.text(
+                0.5,
+                0.5,
+                f"Missing metadata for '{region_key}' and/or '{cell_type_key}'",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_axis_off()
+            return fig, ax
+
+        region_labels = np.unique(regions)
+        type_labels = np.unique(cell_types)
+        count_map = {(r, c): 0 for r in region_labels for c in type_labels}
+        for r, c in zip(regions, cell_types):
+            count_map[(r, c)] += 1
+
+        total_counts = np.array([np.sum(regions == r) for r in region_labels])
+        type_counts = {c: np.array([count_map[(r, c)] for r in region_labels]) for c in type_labels}
+
+        x = np.arange(len(region_labels), dtype=float)
+        n_bars = len(type_labels) + 1
+        width = 0.8 / n_bars
+        cmap = plt.get_cmap("tab10")
+
+        bars_total = ax.bar(x + (0 - (n_bars - 1) / 2) * width, total_counts, width, label="Total", color=cmap(0))
+        ax.bar_label(bars_total, padding=2, fontsize=8)
+
+        for i, c in enumerate(type_labels, start=1):
+            offsets = x + (i - (n_bars - 1) / 2) * width
+            bars = ax.bar(offsets, type_counts[c], width, label=str(c), color=cmap(i % 10))
+            ax.bar_label(bars, padding=2, fontsize=8)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(r) for r in region_labels])
+        ax.set(
+            title=f"Unit counts by {region_key} (Total + per {cell_type_key})",
+            xlabel="brain region",
+            ylabel="unit count",
+        )
+        ax.legend(fontsize=9)
+        ax.grid(alpha=0.2, axis="y")
         fig.tight_layout()
         if show:
             plt.show()
@@ -242,8 +427,10 @@ class NormalizationStep:
             ax = axes.ravel()[i]
             ax.axis("on")
             mask = regions == region
-            self._safe_hist(ax, self.spike_matrix[:, mask].ravel(), bins=100, log=True)
-            ax.set(title=f"{region} (n={int(mask.sum())})", xlabel="z", ylabel="freq")
+            self._plot_density(ax, self.spike_matrix[:, mask].ravel(), bins=100, center=True, color="tab:blue")
+            ax.axvline(0.0, color="k", lw=1, ls="--", alpha=0.5)
+            ax.set(title=f"{region} (n={int(mask.sum())})", xlabel="z - mean(z)", ylabel="density")
+            ax.grid(alpha=0.2)
 
         fig.suptitle(f"Normalized population distribution by {region_key}")
         fig.tight_layout()
@@ -264,28 +451,12 @@ class NormalizationStep:
         fig, ax = plt.subplots(2, 3, figsize=(16, 9))
 
         self.plot_raw_population_counts(ax=ax[0, 0], show=False)
-        self.plot_fraction_empty_bins(ax=ax[0, 1], show=False)
+        self.plot_normalized_population_distribution(ax=ax[0, 1], show=False)
         self.plot_raw_mean_variance(ax=ax[0, 2], show=False)
 
-        self.plot_normalized_population_distribution(ax=ax[1, 0], show=False)
-        self.plot_total_spikes_per_neuron(ax=ax[1, 2], show=False)
-
-        # Put a region-distribution summary into the lower middle panel to keep the report compact.
-        ax[1, 1].axis("off")
-        region_key = getattr(self, "region_key", None) or "cell_area"
-        if region_key in self.unit_metadata_filtered:
-            regions = self.unit_metadata_filtered[region_key]
-            unique_regions = [r for r in np.unique(regions) if np.sum(regions == r) > 0]
-            summary = "\n".join([f"{r}: n={int(np.sum(regions == r))}" for r in unique_regions])
-            ax[1, 1].text(
-                0.0,
-                1.0,
-                f"Region slices available via plot_normalized_distributions_by_region()\n\n"
-                f"{region_key}\n\n{summary}",
-                va="top",
-            )
-        else:
-            ax[1, 1].text(0.0, 1.0, "No region metadata available for region slicing", va="top")
+        self.plot_log_firing_rate_density(ax=ax[1, 0], show=False)
+        self.plot_log_firing_rate_density_by_region(ax=ax[1, 1], show=False)
+        self.plot_region_celltype_counts(ax=ax[1, 2], show=False)
 
         fig.suptitle(f"Normalization: {self.normalization_method}")
         fig.tight_layout()
