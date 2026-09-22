@@ -1,29 +1,15 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-# Single environment for the Hydrangea / DANDI / pynapple analysis pipeline.
-# This project does not need the unrelated allensdk / mne / bugeon envs.
-# The actual code uses:
-#   - numpy, scipy, pandas, matplotlib
-#   - scikit-learn, hmmlearn
-#   - pynapple, pynwb, dandi
-#   - jupyter/ipykernel
+# Single project environment for the Hydrangea / DANDI / pynapple workflow.
+# If your conda install lives somewhere else, update this one path only.
+echo 'Activating conda...'
+source /storage/miniconda3/bin/activate
 
 ENV_NAME="hydrangea_env"
 ENV_PATH="/storage/conda_envs/${ENV_NAME}"
 
-if ! command -v conda >/dev/null 2>&1; then
-  echo "conda is not on PATH. Activate your conda base first." >&2
-  exit 1
-fi
-
-# Source conda in this non-interactive shell.
-source "$(conda info --base)/etc/profile.d/conda.sh"
-
-if conda env list | grep -qE "^${ENV_NAME}[[:space:]]"; then
-  echo "Environment ${ENV_NAME} already exists; reusing it."
-else
-  echo "Creating conda environment: ${ENV_NAME}"
+# Create the environment if it does not already exist.
+if ! conda env list | grep -qE "^${ENV_NAME}[[:space:]]"; then
   conda create -y -n "${ENV_NAME}" -c conda-forge \
     python=3.11 \
     pip \
@@ -59,27 +45,5 @@ python -m pip install \
 
 python -m ipykernel install --user --name="${ENV_NAME}" --display-name="${ENV_NAME}"
 
-python - <<'PY'
-import importlib
-mods = [
-    "numpy",
-    "pandas",
-    "scipy",
-    "matplotlib",
-    "sklearn",
-    "hmmlearn",
-    "pynapple",
-    "pynwb",
-    "dandi",
-    "joblib",
-]
-for mod in mods:
-    importlib.import_module(mod)
-    print(f"OK: {mod}")
-PY
-
-echo ""
-echo "Environment ready: ${ENV_NAME}"
-echo "Activate it with: conda activate ${ENV_NAME}"
-echo "The Jupyter kernel is registered as: ${ENV_NAME}"
-jupyter kernelspec list
+echo 'Done.'
+echo "Kernel registered: ${ENV_NAME}"
