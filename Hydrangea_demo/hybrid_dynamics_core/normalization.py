@@ -77,6 +77,12 @@ class NormalizationStep:
         self.unit_ids = self.unit_ids[keep_mask]
         spike_arrays = [spk for spk, keep in zip(spike_arrays, keep_mask) if keep]
         self.raw_counts = counts
+        self.unit_metadata_filtered = {}
+        if hasattr(source, "metadata_columns"):
+            for key in list(source.metadata_columns):
+                values = np.asarray(source.get_info(key))
+                if len(values) == len(keep_mask):
+                    self.unit_metadata_filtered[key] = values[keep_mask]
 
         if method == "proportion_zscore":
             neuron_totals = np.array([spk.size for spk in spike_arrays], dtype=float)
@@ -115,6 +121,134 @@ class NormalizationStep:
         self.spike_matrix = matrix.astype(float)
         return self.spike_matrix.copy(), self.bin_times_s.copy()
 
+    def _safe_hist(self, ax_obj, values, bins=30, log=False, **kwargs):
+        arr = np.asarray(values, dtype=float).ravel()
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            ax_obj.text(0.5, 0.5, "No finite data", ha="center", va="center", transform=ax_obj.transAxes)
+            return
+
+        vmin = float(np.min(arr))
+        vmax = float(np.max(arr))
+        if np.isclose(vmin, vmax):
+            pad = max(abs(vmin) * 1e-6, 1e-6)
+            ax_obj.hist(arr, bins=1, range=(vmin - pad, vmax + pad), log=log, **kwargs)
+        else:
+            ax_obj.hist(arr, bins=bins, log=log, **kwargs)
+
+    def plot_raw_population_counts(self, ax=None, show=True):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.figure
+        self._safe_hist(ax, self.raw_counts.ravel(), bins=np.arange(0, np.max(self.raw_counts) + 2) - 0.5, log=True)
+        ax.set(title="Raw bin counts (population, log y)", xlabel="count", ylabel="freq")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_fraction_empty_bins(self, ax=None, show=True):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.figure
+        frac_zero = (self.raw_counts == 0).mean(0)
+        self._safe_hist(ax, frac_zero, bins=30)
+        ax.set(title="Fraction empty bins/neuron", xlabel="P(count=0)", ylabel="count")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_raw_mean_variance(self, ax=None, show=True):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.figure
+        m = self.raw_counts.mean(axis=0)
+        v = self.raw_counts.var(axis=0)
+        ax.loglog(m + 1e-3, v + 1e-6, ".", alpha=0.5)
+        lims = [max(m.min() + 1e-3, 1e-3), max(m.max(), 1e-3)]
+        ax.plot(lims, lims, "k--", label="var = mean")
+        ax.set(title="Mean vs var — raw", xlabel="mean", ylabel="var")
+        ax.legend()
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_normalized_population_distribution(self, ax=None, show=True):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.figure
+        self._safe_hist(ax, self.spike_matrix.ravel(), bins=100, log=True)
+        ax.set(title="Normalized values (population, log y)", xlabel="z", ylabel="freq")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_total_spikes_per_neuron(self, ax=None, show=True):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.figure
+        neuron_totals = getattr(self, "neuron_totals", np.array([]))
+        if len(neuron_totals) > 0:
+            self._safe_hist(ax, neuron_totals, bins=40)
+            ax.set(title="Total spikes/neuron (divisor)", xlabel="spike count", ylabel="count")
+        else:
+            ax.axis("off")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_normalized_distributions_by_region(self, region_key=None, show=True, min_count=1):
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+
+        region_key = region_key or getattr(self, "region_key", None) or "cell_area"
+        regions = self.unit_metadata_filtered.get(region_key)
+        if regions is None:
+            raise ValueError(f"No metadata available for region key '{region_key}'.")
+
+        unique_regions = [r for r in np.unique(regions) if np.sum(regions == r) >= min_count]
+        if len(unique_regions) == 0:
+            raise ValueError(f"No regions with at least {min_count} units available for '{region_key}'.")
+
+        ncols = min(3, len(unique_regions))
+        nrows = int(np.ceil(len(unique_regions) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+
+        for ax in axes.ravel():
+            ax.axis("off")
+
+        for i, region in enumerate(unique_regions):
+            ax = axes.ravel()[i]
+            ax.axis("on")
+            mask = regions == region
+            self._safe_hist(ax, self.spike_matrix[:, mask].ravel(), bins=100, log=True)
+            ax.set(title=f"{region} (n={int(mask.sum())})", xlabel="z", ylabel="freq")
+
+        fig.suptitle(f"Normalized population distribution by {region_key}")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, axes
+
     def normalization_report(self, show=True):
         """Print diagnostic plots for the normalized spike matrix.
 
@@ -125,42 +259,32 @@ class NormalizationStep:
         """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
-
-        M = self.spike_matrix
-        counts = self.raw_counts
-        neuron_totals = getattr(self, "neuron_totals", np.array([]))
         fig, ax = plt.subplots(2, 3, figsize=(16, 9))
 
-        ax[0, 0].hist(M.ravel(), bins=100, log=True)
-        ax[0, 0].set(title="Normalized values (log y)", xlabel="z", ylabel="freq")
+        self.plot_raw_population_counts(ax=ax[0, 0], show=False)
+        self.plot_fraction_empty_bins(ax=ax[0, 1], show=False)
+        self.plot_raw_mean_variance(ax=ax[0, 2], show=False)
 
-        frac_zero = (counts == 0).mean(0)
-        ax[0, 1].hist(frac_zero, bins=30)
-        ax[0, 1].set(title="Fraction empty bins/neuron", xlabel="P(count=0)", ylabel="count")
+        self.plot_normalized_population_distribution(ax=ax[1, 0], show=False)
+        self.plot_total_spikes_per_neuron(ax=ax[1, 2], show=False)
 
-        m = counts.mean(axis=0)
-        v = counts.var(axis=0)
-        ax[0, 2].loglog(m + 1e-3, v + 1e-6, ".", alpha=0.5)
-        lims = [max(m.min() + 1e-3, 1e-3), max(m.max(), 1e-3)]
-        ax[0, 2].plot(lims, lims, "k--", label="var = mean")
-        ax[0, 2].set(title="Mean vs var — raw", xlabel="mean", ylabel="var")
-        ax[0, 2].legend()
-
-        ax[1, 0].hist(M.std(axis=0), bins=30)
-        ax[1, 0].set(title="Per-neuron std after norm (~1)", xlabel="std", ylabel="count")
-
-        if len(neuron_totals) > 0:
-            idx = np.argsort(neuron_totals)[len(neuron_totals) // 4]
+        # Put a region-distribution summary into the lower middle panel to keep the report compact.
+        ax[1, 1].axis("off")
+        region_key = getattr(self, "region_key", None) or "cell_area"
+        if region_key in self.unit_metadata_filtered:
+            regions = self.unit_metadata_filtered[region_key]
+            unique_regions = [r for r in np.unique(regions) if np.sum(regions == r) > 0]
+            summary = "\n".join([f"{r}: n={int(np.sum(regions == r))}" for r in unique_regions])
+            ax[1, 1].text(
+                0.0,
+                1.0,
+                f"Region slices available via plot_normalized_distributions_by_region()\n\n"
+                f"{region_key}\n\n{summary}",
+                va="top",
+            )
         else:
-            idx = np.argsort(np.abs(M.mean(axis=0)))[len(M.T) // 2]
-        ax[1, 1].hist(M[:, idx], bins=50)
-        ax[1, 1].set(title=f"Neuron {idx}: normalized dist", xlabel="normalized value", ylabel="count")
+            ax[1, 1].text(0.0, 1.0, "No region metadata available for region slicing", va="top")
 
-        if len(neuron_totals) > 0:
-            ax[1, 2].hist(neuron_totals, bins=40)
-            ax[1, 2].set(title="Total spikes/neuron (divisor)", xlabel="spike count", ylabel="count")
-        else:
-            ax[1, 2].axis("off")
         fig.suptitle(f"Normalization: {self.normalization_method}")
         fig.tight_layout()
         if show:

@@ -47,6 +47,86 @@ class HMMReportStep:
             "switch_rate_per_s": switch_rate,
         }
 
+    def plot_selected_cv_curve(self, ax=None, show=True):
+        if self.hmm_scores is None:
+            raise ValueError("Run fit_hmm() first.")
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        else:
+            fig = ax.figure
+        ax.plot(self.hmm_scores.index, self.hmm_scores["median_cv_loglik"], marker="o", color="tab:green")
+        ax.set_title("Median temporal CV log-likelihood by K")
+        ax.set_xlabel("n states")
+        ax.set_ylabel("CV log-likelihood")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_state_sequence(self, seq, n_states, ax=None, show=True, title=None):
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 3))
+        else:
+            fig = ax.figure
+        ax.scatter(self.bin_times_s, seq, c=seq, cmap="tab10", s=2, marker="s")
+        ax.set(
+            title=title or f"State sequence (K={n_states})",
+            xlabel="time (s)",
+            ylabel="state",
+            yticks=range(n_states),
+        )
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_state_occupancy(self, occ, n_states, ax=None, show=True, title="Occupancy (%)"):
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 3))
+        else:
+            fig = ax.figure
+        bars = ax.bar(np.arange(n_states), occ, color="tab:blue")
+        ax.set(title=title, xlabel="state", ylabel="% of time", xticks=range(n_states))
+        ax.grid(alpha=0.3, axis="y")
+        for b, v in zip(bars, occ):
+            ax.text(b.get_x() + b.get_width() / 2, b.get_height(), f"{v:.1f}%", ha="center", va="bottom", fontsize=8)
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_state_dwell(self, dwell, n_states, ax=None, show=True, title="Mean dwell time"):
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 3))
+        else:
+            fig = ax.figure
+        bars = ax.bar(np.arange(n_states), dwell, color="tab:green")
+        ax.set(title=title, xlabel="state", ylabel="seconds", xticks=range(n_states))
+        ax.grid(alpha=0.3, axis="y")
+        for b, v in zip(bars, dwell):
+            ax.text(b.get_x() + b.get_width() / 2, b.get_height(), f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
+    def plot_transition_matrix(self, T, n_states, ax=None, show=True, title="Transition matrix"):
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+        else:
+            fig = ax.figure
+        im = ax.imshow(T, cmap="viridis", vmin=0, vmax=1)
+        ax.set(title=title, xlabel="to state", ylabel="from state", xticks=range(n_states), yticks=range(n_states))
+        for i in range(n_states):
+            for j in range(n_states):
+                ax.text(j, i, f"{T[i, j]:.2f}", ha="center", va="center", color="w" if T[i, j] < 0.6 else "k", fontsize=7)
+        fig.colorbar(im, ax=ax, label="P(to|from)")
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
+
     def hmm_report(self, report=None):
         """Display a selected or full HMM diagnostic report.
 
@@ -69,14 +149,7 @@ class HMMReportStep:
             print("Ranked CV table:")
             print(ranked[["median_cv_loglik", "AIC", "BIC", "loglik"]])
 
-            fig, ax = plt.subplots(1, 1, figsize=(8, 4))
-            ax.plot(self.hmm_scores.index, self.hmm_scores["median_cv_loglik"], marker="o", color="tab:green")
-            ax.set_title("Median temporal CV log-likelihood by K")
-            ax.set_xlabel("n states")
-            ax.set_ylabel("CV log-likelihood")
-            ax.grid(alpha=0.3)
-            plt.tight_layout()
-            plt.show()
+            fig, ax = self.plot_selected_cv_curve(show=True)
             return fig
 
         if report == "full":
@@ -107,27 +180,10 @@ class HMMReportStep:
                 })
 
                 fig, axes = plt.subplots(2, 2, figsize=(16, 9), gridspec_kw={"height_ratios": [2, 1]})
-                axes[0, 0].scatter(self.bin_times_s, seq, c=seq, cmap="tab10", s=2, marker="s")
-                axes[0, 0].set(title=f"State sequence (K={n_states})", xlabel="time (s)", ylabel="state", yticks=range(n_states))
-
-                bars = axes[0, 1].bar(np.arange(n_states), occ, color="tab:blue")
-                axes[0, 1].set(title="Occupancy (%)", xlabel="state", ylabel="% of time", xticks=range(n_states))
-                axes[0, 1].grid(alpha=0.3, axis="y")
-                for b, v in zip(bars, occ):
-                    axes[0, 1].text(b.get_x() + b.get_width() / 2, b.get_height(), f"{v:.1f}%", ha="center", va="bottom", fontsize=8)
-
-                bars = axes[1, 0].bar(np.arange(n_states), mean_dwell, color="tab:green")
-                axes[1, 0].set(title="Mean dwell time", xlabel="state", ylabel="seconds", xticks=range(n_states))
-                axes[1, 0].grid(alpha=0.3, axis="y")
-                for b, v in zip(bars, mean_dwell):
-                    axes[1, 0].text(b.get_x() + b.get_width() / 2, b.get_height(), f"{v:.1f}", ha="center", va="bottom", fontsize=8)
-
-                im = axes[1, 1].imshow(T, cmap="viridis", vmin=0, vmax=1)
-                axes[1, 1].set(title="Transition matrix", xlabel="to state", ylabel="from state", xticks=range(n_states), yticks=range(n_states))
-                for i in range(n_states):
-                    for j in range(n_states):
-                        axes[1, 1].text(j, i, f"{T[i, j]:.2f}", ha="center", va="center", color="w" if T[i, j] < 0.6 else "k", fontsize=7)
-                fig.colorbar(im, ax=axes[1, 1], label="P(to|from)")
+                self.plot_state_sequence(seq, n_states, ax=axes[0, 0], show=False)
+                self.plot_state_occupancy(occ, n_states, ax=axes[0, 1], show=False)
+                self.plot_state_dwell(mean_dwell, n_states, ax=axes[1, 0], show=False)
+                self.plot_transition_matrix(T, n_states, ax=axes[1, 1], show=False)
 
                 fig.suptitle(
                     f"K={n_states} | switch_rate={diag['switch_rate_per_s']:.3f}/s | "
