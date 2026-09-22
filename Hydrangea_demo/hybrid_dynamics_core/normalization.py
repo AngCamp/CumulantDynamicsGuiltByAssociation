@@ -3,9 +3,27 @@ import matplotlib.pyplot as plt
 
 
 class NormalizationStep:
-    """Normalize spike matrix."""
+    """Methods for transforming spike trains into a normalized observation matrix.
+
+    This is the first step in the HybridDynamicsAnalysis pipeline. It converts
+    spike times into a time-by-unit matrix using a fixed bin width, and stores
+    the relevant metadata on the object for later analysis steps.
+    """
 
     def normalize(self, method="proportion_zscore", zscore=True, smooth_sigma_bins=None, restrict_to_epoch=True):
+        """Build the normalized spike matrix.
+
+        Parameters
+        ----------
+        method : {'proportion_zscore', 'count_zscore', 'raw_counts'}
+            Normalization method applied before the HMM.
+        zscore : bool
+            If True, z-score the selected matrix along units.
+        smooth_sigma_bins : float or None
+            Optional Gaussian smoothing width in bins.
+        restrict_to_epoch : bool
+            If True and a maze epoch exists, restrict spike trains before binning.
+        """
         if restrict_to_epoch and self.maze_epoch is not None:
             source = self.spike_group.restrict(self.maze_epoch)
         else:
@@ -61,6 +79,13 @@ class NormalizationStep:
         return self.spike_matrix.copy(), self.bin_times_s.copy()
 
     def normalization_report(self, show=True):
+        """Print diagnostic plots for the normalized spike matrix.
+
+        Parameters
+        ----------
+        show : bool
+            If True, immediately display the generated plots.
+        """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
 

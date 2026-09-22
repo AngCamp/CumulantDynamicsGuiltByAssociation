@@ -3,9 +3,24 @@ import matplotlib.pyplot as plt
 
 
 class GlobalReductionStep:
-    """Global reduction via PCA."""
+    """Global dimensionality reduction step.
+
+    This step applies a global PCA to the normalized spike matrix so the state
+    finder can work with lower-dimensional embeddings before HMM fitting.
+    """
 
     def global_pca(self, n_components=10, whiten=False, standardize=True):
+        """Fit PCA to the normalized spike matrix.
+
+        Parameters
+        ----------
+        n_components : int
+            Number of principal components to retain.
+        whiten : bool
+            Whether to whiten the output features.
+        standardize : bool
+            Whether to z-score the matrix before PCA.
+        """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
 
@@ -29,6 +44,13 @@ class GlobalReductionStep:
         return scores, pca
 
     def pca_report(self, show=True):
+        """Display PCA variance and projection diagnostics.
+
+        Parameters
+        ----------
+        show : bool
+            If True, display the plot immediately.
+        """
         if self.pca_model is None:
             raise ValueError("Run global_pca() first.")
 

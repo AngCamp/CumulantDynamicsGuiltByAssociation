@@ -4,50 +4,149 @@ from hmmlearn.hmm import GaussianHMM
 
 
 class HMMFittingStep:
-    """Fit Gaussian HMM models."""
+    """Fit Gaussian HMM models across a state-count range.
+
+    Default behaviour is to sweep a range of K values, while cross-validation is
+    governed by the number of folds and the fold strategy. The default fold
+    strategy is to split the recording into contiguous temporal segments, with an
+    optional randomization inside each temporal block.
+    """
 
     def _hmm_param_count(self, n_states, n_features):
         return n_states * (n_states - 1) + (n_states - 1) + n_states * n_features + n_states * n_features
 
-    def build_folds(self, n_folds=5, strategy="temporal_block_randomized", seed=None):
+    def build_folds(self, k_fold=5, fold_strategy="temporal_segments", shuffle_within_segments=True, seed=None, event_intervals=None):
+        """Build validation folds for HMM cross-validation.
+
+        Parameters
+        ----------
+        k_fold : int
+            Number of folds used for cross-validation.
+        fold_strategy : {'temporal_segments', 'contiguous', 'event_intervals'}
+            How the time series is partitioned into validation sets.
+            - temporal_segments: split the recording into contiguous temporal blocks
+            - contiguous: naive contiguous folds
+            - event_intervals: accept a pynapple IntervalSet of event blocks and
+              shuffle these blocks before assigning them to folds
+        shuffle_within_segments : bool
+            If True, randomize within each temporal segment before assigning the
+            held-out portion. This preserves long-term temporal structure while
+            preventing a single local region dominating the validation set.
+        seed : int or None
+            Random seed for reproducible fold assignment.
+        event_intervals : pynapple.IntervalSet or None
+            Explicit event-based interval set used when fold_strategy='event_intervals'.
+        """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
 
         n_samples = self.spike_matrix.shape[0]
-        if n_samples < n_folds:
+        if n_samples < k_fold:
             raise ValueError("Need more samples than folds.")
 
         rng = np.random.default_rng(seed if seed is not None else self.random_state)
+        self.fold_idx = None
 
-        if strategy == "contiguous":
-            edges = np.linspace(0, n_samples, n_folds + 1, dtype=int)
-            self.fold_idx = [np.arange(edges[i], edges[i + 1]) for i in range(n_folds)]
+        if fold_strategy == "contiguous":
+            edges = np.linspace(0, n_samples, k_fold + 1, dtype=int)
+            self.fold_idx = [np.arange(edges[i], edges[i + 1]) for i in range(k_fold)]
 
-        elif strategy == "temporal_block_randomized":
-            edges = np.linspace(0, n_samples, n_folds + 1, dtype=int)
+        elif fold_strategy == "temporal_segments":
+            edges = np.linspace(0, n_samples, k_fold + 1, dtype=int)
             block_ranges = list(zip(edges[:-1], edges[1:]))
-            block_splits = [np.array_split(np.arange(a, b), n_folds) for a, b in block_ranges]
+            block_splits = [np.array_split(np.arange(a, b), k_fold) for a, b in block_ranges]
 
             fold_idx = []
-            for fold in range(n_folds):
+            for fold in range(k_fold):
                 selected = []
-                for b in range(n_folds):
-                    perm = np.argsort(rng.random(len(block_splits[b])))
-                    selected.append(block_splits[b][perm[fold]])
+                for b in range(k_fold):
+                    if shuffle_within_segments:
+                        perm = np.argsort(rng.random(len(block_splits[b])))
+                        chosen = block_splits[b][perm[fold]]
+                    else:
+                        chosen = block_splits[b][fold]
+                    selected.append(chosen)
                 fold_idx.append(np.concatenate(selected))
             self.fold_idx = fold_idx
 
+        elif fold_strategy == "event_intervals":
+            if event_intervals is None:
+                raise ValueError("event_intervals requires a pynapple IntervalSet object.")
+
+            if not hasattr(event_intervals, "start") or not hasattr(event_intervals, "end"):
+                raise TypeError("event_intervals must be a pynapple IntervalSet-like object with start/end attributes.")
+
+            interval_starts = np.asarray(event_intervals.start)
+            interval_ends = np.asarray(event_intervals.end)
+            time_points = self.bin_times_s
+
+            candidates = []
+            for s, e in zip(interval_starts, interval_ends):
+                mask = (time_points >= s) & (time_points < e)
+                if np.any(mask):
+                    candidates.append(np.nonzero(mask)[0])
+
+            if len(candidates) == 0:
+                raise ValueError("No time points fell inside the supplied event intervals.")
+
+            order = np.arange(len(candidates))
+            if len(candidates) > 1:
+                order = rng.permutation(order)
+
+            fold_idx = [[] for _ in range(k_fold)]
+            for idx, block_idx in enumerate(order):
+                fold_idx[idx % k_fold].append(candidates[block_idx])
+
+            self.fold_idx = [np.concatenate(x) if len(x) else np.array([], dtype=int) for x in fold_idx]
+
         else:
-            raise ValueError(f"Unknown fold strategy: {strategy}")
+            raise ValueError(f"Unknown fold strategy: {fold_strategy}")
 
         return self.fold_idx
 
-    def fit_hmm(self, k_values=None, n_iter=100, covariance_type="diag", verbose=False, use_cv=True, report="full"):
+    def fit_hmm(self, n_states_min=2, n_states_max=10, k_fold=5, fold_strategy="temporal_segments", shuffle_within_segments=True, n_iter=100, covariance_type="diag", verbose=False, use_cv=True, report="full", event_intervals=None):
+        """Fit a sweep of Gaussian HMMs across a simple integer state-count range.
+
+        Parameters
+        ----------
+        n_states_min : int
+            Minimum number of latent states to test.
+        n_states_max : int
+            Maximum number of latent states to test.
+        k_fold : int
+            Number of cross-validation folds used when use_cv is True.
+        fold_strategy : {'temporal_segments', 'contiguous', 'event_intervals'}
+            How the time series is partitioned into validation sets.
+        shuffle_within_segments : bool
+            Whether to randomize subsegments inside each temporal block.
+        n_iter : int
+            Maximum EM iterations for each HMM fit.
+        covariance_type : {'diag', 'full'}
+            Gaussian HMM covariance form.
+        verbose : bool
+            Verbosity for hmmlearn.
+        use_cv : bool
+            Whether to perform cross-validation using the configured folds.
+        report : {'full', 'selected', 'none'}
+            Reporting mode for model comparison summary.
+        event_intervals : pynapple.IntervalSet or None
+            Interval-based validation blocks when fold_strategy='event_intervals'.
+        """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
 
-        if k_values is None:
-            k_values = list(range(10, 1, -1))
+        if n_states_min > n_states_max:
+            raise ValueError("n_states_min must be <= n_states_max.")
+
+        k_values = list(range(n_states_max, n_states_min - 1, -1))
+        if self.fold_idx is None:
+            self.build_folds(
+                k_fold=k_fold,
+                fold_strategy=fold_strategy,
+                shuffle_within_segments=shuffle_within_segments,
+                seed=self.random_state,
+                event_intervals=event_intervals,
+            )
 
         self.hmm_models = {}
         rows = []

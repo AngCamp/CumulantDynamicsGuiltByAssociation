@@ -4,7 +4,12 @@ import matplotlib.pyplot as plt
 
 
 class HMMReportStep:
-    """HMM summaries and plots."""
+    """Reporting tools for HMM model comparison and diagnostics.
+
+    This step inspects fitted HMMs across K values, ranks them by validation
+    likelihood, and produces plots for state occupancy, dwell times, and
+    transition matrices.
+    """
 
     def _summarize_sequence(self, seq, n_states, dt):
         seq = np.asarray(seq, dtype=int)
@@ -43,6 +48,14 @@ class HMMReportStep:
         }
 
     def hmm_report(self, report=None):
+        """Display a selected or full HMM diagnostic report.
+
+        Parameters
+        ----------
+        report : {'selected', 'full', 'none'}
+            Report mode. 'selected' returns the ranked CV table and the main plot.
+            'full' returns per-K state diagnostics and transition summaries.
+        """
         if self.hmm_scores is None:
             raise ValueError("Run fit_hmm() first.")
 
