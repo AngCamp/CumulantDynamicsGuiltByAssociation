@@ -1,42 +1,85 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Conda and Jupyter Kernel Startup Script for Hydrangea
-# Run this at the start of each session to activate conda and register kernels.
+# Single environment for the Hydrangea / DANDI / pynapple analysis pipeline.
+# This project does not need the unrelated allensdk / mne / bugeon envs.
+# The actual code uses:
+#   - numpy, scipy, pandas, matplotlib
+#   - scikit-learn, hmmlearn
+#   - pynapple, pynwb, dandi
+#   - jupyter/ipykernel
 
-echo 'Activating conda...'
-source /storage/miniconda3/bin/activate
+ENV_NAME="hydrangea_env"
+ENV_PATH="/storage/conda_envs/${ENV_NAME}"
 
-echo 'Registering hydrangea_env kernel...'
-conda activate /storage/conda_envs/hydrangea_env
-python -m ipykernel install --user --name=hydrangea_env --display-name='hydrangea_env'
-conda deactivate
+if ! command -v conda >/dev/null 2>&1; then
+  echo "conda is not on PATH. Activate your conda base first." >&2
+  exit 1
+fi
 
-echo 'Registering allensdk_env kernel...'
-conda activate /storage/conda_envs/allensdk_env
-python -m ipykernel install --user --name=allensdk_env --display-name='allensdk_env'
-conda deactivate
+# Source conda in this non-interactive shell.
+source "$(conda info --base)/etc/profile.d/conda.sh"
 
-echo 'Registering mne_env kernel...'
-conda activate /storage/conda_envs/mne_env
-python -m ipykernel install --user --name=mne_env --display-name='mne_env'
-conda deactivate
+if conda env list | grep -qE "^${ENV_NAME}[[:space:]]"; then
+  echo "Environment ${ENV_NAME} already exists; reusing it."
+else
+  echo "Creating conda environment: ${ENV_NAME}"
+  conda create -y -n "${ENV_NAME}" -c conda-forge \
+    python=3.11 \
+    pip \
+    numpy \
+    pandas \
+    scipy \
+    matplotlib \
+    scikit-learn \
+    hmmlearn \
+    joblib \
+    h5py \
+    xarray \
+    dask \
+    distributed \
+    tqdm \
+    ipykernel \
+    jupyterlab \
+    numba \
+    requests \
+    aiohttp \
+    fsspec
+fi
 
-echo 'Registering bugeon_dynamics kernel...'
-conda activate /storage/conda_envs/bugeon_dynamics
-python -m ipykernel install --user --name=bugeon_dynamics --display-name='bugeon_dynamics'
-conda deactivate
+conda activate "${ENV_NAME}"
 
-echo 'Creating and registering pynapple_dandi_env kernel...'
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-conda create --yes --prefix /storage/conda_envs/pynapple_dandi_env pip python=3.11
-conda activate /storage/conda_envs/pynapple_dandi_env
-conda install --yes conda-forge::dandi
-pip install pynapple
-pip install ipykernel
-python -m ipykernel install --user --name=pynapple_dandi_env --display-name='pynapple_dandi_env'
-conda deactivate
+python -m pip install --upgrade pip
+python -m pip install \
+  pynapple \
+  dandi \
+  dandischema \
+  pynwb \
+  remfile
 
-echo 'Done! Kernels registered. Refresh your Jupyter page.'
-echo 'Available kernels:'
+python -m ipykernel install --user --name="${ENV_NAME}" --display-name="${ENV_NAME}"
+
+python - <<'PY'
+import importlib
+mods = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "matplotlib",
+    "sklearn",
+    "hmmlearn",
+    "pynapple",
+    "pynwb",
+    "dandi",
+    "joblib",
+]
+for mod in mods:
+    importlib.import_module(mod)
+    print(f"OK: {mod}")
+PY
+
+echo ""
+echo "Environment ready: ${ENV_NAME}"
+echo "Activate it with: conda activate ${ENV_NAME}"
+echo "The Jupyter kernel is registered as: ${ENV_NAME}"
 jupyter kernelspec list
