@@ -11,6 +11,9 @@ ROOT = Path.cwd().resolve()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import numpy as np
+import pynapple as nap
+
 from hybrid_dynamics_core.base import HybridDynamicsAnalysis
 
 DOWNLOAD_DIR = Path("/storage/dandi_downloads").resolve()
@@ -52,13 +55,24 @@ def print_session_table(download_root: Path):
 
 print_session_table(DOWNLOAD_DIR)
 
-# Assumes the following notebook objects already exist inside the notebook cell:
-#   spike_group
-#   maze_ep
-#   position_xy
-#   spike_group_maze
-#   bin_times_s
-#   session_nwb
+# Build the same session context used in the notebook.
+# Hardcoded for the known dataset in this tutorial script.
+session_nwb_path = Path(
+    "/storage/dandi_downloads/sub-M01/"
+    "sub-M01_ses-20240313T100000_behavior+ecephys.nwb"
+).resolve()
+session_nwb = nap.load_file(str(session_nwb_path))
+
+spike_group = session_nwb["units"]
+position_xy = session_nwb["Position"]
+
+maze_start = float(position_xy.index[0])
+maze_end = float(position_xy.index[-1])
+maze_ep = nap.IntervalSet(start=maze_start, end=maze_end)
+spike_group_maze = spike_group.restrict(maze_ep)
+
+print("Session NWB path:", session_nwb_path)
+print("Units before/after maze restriction:", len(spike_group), "/", len(spike_group_maze))
 
 # Example usage: create a Hydrangea object and call steps in order.
 hybdyn = HybridDynamicsAnalysis(
