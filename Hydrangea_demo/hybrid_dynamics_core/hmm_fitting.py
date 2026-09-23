@@ -1,8 +1,16 @@
+import pickle
+import time
+import warnings
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import pickle
 from hmmlearn.hmm import GaussianHMM
+
+try:
+    from sklearn.exceptions import ConvergenceWarning
+except ImportError:  # pragma: no cover - sklearn always ships this
+    ConvergenceWarning = UserWarning
 
 
 class HMMFittingStep:
@@ -125,8 +133,34 @@ class HMMFittingStep:
 
         return self.fold_idx
 
-    def fit_hmm(self, n_states_min=2, n_states_max=10, k_fold=5, fold_strategy="temporal_segments", shuffle_within_segments=True, n_iter=100, covariance_type="diag", verbose=False, use_cv=True, report="full", event_intervals=None):
+    def _fit_one_hmm(self, matrix, n_states, covariance_type, n_iter, verbose):
+        """Fit a single Gaussian HMM and report how the EM run went."""
+        hmm = GaussianHMM(
+            n_components=n_states,
+            covariance_type=covariance_type,
+            n_iter=n_iter,
+            random_state=self.random_state,
+            verbose=verbose,
+        )
+        started = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            hmm.fit(matrix)
+        elapsed = time.perf_counter() - started
+
+        monitor = getattr(hmm, "monitor_", None)
+        converged = bool(getattr(monitor, "converged", False))
+        iterations = int(getattr(monitor, "iter", 0) or len(getattr(monitor, "history", []) or []))
+        return hmm, elapsed, converged, iterations
+
+    def fit_hmm(self, n_states_min=2, n_states_max=10, k_fold=5, fold_strategy="temporal_segments", shuffle_within_segments=True, n_iter=100, covariance_type="diag", verbose=False, use_cv=True, report="full", event_intervals=None, show_progress=True):
         """Fit a sweep of Gaussian HMMs across a simple integer state-count range.
+
+        Each K is fit once on the whole matrix (for AIC/BIC and the state
+        sequence) and then k_fold more times on held-out splits (for the CV
+        score that selects K). That is K * (1 + k_fold) EM runs, so progress
+        reporting matters: `show_progress` prints where the sweep is, how long
+        each fit took, and whether EM converged.
 
         Parameters
         ----------
@@ -145,13 +179,25 @@ class HMMFittingStep:
         covariance_type : {'diag', 'full'}
             Gaussian HMM covariance form.
         verbose : bool
-            Verbosity for hmmlearn.
+            hmmlearn's own EM monitor: one line per EM iteration with the
+            running log-likelihood and its delta. Useful when diagnosing a
+            single fit that will not converge, but it says nothing about which
+            K or fold is running. Leave it off and use `show_progress` instead.
         use_cv : bool
             Whether to perform cross-validation using the configured folds.
         report : {'full', 'selected', 'none'}
-            Reporting mode for model comparison summary.
+            Reporting mode for the model comparison table.
         event_intervals : pynapple.IntervalSet or None
             Interval-based validation blocks when fold_strategy='event_intervals'.
+        show_progress : bool
+            Print one line per fit: K, fold, elapsed seconds, EM iterations, and
+            whether EM converged, plus a per-K summary.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per K. Log-likelihoods, information criteria, the spread of
+            the CV folds (mean/median/std/min/max), EM convergence, and timings.
         """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
@@ -177,67 +223,147 @@ class HMMFittingStep:
         self.hmm_models = {}
         rows = []
 
-        n_obs = self.spike_matrix.shape[0]
+        n_obs, n_features = self.spike_matrix.shape
+        run_cv = use_cv and self.fold_idx is not None
+        n_folds = len(self.fold_idx) if run_cv else 0
+        n_fits = len(k_values) * (1 + n_folds)
+        sweep_started = time.perf_counter()
 
-        for n_states in k_values:
-            hmm = GaussianHMM(
-                n_components=n_states,
-                covariance_type=covariance_type,
-                n_iter=n_iter,
-                random_state=self.random_state,
-                verbose=verbose,
+        if show_progress:
+            print(
+                f"Fitting {len(k_values)} models (K={min(k_values)}..{max(k_values)}) on "
+                f"{n_obs} bins x {n_features} units | {covariance_type} covariance | "
+                f"{n_folds} CV folds -> {n_fits} EM runs"
             )
-            hmm.fit(self.spike_matrix)
 
+        for model_i, n_states in enumerate(k_values, start=1):
+            if show_progress:
+                print(f"  K={n_states:<3} [{model_i}/{len(k_values)}]", flush=True)
+
+            hmm, fit_seconds, converged, iterations = self._fit_one_hmm(
+                self.spike_matrix, n_states, covariance_type, n_iter, verbose
+            )
             loglik = float(hmm.score(self.spike_matrix))
-            n_params = self._hmm_param_count(n_states, self.spike_matrix.shape[1])
+            n_params = self._hmm_param_count(n_states, n_features)
 
-            if self.fold_idx is not None and use_cv:
+            if show_progress:
+                flag = "converged" if converged else f"HIT n_iter={n_iter}"
+                print(
+                    f"      full fit   {fit_seconds:6.1f}s  {iterations:>3} iter  {flag:<16}"
+                    f"loglik={loglik:,.0f}",
+                    flush=True,
+                )
+
+            cv_seconds = 0.0
+            if run_cv:
                 cv_scores = []
-                for fold in self.fold_idx:
+                for fold_i, fold in enumerate(self.fold_idx, start=1):
                     if len(fold) == 0:
                         raise ValueError("Encountered an empty validation fold; cannot run CV scoring.")
                     train_idx = np.setdiff1d(np.arange(n_obs), fold, assume_unique=True)
                     if len(train_idx) == 0:
                         raise ValueError("Encountered an empty training fold; cannot run CV scoring.")
-                    cv_hmm = GaussianHMM(
-                        n_components=n_states,
-                        covariance_type=covariance_type,
-                        n_iter=n_iter,
-                        random_state=self.random_state,
-                        verbose=False,
+
+                    cv_hmm, fold_seconds, fold_converged, fold_iterations = self._fit_one_hmm(
+                        self.spike_matrix[train_idx], n_states, covariance_type, n_iter, False
                     )
-                    cv_hmm.fit(self.spike_matrix[train_idx])
-                    cv_scores.append(float(cv_hmm.score(self.spike_matrix[fold])))
-                median_cv = float(np.median(cv_scores))
+                    score = float(cv_hmm.score(self.spike_matrix[fold]))
+                    cv_scores.append(score)
+                    cv_seconds += fold_seconds
+
+                    if show_progress:
+                        flag = "converged" if fold_converged else f"HIT n_iter={n_iter}"
+                        print(
+                            f"      fold {fold_i}/{n_folds}  {fold_seconds:6.1f}s  "
+                            f"{fold_iterations:>3} iter  {flag:<16}"
+                            f"held-out loglik={score:,.0f}",
+                            flush=True,
+                        )
+
                 cv_arr = np.asarray(cv_scores, dtype=float)
             else:
-                median_cv = loglik
                 cv_arr = np.array([loglik], dtype=float)
 
             rows.append({
                 "n_states": n_states,
+                "n_params": n_params,
                 "loglik": loglik,
+                "loglik_per_bin": loglik / n_obs,
                 "AIC": -2 * loglik + 2 * n_params,
                 "BIC": -2 * loglik + n_params * np.log(n_obs),
-                "n_params": n_params,
-                "median_cv_loglik": median_cv,
+                "mean_cv_loglik": float(np.mean(cv_arr)),
+                "median_cv_loglik": float(np.median(cv_arr)),
+                "std_cv_loglik": float(np.std(cv_arr)),
+                "min_cv_loglik": float(np.min(cv_arr)),
+                "max_cv_loglik": float(np.max(cv_arr)),
+                "converged": converged,
+                "n_iter_run": iterations,
+                "fit_seconds": fit_seconds,
+                "cv_seconds": cv_seconds,
+                "total_seconds": fit_seconds + cv_seconds,
                 "cv_fold_loglik": cv_arr.tolist(),
             })
 
             self.hmm_models[n_states] = hmm
 
+            if show_progress:
+                elapsed = time.perf_counter() - sweep_started
+                done = model_i * (1 + n_folds)
+                remaining = (elapsed / done) * (n_fits - done) if done else 0.0
+                print(
+                    f"      K={n_states} done in {fit_seconds + cv_seconds:.1f}s | "
+                    f"median CV loglik={np.median(cv_arr):,.0f} | "
+                    f"elapsed {elapsed / 60:.1f} min, ~{remaining / 60:.1f} min left",
+                    flush=True,
+                )
+
         self.hmm_scores = pd.DataFrame(rows).set_index("n_states").sort_index()
         self.best_k = int(self.hmm_scores["median_cv_loglik"].idxmax())
         self.best_hmm = self.hmm_models[self.best_k]
         self.state_labels_ = self.best_hmm.predict(self.spike_matrix)
+        self.hmm_fit_seconds = time.perf_counter() - sweep_started
+        if hasattr(self, "_record_timing"):
+            self._record_timing("fit_hmm", self.hmm_fit_seconds)
         if hasattr(self, "_mark_checkpoint"):
             self._mark_checkpoint("states_discovered")
 
+        if show_progress:
+            n_unconverged = int((~self.hmm_scores["converged"]).sum())
+            print(
+                f"\nSweep finished in {self.hmm_fit_seconds / 60:.1f} min. "
+                f"Best K={self.best_k} by median CV log-likelihood."
+                + (f" {n_unconverged} model(s) hit the n_iter ceiling." if n_unconverged else "")
+            )
+
         if report in ["full", "selected"]:
-            print(self.hmm_scores[["AIC", "BIC", "loglik", "median_cv_loglik"]])
+            print("\nModel comparison:")
+            print(self.hmm_score_table())
 
         return self.hmm_scores.copy()
+
+    def hmm_score_table(self, sort_by="n_states"):
+        """Readable model-comparison table: scores, CV spread, and timings."""
+        if self.hmm_scores is None:
+            raise ValueError("Run fit_hmm() first.")
+        columns = [
+            "n_params",
+            "loglik_per_bin",
+            "AIC",
+            "BIC",
+            "mean_cv_loglik",
+            "median_cv_loglik",
+            "std_cv_loglik",
+            "min_cv_loglik",
+            "max_cv_loglik",
+            "converged",
+            "n_iter_run",
+            "total_seconds",
+        ]
+        columns = [c for c in columns if c in self.hmm_scores.columns]
+        table = self.hmm_scores[columns].copy()
+        if sort_by in ("median_cv_loglik", "mean_cv_loglik"):
+            table = table.sort_values(sort_by, ascending=False)
+        return table.round(3)
 
     def _summarize_sequence(self, seq, n_states, dt):
         seq = np.asarray(seq, dtype=int)
@@ -367,16 +493,14 @@ class HMMFittingStep:
             return None
 
         if report == "selected":
-            ranked = self.hmm_scores.sort_values("median_cv_loglik", ascending=False)
-            print("Ranked CV table:")
-            print(ranked[["median_cv_loglik", "AIC", "BIC", "loglik"]])
+            print("Models ranked by median CV log-likelihood:")
+            print(self.hmm_score_table(sort_by="median_cv_loglik"))
             self.plot_selected_cv_curve(show=True)
             return None
 
         if report == "full":
-            ranked = self.hmm_scores.sort_values("median_cv_loglik", ascending=False)
-            print("Full model comparison:")
-            print(ranked[["median_cv_loglik", "AIC", "BIC", "loglik"]])
+            print("Models ranked by median CV log-likelihood:")
+            print(self.hmm_score_table(sort_by="median_cv_loglik"))
 
             dt = float(np.median(np.diff(self.bin_times_s))) if len(self.bin_times_s) > 1 else 1.0
             diagnostic_rows = []

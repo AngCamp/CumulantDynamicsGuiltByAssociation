@@ -1,3 +1,5 @@
+import pandas as pd
+
 from .metadata import MetadataStep
 from .spiking_and_behaviour_eda import SpikingBehaviorEDAStep
 from .normalization import NormalizationStep
@@ -81,6 +83,7 @@ class HybridDynamicsAnalysis(
             region_table=region_table,
         )
         self._init_behavior()
+        self.timings = {}
 
         self._source_spike_group = None
         self.spike_matrix = None
@@ -145,6 +148,27 @@ class HybridDynamicsAnalysis(
         self.sessions.append(entry)
         return entry
 
+    def _record_timing(self, step, seconds):
+        """Record wall-clock seconds for a pipeline step."""
+        self.timings[step] = float(seconds)
+        return self.timings[step]
+
+    def timing_summary(self, as_text=False):
+        """Wall-clock seconds recorded for each completed pipeline step."""
+        if not self.timings:
+            return pd.DataFrame(columns=["seconds", "minutes"])
+        table = pd.DataFrame(
+            {"seconds": pd.Series(self.timings)},
+        )
+        table["minutes"] = table["seconds"] / 60.0
+        table = table.round(3)
+        table.index.name = "step"
+        if as_text:
+            print("\nStep timings")
+            print(table)
+            return None
+        return table
+
     def _mark_checkpoint(self, key):
         if key in self.analysis_checkpoints:
             self.analysis_checkpoints[key] = True
@@ -205,5 +229,9 @@ class HybridDynamicsAnalysis(
             )
             print(f"analysis_stage: {summary['analysis_stage']}")
             print(f"analysis_point: {summary['analysis_point']}")
+            if self.timings:
+                total = sum(self.timings.values())
+                steps = ", ".join(f"{k}={v:.1f}s" for k, v in self.timings.items())
+                print(f"timings: total={total:.1f}s ({steps})")
             return None
         return summary

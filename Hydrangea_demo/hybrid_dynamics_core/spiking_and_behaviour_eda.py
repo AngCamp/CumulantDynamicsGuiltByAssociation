@@ -25,6 +25,8 @@ rather than being derived inside it. Derivation rules are dataset-specific and
 belong in the analysis script.
 """
 
+import time
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -517,13 +519,86 @@ class SpikingBehaviorEDAStep:
     # ------------------------------------------------------------------
 
     def bin_edges(self, bin_edges=None):
-        """Bin edges matching the normalized spike matrix."""
+        """Bin edges for behaviour alignment.
+
+        After :meth:`normalize` these are exactly the observation-matrix bins.
+        Before it, they are built from the analysis epoch (or the behavioural
+        span) at the object's bin size, so behaviour can be inspected on the
+        grid the spikes will later land on without having binned spikes yet.
+        """
         if bin_edges is not None:
             return np.asarray(bin_edges, dtype=float)
-        if getattr(self, "bin_times_s", None) is None:
+
+        bin_size = float(self.bin_size_s)
+        if getattr(self, "bin_times_s", None) is not None:
+            left = np.asarray(self.bin_times_s, dtype=float)
+            return np.append(left, left[-1] + bin_size)
+
+        span = self.behavior_time_span()
+        if span is None:
             raise ValueError("Run normalize() first, or pass explicit bin_edges.")
-        left = np.asarray(self.bin_times_s, dtype=float)
-        return np.append(left, left[-1] + float(self.bin_size_s))
+        t_start, t_end = span
+        return np.arange(t_start, t_end + bin_size, bin_size)
+
+    def behavior_time_span(self):
+        """(start, end) of the analysis epoch, else of the registered behaviour."""
+        epoch = getattr(self, "maze_epoch", None)
+        if epoch is not None:
+            try:
+                return float(np.asarray(epoch.start)[0]), float(np.asarray(epoch.end)[-1])
+            except Exception:
+                pass
+
+        starts, ends = [], []
+        for signal in self.continuous_behavior.values():
+            if signal.n_samples:
+                starts.append(signal.t_start)
+                ends.append(signal.t_end)
+        for events in self.discrete_events.values():
+            if events.n_events:
+                starts.append(events.t_start)
+                ends.append(events.t_end)
+        if not starts:
+            return None
+        return min(starts), max(ends)
+
+    def behavior_coverage(self, bin_edges=None, aligned=None):
+        """How much of the binned window each behavioural channel covers.
+
+        Continuous channels report the fraction of bins holding at least one
+        sample; event sets report the fraction of bins any event overlaps. A
+        channel well below 1.0 is either sampled more slowly than the bin size
+        or genuinely absent for part of the window.
+        """
+        if aligned is None:
+            aligned = self.align_behavior_to_bins(bin_edges=bin_edges)
+        if len(aligned) == 0:
+            return pd.DataFrame()
+
+        n_bins = len(aligned)
+        bin_size = float(self.bin_size_s)
+        rows = []
+        for column in aligned.columns:
+            values = aligned[column].to_numpy()
+            if column.endswith(".occupancy"):
+                covered = float((values > 0).mean())
+                kind = "event occupancy"
+            elif column.endswith(".count"):
+                covered = float((values > 0).mean())
+                kind = "event onsets"
+            else:
+                covered = float(np.isfinite(values).mean())
+                kind = "continuous"
+            rows.append(
+                {
+                    "channel": column,
+                    "kind": kind,
+                    "bins_with_data": int(round(covered * n_bins)),
+                    "frac_bins_covered": round(covered, 4),
+                    "seconds_covered": round(covered * n_bins * bin_size, 1),
+                }
+            )
+        return pd.DataFrame(rows).set_index("channel")
 
     def align_behavior_to_bins(self, bin_edges=None, reduce="mean", names=None):
         """Project every registered channel onto the spike-matrix bins.
@@ -667,7 +742,7 @@ class SpikingBehaviorEDAStep:
         unit_color = {uid: palette[label] for uid, label in zip(unit_ids, color_by)}
 
         if t_start is None:
-            t_start = self._default_window_start(group, selected)
+            t_start = self._default_window_start(group, [u for u, _r, _c in selected])
         t_start = float(t_start)
         t_end = t_start + float(window_s)
 
@@ -755,22 +830,33 @@ class SpikingBehaviorEDAStep:
             parts.append(str(cell_type)[:5])
         return "·".join(parts) if parts else "unit"
 
-    def _default_window_start(self, group, selected):
+    def _default_window_start(self, group=None, unit_ids=None):
+        """Window start for EDA plots: the analysis epoch, else the first spike."""
         epoch = getattr(self, "maze_epoch", None)
         if epoch is not None:
             try:
                 return float(np.asarray(epoch.start)[0])
             except Exception:
                 pass
+
+        if group is None:
+            return 0.0
+        if unit_ids is None:
+            unit_ids = np.asarray(group.index)[:20]
         firsts = []
-        for uid, _r, _c in selected:
+        for uid in unit_ids:
             times = np.asarray(group[uid].index)
             if times.size:
                 firsts.append(float(times[0]))
         return min(firsts) if firsts else 0.0
 
-    def plot_behavior_overview(self, names=None, t_start=None, t_end=None, show=True):
-        """Full-session view of every continuous channel with events shaded."""
+    def plot_behavior_overview(self, names=None, t_start=None, t_end=None, highlight=None, show=True):
+        """Full-session view of every continuous channel with events shaded.
+
+        `highlight` takes a (start, end) pair and marks that span, which is how
+        the raster window is placed in session context rather than repeating
+        the same traces twice.
+        """
         if names is None:
             names = list(self.continuous_behavior)
         signals = [self.continuous_behavior[n] for n in names if n in self.continuous_behavior]
@@ -796,11 +882,22 @@ class SpikingBehaviorEDAStep:
 
         handles = []
         self._shade_events(list(axes), t_start, t_end, legend_handles=handles)
+
+        title = "Behaviour overview (full session)"
+        if highlight is not None:
+            h_start, h_end = float(highlight[0]), float(highlight[1])
+            for ax in axes:
+                ax.axvspan(h_start, h_end, color="tab:red", alpha=0.18, lw=0, zorder=0)
+                ax.axvline(h_start, color="tab:red", lw=1.0)
+                ax.axvline(h_end, color="tab:red", lw=1.0)
+            handles.append(Patch(facecolor="tab:red", alpha=0.35, label="raster window"))
+            title += f" — raster window {h_start:.0f}-{h_end:.0f}s marked"
+
         if handles:
             axes[0].legend(handles=handles, fontsize=8, loc="upper left", ncol=max(1, len(handles)))
 
         axes[-1].set_xlabel("time (s)")
-        fig.suptitle("Behaviour overview (full session)")
+        fig.suptitle(title)
         fig.tight_layout()
         if show:
             plt.show()
@@ -812,32 +909,75 @@ class SpikingBehaviorEDAStep:
         n_units_per_group=5,
         region_key=None,
         cell_type_key=None,
+        t_start=None,
         show=True,
     ):
-        """Pre-modelling EDA: unit inventory, behaviour inventory, rasters.
+        """Pre-modelling EDA: unit inventory, behaviour inventory, coverage, rasters.
 
         Run this before :meth:`normalize` to decide on epoch restriction, bin
-        size, and which behavioural channels are worth carrying forward.
+        size, and which behavioural channels are worth carrying forward. The
+        two figures are complementary rather than redundant: the overview is
+        the whole session with the raster window marked on it, the raster is
+        that window expanded.
 
         Display-only: returns None. The tables it prints stay available through
-        :meth:`metadata_summary`, :meth:`unit_inventory`, and
-        :meth:`behavior_summary`.
+        :meth:`metadata_summary`, :meth:`unit_inventory`,
+        :meth:`behavior_summary`, and :meth:`behavior_coverage`.
         """
+        started = time.perf_counter()
+
+        print("=" * 72)
+        print("1. metadata tables")
+        print("=" * 72)
         self.describe_metadata(as_text=True)
+
+        print("\n" + "=" * 72)
+        print("2. unit inventory")
+        print("=" * 72)
         self.unit_inventory(
             region_key=region_key, cell_type_key=cell_type_key, filtered=False, print_table=True
         )
         self.plot_unit_inventory(
             region_key=region_key, cell_type_key=cell_type_key, filtered=False, show=show
         )
+
+        print("\n" + "=" * 72)
+        print("3. behaviour channels")
+        print("=" * 72)
         self.behavior_summary(as_text=True)
 
+        if self.continuous_behavior or self.discrete_events:
+            print("\n" + "=" * 72)
+            print(f"4. behaviour coverage on {self.bin_size_s * 1000:.0f} ms bins")
+            print("=" * 72)
+            aligned = self.align_behavior_to_bins()
+            span = self.behavior_time_span()
+            if span is not None:
+                print(
+                    f"{len(aligned)} bins spanning {span[0]:.1f}-{span[1]:.1f}s "
+                    f"({(span[1] - span[0]) / 60:.1f} min)"
+                )
+            print(self.behavior_coverage(aligned=aligned))
+
         if self.continuous_behavior:
-            self.plot_behavior_overview(show=show)
+            print("\n" + "=" * 72)
+            print("5. spiking against behaviour")
+            print("=" * 72)
+            if t_start is None:
+                t_start = self._default_window_start(self._eda_spike_group())
+            self.plot_behavior_overview(
+                highlight=(t_start, t_start + float(window_s)), show=show
+            )
             self.plot_raster_with_behavior(
                 region_key=region_key,
                 cell_type_key=cell_type_key,
                 n_units_per_group=n_units_per_group,
                 window_s=window_s,
+                t_start=t_start,
                 show=show,
             )
+
+        elapsed = time.perf_counter() - started
+        if hasattr(self, "_record_timing"):
+            self._record_timing("spiking_behavior_report", elapsed)
+        print(f"\nEDA complete in {elapsed:.1f}s")

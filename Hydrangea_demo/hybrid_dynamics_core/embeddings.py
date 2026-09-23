@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -93,6 +95,7 @@ class EmbeddingStep:
             raise ValueError("Run normalize() first.")
 
         method = self._resolve_embedding_method(method)
+        started = time.perf_counter()
 
         scores, model = self._fit_embedding_matrix(
             self.spike_matrix,
@@ -121,6 +124,8 @@ class EmbeddingStep:
         self.embedding_variance_ratio = model.explained_variance_ratio_
         self.embedding_scope = "global"
         self.embedding_label = None
+        if hasattr(self, "_record_timing"):
+            self._record_timing("global_embedding", time.perf_counter() - started)
         if hasattr(self, "_mark_checkpoint"):
             self._mark_checkpoint("global_embedding")
         return scores, model

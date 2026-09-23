@@ -1,6 +1,9 @@
-import numpy as np
-import matplotlib.pyplot as plt
+import time
 import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
 from .metadata import extract_unit_metadata
 
@@ -27,6 +30,8 @@ class NormalizationStep:
         restrict_to_epoch : bool
             If True and a maze epoch exists, restrict spike trains before binning.
         """
+        started = time.perf_counter()
+
         if restrict_to_epoch and self.maze_epoch is not None:
             source = self.spike_group.restrict(self.maze_epoch)
         else:
@@ -129,6 +134,8 @@ class NormalizationStep:
             matrix = gaussian_filter1d(matrix, smooth_sigma_bins, axis=0)
 
         self.spike_matrix = matrix.astype(float)
+        if hasattr(self, "_record_timing"):
+            self._record_timing("normalize", time.perf_counter() - started)
         if hasattr(self, "_mark_checkpoint"):
             self._mark_checkpoint("normalized")
         return self.spike_matrix.copy(), self.bin_times_s.copy()
@@ -200,7 +207,14 @@ class NormalizationStep:
             plt.show()
         return fig, ax
 
-    def plot_raw_mean_variance(self, ax=None, show=True):
+    def plot_raw_mean_variance(self, ax=None, show=True, log_scale=True):
+        """Per-unit mean against variance, with the Poisson line for reference.
+
+        `log_scale` controls whether both axes are logarithmic. Log axes spread
+        the low-rate units out; linear axes show the high-rate units in
+        proportion. Off-scale padding is only added on log axes, where zeros
+        cannot be drawn.
+        """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
         if ax is None:
@@ -209,10 +223,17 @@ class NormalizationStep:
             fig = ax.figure
         m = self.raw_counts.mean(axis=0)
         v = self.raw_counts.var(axis=0)
-        ax.loglog(m + 1e-3, v + 1e-6, ".", alpha=0.5)
-        lims = [max(m.min() + 1e-3, 1e-3), max(m.max(), 1e-3)]
+
+        if log_scale:
+            ax.loglog(m + 1e-3, v + 1e-6, ".", alpha=0.5)
+            lims = [max(m.min() + 1e-3, 1e-3), max(m.max(), 1e-3)]
+        else:
+            ax.plot(m, v, ".", alpha=0.5)
+            lims = [0.0, float(m.max()) if m.size else 1.0]
+
         ax.plot(lims, lims, "k--", label="var = mean")
-        ax.set(title="Mean vs var — raw", xlabel="mean", ylabel="var")
+        scale = "log" if log_scale else "linear"
+        ax.set(title=f"Mean vs var — raw ({scale})", xlabel="mean", ylabel="var")
         ax.legend()
         fig.tight_layout()
         if show:
@@ -252,6 +273,15 @@ class NormalizationStep:
             plt.show()
         return fig, ax
 
+    def _firing_rate_hz(self):
+        """Per-unit firing rate over the analyzed window, in Hz."""
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        if getattr(self, "neuron_totals", None) is None or len(self.neuron_totals) == 0:
+            raise ValueError("No neuron totals available for firing-rate diagnostics.")
+        duration_s = max(float(len(self.bin_times_s) * self.bin_size_s), 1e-9)
+        return self.neuron_totals / duration_s
+
     def _log10_firing_rate_hz(self):
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
@@ -264,21 +294,29 @@ class NormalizationStep:
             raise ValueError("No positive firing rates available.")
         return np.log10(rates_hz)
 
-    def plot_log_firing_rate_density(self, ax=None, show=True):
+    def plot_log_firing_rate_density(self, ax=None, show=True, log_scale=True, bins=60):
+        """Firing-rate distribution, on a log10 or linear rate axis."""
         if ax is None:
             fig, ax = plt.subplots(1, 1, figsize=(6, 4))
         else:
             fig = ax.figure
 
-        log_fr = self._log10_firing_rate_hz()
-        self._plot_density(ax, log_fr, bins=100, center=False, color="tab:red")
-        ax.set(title="log10 firing rate density", xlabel="log10 firing rate (Hz)", ylabel="density")
+        if log_scale:
+            values = self._log10_firing_rate_hz()
+            label, title = "log10 firing rate (Hz)", "log10 firing rate density"
+        else:
+            values = self._firing_rate_hz()
+            label, title = "firing rate (Hz)", "firing rate density"
+
+        self._plot_density(ax, values, bins=bins, center=False, color="tab:red")
+        ax.set(title=title, xlabel=label, ylabel="density")
         fig.tight_layout()
         if show:
             plt.show()
         return fig, ax
 
-    def plot_log_firing_rate_density_by_region(self, ax=None, region_key=None, show=True):
+    def plot_log_firing_rate_density_by_region(self, ax=None, region_key=None, show=True, log_scale=True, bins=40):
+        """Firing-rate distribution split by region, log10 or linear."""
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
         if ax is None:
@@ -300,8 +338,7 @@ class NormalizationStep:
             ax.set_axis_off()
             return fig, ax
 
-        duration_s = max(float(len(self.bin_times_s) * self.bin_size_s), 1e-9)
-        rates_hz = self.neuron_totals / duration_s
+        rates_hz = self._firing_rate_hz()
         uniq = np.unique(regions)
         cmap = plt.get_cmap("tab10")
         for i, region in enumerate(uniq):
@@ -310,12 +347,14 @@ class NormalizationStep:
             vals = vals[vals > 0]
             if len(vals) == 0:
                 continue
-            log_vals = np.log10(vals)
-            centers, dens = self._plot_density(ax, log_vals, bins=80, center=False, color=cmap(i % 10), lw=1.8)
+            plotted = np.log10(vals) if log_scale else vals
+            centers, dens = self._plot_density(ax, plotted, bins=bins, center=False, color=cmap(i % 10), lw=1.8)
             if centers is not None and dens is not None:
                 ax.lines[-1].set_label(str(region))
 
-        ax.set(title=f"log10 firing rate density by {region_key}", xlabel="log10 firing rate (Hz)", ylabel="density")
+        label = "log10 firing rate (Hz)" if log_scale else "firing rate (Hz)"
+        prefix = "log10 firing rate" if log_scale else "firing rate"
+        ax.set(title=f"{prefix} density by {region_key}", xlabel=label, ylabel="density")
         if len(ax.lines) > 0:
             ax.legend(fontsize=9)
         fig.tight_layout()
@@ -402,28 +441,59 @@ class NormalizationStep:
             plt.show()
         return fig, axes
 
-    def normalization_report(self, show=True):
+    def normalization_summary(self):
+        """Shape, sparsity, and rate statistics of the observation matrix."""
+        if self.spike_matrix is None:
+            raise ValueError("Run normalize() first.")
+        rates = self._firing_rate_hz()
+        duration_s = float(len(self.bin_times_s) * self.bin_size_s)
+        return pd.Series(
+            {
+                "method": self.normalization_method,
+                "bin_size_s": self.bin_size_s,
+                "n_bins": int(self.spike_matrix.shape[0]),
+                "n_units": int(self.spike_matrix.shape[1]),
+                "duration_s": round(duration_s, 1),
+                "duration_min": round(duration_s / 60.0, 2),
+                "total_spikes": int(self.raw_counts.sum()),
+                "frac_empty_bins": round(float((self.raw_counts == 0).mean()), 4),
+                "median_rate_hz": round(float(np.median(rates)), 3),
+                "min_rate_hz": round(float(rates.min()), 4),
+                "max_rate_hz": round(float(rates.max()), 3),
+            },
+            name="normalization",
+        )
+
+    def normalization_report(self, show=True, log_scale=True):
         """Display diagnostic plots for the normalized spike matrix.
 
         Display-only: returns None, so the figure handles do not echo in a
         notebook cell. Call the individual ``plot_*`` methods when you need the
-        handles for further composition.
+        handles for further composition, or ``normalization_summary`` for the
+        numbers.
 
         Parameters
         ----------
         show : bool
             If True, immediately display the generated plots.
+        log_scale : bool
+            Log axes on the rate and mean-variance panels. Log spreads out the
+            low-rate units, which is usually what you want with a long tail of
+            near-silent cells; turn it off when the tail is not the story.
         """
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
+
+        print(self.normalization_summary().to_string())
+
         fig, ax = plt.subplots(2, 3, figsize=(16, 9))
 
         self.plot_raw_population_counts(ax=ax[0, 0], show=False)
         self.plot_normalized_population_distribution(ax=ax[0, 1], show=False)
-        self.plot_raw_mean_variance(ax=ax[0, 2], show=False)
+        self.plot_raw_mean_variance(ax=ax[0, 2], show=False, log_scale=log_scale)
 
-        self.plot_log_firing_rate_density(ax=ax[1, 0], show=False)
-        self.plot_log_firing_rate_density_by_region(ax=ax[1, 1], show=False)
+        self.plot_log_firing_rate_density(ax=ax[1, 0], show=False, log_scale=log_scale)
+        self.plot_log_firing_rate_density_by_region(ax=ax[1, 1], show=False, log_scale=log_scale)
         self.plot_region_celltype_counts(ax=ax[1, 2], show=False)
 
         fig.suptitle(f"Normalization: {self.normalization_method}")
