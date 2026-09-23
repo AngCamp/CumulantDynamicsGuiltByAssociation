@@ -1,9 +1,13 @@
+from .metadata import MetadataStep
+from .spiking_and_behaviour_eda import SpikingBehaviorEDAStep
 from .normalization import NormalizationStep
 from .embeddings import EmbeddingStep
 from .hmm_fitting import HMMFittingStep
 
 
 class HybridDynamicsAnalysis(
+    MetadataStep,
+    SpikingBehaviorEDAStep,
     NormalizationStep,
     EmbeddingStep,
     HMMFittingStep,
@@ -11,6 +15,8 @@ class HybridDynamicsAnalysis(
     """Pipeline object for session-wide embeddings, HMM fitting, and local state embeddings.
 
     Typical call order:
+        hybdyn.add_continuous_behavior(...) / hybdyn.add_discrete_events(...)
+        hybdyn.spiking_behavior_report(...)
         hybdyn.normalize(...)
         hybdyn.global_embedding(...)
         hybdyn.fit_states(...)
@@ -22,6 +28,11 @@ class HybridDynamicsAnalysis(
     Local embeddings are computed later from subsets of the same session, usually
     after HMM states are available, so the same embedding machinery can be reused
     across the workflow.
+
+    Metadata (unit, trial, condition, region tables) and behaviour channels are
+    registered up front. They are not used by the fitting steps, but they are
+    carried through unit filtering and bin alignment so the discovered states can
+    later be related to anatomy, cell class, trial structure, and behaviour.
     """
 
     def __init__(
@@ -30,8 +41,12 @@ class HybridDynamicsAnalysis(
         bin_size_s=0.050,
         maze_epoch=None,
         unit_metadata=None,
+        trial_table=None,
+        condition_table=None,
+        region_table=None,
         unit_id_key=None,
         region_key=None,
+        cell_type_key=None,
         condition_key=None,
         random_state=0,
         report="full",
@@ -43,9 +58,9 @@ class HybridDynamicsAnalysis(
         self.spike_group = spike_group
         self.bin_size_s = float(bin_size_s)
         self.maze_epoch = maze_epoch
-        self.unit_metadata = unit_metadata if unit_metadata is not None else {}
         self.unit_id_key = unit_id_key
         self.region_key = region_key
+        self.cell_type_key = cell_type_key
         self.condition_key = condition_key
         self.random_state = random_state
         self.report = report
@@ -58,6 +73,15 @@ class HybridDynamicsAnalysis(
         if self.state_discovery_method not in {"gaussian_hmm"}:
             raise ValueError("state_discovery_method must be one of: 'gaussian_hmm'.")
 
+        self._init_metadata(
+            spike_group=spike_group,
+            unit_metadata=unit_metadata,
+            trial_table=trial_table,
+            condition_table=condition_table,
+            region_table=region_table,
+        )
+        self._init_behavior()
+
         self._source_spike_group = None
         self.spike_matrix = None
         self.bin_times_s = None
@@ -65,7 +89,6 @@ class HybridDynamicsAnalysis(
         self.normalization_method = None
         self.raw_counts = None
         self.neuron_totals = None
-        self.unit_metadata_filtered = {}
 
         self.embedding_results = None
         self.embedding_model = None
@@ -157,6 +180,10 @@ class HybridDynamicsAnalysis(
             "analysis_stage": self.analysis_stage,
             "analysis_point": self._current_analysis_point(),
             "checkpoints": dict(self.analysis_checkpoints),
+            "region_key": self.resolved_region_key(filtered=False),
+            "cell_type_key": self.resolved_cell_type_key(filtered=False),
+            "n_continuous_behavior": len(self.continuous_behavior),
+            "n_discrete_event_sets": len(self.discrete_events),
         }
 
         if as_text:
@@ -166,6 +193,12 @@ class HybridDynamicsAnalysis(
             print(f"mice: {summary['n_mice']} -> {summary['mouse_ids']}")
             print(f"state_discovery_method: {summary['state_discovery_method']}")
             print(f"embedding_method: {summary['embedding_method']}")
+            print(f"region_key: {summary['region_key'] or 'none'}")
+            print(f"cell_type_key: {summary['cell_type_key'] or 'none'}")
+            print(
+                f"behaviour: {summary['n_continuous_behavior']} continuous, "
+                f"{summary['n_discrete_event_sets']} event sets"
+            )
             print(f"analysis_stage: {summary['analysis_stage']}")
             print(f"analysis_point: {summary['analysis_point']}")
         return summary

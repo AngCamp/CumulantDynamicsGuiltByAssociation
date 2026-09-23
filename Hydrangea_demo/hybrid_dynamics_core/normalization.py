@@ -2,6 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import warnings
 
+from .metadata import extract_unit_metadata
+
 
 class NormalizationStep:
     """Methods for transforming spike trains into a normalized observation matrix.
@@ -53,20 +55,29 @@ class NormalizationStep:
         neuron_totals_all = np.array([spk.size for spk in spike_arrays], dtype=float)
         keep_mask = neuron_totals_all > 0
         dropped = int((~keep_mask).sum())
+
+        # Per-unit metadata for this source, before any unit is dropped. The
+        # object may already hold a richer table (user-supplied columns merged
+        # onto whatever the spike group carried); prefer it when it lines up.
+        full_metadata = getattr(self, "unit_metadata", None)
+        if full_metadata is None or len(full_metadata) != len(keep_mask):
+            full_metadata = extract_unit_metadata(source)
+        self.unit_metadata = full_metadata
+
         if dropped > 0:
             msg = (
                 f"Dropped {dropped} neurons with no spikes in analyzed time interval."
             )
 
-            if hasattr(source, "metadata_columns") and "cell_area" in list(source.metadata_columns):
-                region_vals = np.asarray(source.get_info("cell_area"))
-                if len(region_vals) == len(keep_mask):
-                    regions, counts_by_region = np.unique(region_vals[~keep_mask], return_counts=True)
-                    if len(regions) > 0:
-                        region_txt = ", ".join(
-                            f"{r}:{n}" for r, n in zip(regions.tolist(), counts_by_region.tolist())
-                        )
-                        msg = f"{msg} Per-region dropped counts -> {region_txt}."
+            region_key = self.resolved_region_key(filtered=False)
+            if region_key is not None and len(full_metadata) == len(keep_mask):
+                region_vals = np.asarray(full_metadata[region_key])
+                regions, counts_by_region = np.unique(region_vals[~keep_mask], return_counts=True)
+                if len(regions) > 0:
+                    region_txt = ", ".join(
+                        f"{r}:{n}" for r, n in zip(regions.tolist(), counts_by_region.tolist())
+                    )
+                    msg = f"{msg} Per-region dropped counts -> {region_txt}."
 
             warnings.warn(msg)
 
@@ -79,12 +90,11 @@ class NormalizationStep:
         neuron_totals = np.array([spk.size for spk in spike_arrays], dtype=float)
         self.neuron_totals = neuron_totals
         self.raw_counts = counts
-        self.unit_metadata_filtered = {}
-        if hasattr(source, "metadata_columns"):
-            for key in list(source.metadata_columns):
-                values = np.asarray(source.get_info(key))
-                if len(values) == len(keep_mask):
-                    self.unit_metadata_filtered[key] = values[keep_mask]
+
+        if len(full_metadata) == len(keep_mask):
+            self.unit_metadata_filtered = full_metadata.loc[full_metadata.index[keep_mask]]
+        else:
+            self.unit_metadata_filtered = full_metadata
 
         if method == "proportion_zscore":
             prop = counts / neuron_totals
@@ -281,10 +291,17 @@ class NormalizationStep:
         else:
             fig = ax.figure
 
-        region_key = region_key or getattr(self, "region_key", None) or "cell_area"
-        regions = self.unit_metadata_filtered.get(region_key)
+        region_key = self.resolved_region_key(region_key)
+        regions = self._unit_meta(region_key)
         if regions is None:
-            ax.text(0.5, 0.5, f"No region metadata for '{region_key}'", ha="center", va="center", transform=ax.transAxes)
+            ax.text(
+                0.5,
+                0.5,
+                "No region annotation for these units",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
             ax.set_axis_off()
             return fig, ax
 
@@ -320,11 +337,15 @@ class NormalizationStep:
         else:
             fig = ax.figure
 
-        region_key = region_key or getattr(self, "region_key", None) or "cell_area"
-        regions = self.unit_metadata_filtered.get(region_key)
+        region_key = self.resolved_region_key(region_key)
+        regions = self._unit_meta(region_key)
         if regions is None:
-            ax.text(0.5, 0.5, f"No region metadata for '{region_key}'", ha="center", va="center", transform=ax.transAxes)
-            ax.set_axis_off()
+            ax.bar(["all units"], [self.spike_matrix.shape[1]], color="tab:cyan")
+            ax.set(title="Analyzed units (no region annotation)", ylabel="unit count")
+            ax.grid(alpha=0.2, axis="y")
+            fig.tight_layout()
+            if show:
+                plt.show()
             return fig, ax
 
         labels, counts = np.unique(regions, return_counts=True)
@@ -343,74 +364,26 @@ class NormalizationStep:
             plt.show()
         return fig, ax
 
-    def plot_region_celltype_counts(self, ax=None, region_key=None, cell_type_key="cell_type", show=True):
+    def plot_region_celltype_counts(self, ax=None, region_key=None, cell_type_key=None, show=True):
+        """Unit counts for the analyzed units, by region and cell type when annotated."""
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
-        if ax is None:
-            fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-        else:
-            fig = ax.figure
-
-        region_key = region_key or getattr(self, "region_key", None) or "cell_area"
-        regions = self.unit_metadata_filtered.get(region_key)
-        cell_types = self.unit_metadata_filtered.get(cell_type_key)
-
-        if regions is None or cell_types is None:
-            ax.text(
-                0.5,
-                0.5,
-                f"Missing metadata for '{region_key}' and/or '{cell_type_key}'",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
-            ax.set_axis_off()
-            return fig, ax
-
-        region_labels = np.unique(regions)
-        type_labels = np.unique(cell_types)
-        count_map = {(r, c): 0 for r in region_labels for c in type_labels}
-        for r, c in zip(regions, cell_types):
-            count_map[(r, c)] += 1
-
-        total_counts = np.array([np.sum(regions == r) for r in region_labels])
-        type_counts = {c: np.array([count_map[(r, c)] for r in region_labels]) for c in type_labels}
-
-        x = np.arange(len(region_labels), dtype=float)
-        n_bars = len(type_labels) + 1
-        width = 0.8 / n_bars
-        cmap = plt.get_cmap("tab10")
-
-        bars_total = ax.bar(x + (0 - (n_bars - 1) / 2) * width, total_counts, width, label="Total", color=cmap(0))
-        ax.bar_label(bars_total, padding=2, fontsize=8)
-
-        for i, c in enumerate(type_labels, start=1):
-            offsets = x + (i - (n_bars - 1) / 2) * width
-            bars = ax.bar(offsets, type_counts[c], width, label=str(c), color=cmap(i % 10))
-            ax.bar_label(bars, padding=2, fontsize=8)
-
-        ax.set_xticks(x)
-        ax.set_xticklabels([str(r) for r in region_labels])
-        ax.set(
-            title=f"Unit counts by {region_key} (Total + per {cell_type_key})",
-            xlabel="brain region",
-            ylabel="unit count",
+        return self.plot_unit_inventory(
+            region_key=region_key,
+            cell_type_key=cell_type_key,
+            filtered=True,
+            ax=ax,
+            show=show,
         )
-        ax.legend(fontsize=9)
-        ax.grid(alpha=0.2, axis="y")
-        fig.tight_layout()
-        if show:
-            plt.show()
-        return fig, ax
 
     def plot_normalized_distributions_by_region(self, region_key=None, show=True, min_count=1):
         if self.spike_matrix is None:
             raise ValueError("Run normalize() first.")
 
-        region_key = region_key or getattr(self, "region_key", None) or "cell_area"
-        regions = self.unit_metadata_filtered.get(region_key)
+        region_key = self.resolved_region_key(region_key)
+        regions = self._unit_meta(region_key)
         if regions is None:
-            raise ValueError(f"No metadata available for region key '{region_key}'.")
+            raise ValueError("No region annotation available for these units.")
 
         unique_regions = [r for r in np.unique(regions) if np.sum(regions == r) >= min_count]
         if len(unique_regions) == 0:
