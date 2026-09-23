@@ -216,7 +216,6 @@ class EmbeddingStep:
 
         ax.plot(np.arange(1, len(result["variance_ratio"]) + 1), result["variance_ratio"] * 100, marker="o")
         ax.set(title=f"{scope.title()} embedding variance explained", xlabel="Component", ylabel="% variance")
-        ax.grid(alpha=0.3)
         fig.tight_layout()
         if show:
             plt.show()
@@ -234,7 +233,6 @@ class EmbeddingStep:
         if scores.shape[1] >= 2:
             ax.scatter(scores[:, 0], scores[:, 1], s=10, alpha=0.7)
             ax.set(title=f"{scope.title()} embedding projection", xlabel="Component 1", ylabel="Component 2")
-            ax.grid(alpha=0.3)
         else:
             ax.text(0.5, 0.5, "Need at least 2 components", ha="center", va="center", transform=ax.transAxes)
             ax.set_axis_off()
@@ -245,12 +243,14 @@ class EmbeddingStep:
         return fig, ax
 
     def report_embeddings(self, scope="global", label=None, show=True):
-        """Display embedding variance and projection diagnostics."""
+        """Display embedding variance and projection diagnostics.
+
+        Display-only: returns None.
+        """
         fig, ax = plt.subplots(1, 2, figsize=(12, 4))
         self.plot_embedding_variance(scope=scope, label=label, ax=ax[0], show=False)
         self.plot_embedding_projection(scope=scope, label=label, ax=ax[1], show=False)
         fig.tight_layout()
         if show:
             plt.show()
-        return fig, ax
 

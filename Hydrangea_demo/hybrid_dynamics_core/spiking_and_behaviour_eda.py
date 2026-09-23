@@ -509,6 +509,7 @@ class SpikingBehaviorEDAStep:
         if as_text:
             print("\nRegistered behaviour channels:")
             print(summary if len(summary) else "  (none)")
+            return None
         return summary
 
     # ------------------------------------------------------------------
@@ -725,7 +726,6 @@ class SpikingBehaviorEDAStep:
             label = signal.name if signal.units is None else f"{signal.name} ({signal.units})"
             rate = signal.sampling_rate_hz
             axes[i].set_ylabel(f"{label}\n{rate:.1f} Hz" if rate else label, fontsize=8)
-            axes[i].grid(alpha=0.2)
             if signal.n_dims > 1:
                 axes[i].legend(fontsize=7, ncol=signal.n_dims, loc="upper right")
 
@@ -791,7 +791,6 @@ class SpikingBehaviorEDAStep:
                 ax.plot(window.time, window.values[:, j], lw=0.6, label=column)
             label = signal.name if signal.units is None else f"{signal.name} ({signal.units})"
             ax.set_ylabel(label, fontsize=9)
-            ax.grid(alpha=0.2)
             if signal.n_dims > 1:
                 ax.legend(fontsize=7, ncol=signal.n_dims, loc="upper right")
 
@@ -819,16 +818,19 @@ class SpikingBehaviorEDAStep:
 
         Run this before :meth:`normalize` to decide on epoch restriction, bin
         size, and which behavioural channels are worth carrying forward.
+
+        Display-only: returns None. The tables it prints stay available through
+        :meth:`metadata_summary`, :meth:`unit_inventory`, and
+        :meth:`behavior_summary`.
         """
-        results = {}
-        results["metadata"] = self.describe_metadata(as_text=True)
-        results["unit_inventory"] = self.unit_inventory(
+        self.describe_metadata(as_text=True)
+        self.unit_inventory(
             region_key=region_key, cell_type_key=cell_type_key, filtered=False, print_table=True
         )
         self.plot_unit_inventory(
             region_key=region_key, cell_type_key=cell_type_key, filtered=False, show=show
         )
-        results["behavior"] = self.behavior_summary(as_text=True)
+        self.behavior_summary(as_text=True)
 
         if self.continuous_behavior:
             self.plot_behavior_overview(show=show)
@@ -839,4 +841,3 @@ class SpikingBehaviorEDAStep:
                 window_s=window_s,
                 show=show,
             )
-        return results

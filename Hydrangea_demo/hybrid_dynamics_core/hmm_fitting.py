@@ -286,7 +286,6 @@ class HMMFittingStep:
         ax.set_title("Median temporal CV log-likelihood by K")
         ax.set_xlabel("n states")
         ax.set_ylabel("CV log-likelihood")
-        ax.grid(alpha=0.3)
         fig.tight_layout()
         if show:
             plt.show()
@@ -316,7 +315,6 @@ class HMMFittingStep:
             fig = ax.figure
         bars = ax.bar(np.arange(n_states), occ, color="tab:blue")
         ax.set(title=title, xlabel="state", ylabel="% of time", xticks=range(n_states))
-        ax.grid(alpha=0.3, axis="y")
         for b, v in zip(bars, occ):
             ax.text(b.get_x() + b.get_width() / 2, b.get_height(), f"{v:.1f}%", ha="center", va="bottom", fontsize=8)
         fig.tight_layout()
@@ -331,7 +329,6 @@ class HMMFittingStep:
             fig = ax.figure
         bars = ax.bar(np.arange(n_states), dwell, color="tab:green")
         ax.set(title=title, xlabel="state", ylabel="seconds", xticks=range(n_states))
-        ax.grid(alpha=0.3, axis="y")
         for b, v in zip(bars, dwell):
             ax.text(b.get_x() + b.get_width() / 2, b.get_height(), f"{v:.1f}", ha="center", va="bottom", fontsize=8)
         fig.tight_layout()
@@ -356,7 +353,11 @@ class HMMFittingStep:
         return fig, ax
 
     def hmm_report(self, report=None):
-        """Display a selected or full HMM diagnostic report."""
+        """Display a selected or full HMM diagnostic report.
+
+        Display-only: returns None. Model comparison scores stay on
+        ``hmm_scores``; the full report also stores ``hmm_diagnostics``.
+        """
         if self.hmm_scores is None:
             raise ValueError("Run fit_hmm() first.")
 
@@ -369,8 +370,8 @@ class HMMFittingStep:
             ranked = self.hmm_scores.sort_values("median_cv_loglik", ascending=False)
             print("Ranked CV table:")
             print(ranked[["median_cv_loglik", "AIC", "BIC", "loglik"]])
-            fig, ax = self.plot_selected_cv_curve(show=True)
-            return fig
+            self.plot_selected_cv_curve(show=True)
+            return None
 
         if report == "full":
             ranked = self.hmm_scores.sort_values("median_cv_loglik", ascending=False)
@@ -415,8 +416,9 @@ class HMMFittingStep:
                 plt.show()
 
             summary = pd.DataFrame(diagnostic_rows).sort_values("n_states", ascending=False)
+            self.hmm_diagnostics = summary
             print(summary)
-            return summary
+            return None
 
         raise ValueError("report must be one of: 'full', 'selected', or 'none'")
 

@@ -325,11 +325,15 @@ class MetadataStep:
             bars = ax.bar(offsets, tab[col].values, width, label=str(col), color=cmap(i % 10))
             ax.bar_label(bars, padding=2, fontsize=8)
 
+        has_cell_types = len(cols) > 1
+        title = "Unit counts by region"
+        if has_cell_types:
+            title += " (Total + per cell type)"
+
         ax.set_xticks(x)
         ax.set_xticklabels(areas, rotation=30 if len(areas) > 4 else 0, ha="right" if len(areas) > 4 else "center")
-        ax.set(xlabel="brain region", ylabel="unit count", title="Unit counts by region")
+        ax.set(xlabel="brain region", ylabel="unit count", title=title)
         ax.legend(fontsize=9)
-        ax.grid(alpha=0.2, axis="y")
         fig.tight_layout()
         if show:
             plt.show()
@@ -346,7 +350,10 @@ class MetadataStep:
         return pd.DataFrame(rows).set_index("table")
 
     def describe_metadata(self, as_text=True):
-        """Print which metadata tables and annotation columns are available."""
+        """Print which metadata tables and annotation columns are available.
+
+        Display-only: returns None. Use :meth:`metadata_summary` for the table.
+        """
         summary = self.metadata_summary()
         region_key = self.resolved_region_key(filtered=False)
         cell_type_key = self.resolved_cell_type_key(filtered=False)
@@ -359,4 +366,5 @@ class MetadataStep:
                 print(f"{name:<16} rows={row['n_rows']:<6} cols={row['n_columns']:<3} {cols}")
             print(f"region column:    {region_key or 'none'}")
             print(f"cell-type column: {cell_type_key or 'none'}")
+            return None
         return summary

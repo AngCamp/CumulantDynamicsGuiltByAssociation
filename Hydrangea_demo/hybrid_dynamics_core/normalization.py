@@ -180,7 +180,6 @@ class NormalizationStep:
         self._plot_density(ax, self.raw_counts.ravel(), bins=120, center=True, color="tab:blue")
         ax.axvline(0.0, color="k", lw=1, ls="--", alpha=0.6)
         ax.set(title="Raw binned counts density (centered)", xlabel="count - mean(count)", ylabel="density")
-        ax.grid(alpha=0.3)
         fig.tight_layout()
         if show:
             plt.show()
@@ -196,7 +195,6 @@ class NormalizationStep:
         frac_zero = (self.raw_counts == 0).mean(0)
         self._plot_density(ax, frac_zero, bins=80, center=False, color="tab:orange")
         ax.set(title="Fraction empty bins/neuron", xlabel="P(count=0)", ylabel="density")
-        ax.grid(alpha=0.3)
         fig.tight_layout()
         if show:
             plt.show()
@@ -231,7 +229,6 @@ class NormalizationStep:
         self._plot_density(ax, self.spike_matrix.ravel(), bins=120, center=True, color="tab:green")
         ax.axvline(0.0, color="k", lw=1, ls="--", alpha=0.6)
         ax.set(title="Z-scored values density (centered)", xlabel="z - mean(z)", ylabel="density")
-        ax.grid(alpha=0.3)
         fig.tight_layout()
         if show:
             plt.show()
@@ -248,7 +245,6 @@ class NormalizationStep:
         if len(neuron_totals) > 0:
             self._plot_density(ax, neuron_totals, bins=80, center=False, color="tab:purple")
             ax.set(title="Total spikes/neuron (divisor)", xlabel="spike count", ylabel="density")
-            ax.grid(alpha=0.3)
         else:
             ax.axis("off")
         fig.tight_layout()
@@ -277,7 +273,6 @@ class NormalizationStep:
         log_fr = self._log10_firing_rate_hz()
         self._plot_density(ax, log_fr, bins=100, center=False, color="tab:red")
         ax.set(title="log10 firing rate density", xlabel="log10 firing rate (Hz)", ylabel="density")
-        ax.grid(alpha=0.3)
         fig.tight_layout()
         if show:
             plt.show()
@@ -321,7 +316,6 @@ class NormalizationStep:
                 ax.lines[-1].set_label(str(region))
 
         ax.set(title=f"log10 firing rate density by {region_key}", xlabel="log10 firing rate (Hz)", ylabel="density")
-        ax.grid(alpha=0.3)
         if len(ax.lines) > 0:
             ax.legend(fontsize=9)
         fig.tight_layout()
@@ -342,7 +336,6 @@ class NormalizationStep:
         if regions is None:
             ax.bar(["all units"], [self.spike_matrix.shape[1]], color="tab:cyan")
             ax.set(title="Analyzed units (no region annotation)", ylabel="unit count")
-            ax.grid(alpha=0.2, axis="y")
             fig.tight_layout()
             if show:
                 plt.show()
@@ -358,7 +351,6 @@ class NormalizationStep:
         ax.tick_params(axis="x", rotation=30)
         for x, y in zip(labels.astype(str), counts):
             ax.text(x, y, str(int(y)), ha="center", va="bottom", fontsize=9)
-        ax.grid(alpha=0.2, axis="y")
         fig.tight_layout()
         if show:
             plt.show()
@@ -403,7 +395,6 @@ class NormalizationStep:
             self._plot_density(ax, self.spike_matrix[:, mask].ravel(), bins=100, center=True, color="tab:blue")
             ax.axvline(0.0, color="k", lw=1, ls="--", alpha=0.5)
             ax.set(title=f"{region} (n={int(mask.sum())})", xlabel="z - mean(z)", ylabel="density")
-            ax.grid(alpha=0.2)
 
         fig.suptitle(f"Normalized population distribution by {region_key}")
         fig.tight_layout()
@@ -412,7 +403,11 @@ class NormalizationStep:
         return fig, axes
 
     def normalization_report(self, show=True):
-        """Print diagnostic plots for the normalized spike matrix.
+        """Display diagnostic plots for the normalized spike matrix.
+
+        Display-only: returns None, so the figure handles do not echo in a
+        notebook cell. Call the individual ``plot_*`` methods when you need the
+        handles for further composition.
 
         Parameters
         ----------
@@ -435,4 +430,3 @@ class NormalizationStep:
         fig.tight_layout()
         if show:
             plt.show()
-        return fig, ax

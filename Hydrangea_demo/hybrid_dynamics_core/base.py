@@ -169,7 +169,11 @@ class HybridDynamicsAnalysis(
         return "Initialized"
 
     def describe(self, as_text=True):
-        """Summarize cohort scope, locked methods, and progress state."""
+        """Summarize cohort scope, locked methods, and progress state.
+
+        With ``as_text=True`` this prints and returns None; pass
+        ``as_text=False`` for the summary dict.
+        """
         unique_mice = sorted({s["mouse_id"] for s in self.sessions if s.get("mouse_id") is not None})
         summary = {
             "n_sessions": len(self.sessions),
@@ -201,4 +205,5 @@ class HybridDynamicsAnalysis(
             )
             print(f"analysis_stage: {summary['analysis_stage']}")
             print(f"analysis_point: {summary['analysis_point']}")
+            return None
         return summary

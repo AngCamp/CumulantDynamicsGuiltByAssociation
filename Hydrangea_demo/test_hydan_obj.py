@@ -1,27 +1,33 @@
 """Hydrangea demo: session EDA, then state-fitting EDA.
 
-Runs from the notebook. The package root is discovered by walking up from the
-working directory, so this works whether the notebook is launched from the repo
-root or from Hydrangea_demo/, locally or on the cloud box where the repo lives
-at /notebooks/CumulantDynamicsGuiltByAssociation.
+Runs from the notebook. `# %%` marks each cell boundary — split there.
 
-The data mount defaults to /storage/dandi_downloads and can be overridden with
-the HYDRANGEA_DATA_DIR environment variable.
+The package root is discovered by walking up from the working directory, so
+this works whether the notebook is launched from the repo root or from
+Hydrangea_demo/, locally or on the cloud box where the repo lives at
+/notebooks/CumulantDynamicsGuiltByAssociation. The data mount defaults to
+/storage/dandi_downloads and can be overridden with HYDRANGEA_DATA_DIR.
 
-Order of operations:
-    0. locate package + data, list sessions
-    1. load one session, build the analysis epoch
-    2. derive behaviour the archive does not ship (running speed)
-    3. build the analysis object with its metadata tables
-    4. register behaviour channels (continuous signals, discrete events)
-    5. spiking + behaviour EDA          <- decide bin size / epoch / channels
-    6. normalize + normalization report <- decide normalization method
-    7. global embedding
-    8. folds + state fitting + HMM report
-    9. save/reload, summarize
+Cells:
+    1. setup: paths, imports, constants
+    2. navigate the dataset with pynapple's Folder API
+    3. load one session, build the analysis epoch
+    4. derive behaviour the archive does not ship (running speed)
+    5. build the analysis object with its metadata tables
+    6. register behaviour channels
+    7. spiking + behaviour EDA          <- judge epoch / unit sample / channels
+    8. normalize + normalization report <- judge bin size and normalization
+    9. global embedding
+   10. folds + state fitting + HMM report
+   11. save, reload, summarize
 """
 
+# %% ==========================================================================
+# CELL 1 — setup
+# =============================================================================
+
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -29,10 +35,6 @@ import numpy as np
 import pandas as pd
 import pynapple as nap
 
-
-# ---------------------------------------------------------------------------
-# 0. paths
-# ---------------------------------------------------------------------------
 
 def find_package_root(start):
     """Walk up from `start` looking for the hybrid_dynamics_core package."""
@@ -59,10 +61,10 @@ DOWNLOAD_DIR = Path(os.environ.get("HYDRANGEA_DATA_DIR", "/storage/dandi_downloa
 MODEL_DIR = DOWNLOAD_DIR / "hydrangea_models"
 DANDISET_ID = "001695"
 VERSION_ID = "0.260319.2023"
-SUBJECTS = ["sub-M01", "sub-M02", "sub-M03", "sub-M05"]
 
-# Session to analyze. Set to None to take the first behaviour+ecephys file found.
-SESSION_FILENAME = "sub-M01/sub-M01_ses-20240313T100000_behavior+ecephys.nwb"
+# Session to analyze. Set either to None to take the first behaviour recording.
+SUBJECT = "M01"
+SESSION = "20240313T100000"
 
 BIN_SIZE_S = 0.050
 EDA_WINDOW_S = 60
@@ -70,53 +72,83 @@ N_UNITS_PER_GROUP = 5
 
 if DOWNLOAD_DIR.is_dir():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+print("Package root:", PACKAGE_ROOT)
+print("Download dir:", DOWNLOAD_DIR)
 
 
-def session_inventory(download_root):
-    """Table of every NWB file under the data mount."""
-    rows = []
-    for subject_dir in sorted(Path(download_root).glob("sub-*")):
-        for nwb_file in sorted(subject_dir.rglob("*.nwb")):
-            stem = nwb_file.stem
-            session = stem.split("_ses-")[-1].split("_")[0] if "_ses-" in stem else "unknown"
-            rows.append(
-                {
-                    "subject": subject_dir.name,
-                    "session": session,
-                    "has_behavior": "behavior" in stem,
-                    "nwb_file": str(nwb_file),
-                }
-            )
-    return pd.DataFrame(rows)
+# %% ==========================================================================
+# CELL 2 — navigate the dataset
+# =============================================================================
+# pynapple's Folder API walks the subject/session tree and prints the whole
+# hierarchy, so the inventory only has to parse identifiers out of the
+# BIDS-style filenames:
+#     sub-M01_ses-20240313T100000_behavior+ecephys.nwb
+#     ^^^^^^^ ^^^^^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^
+#     subject session             modalities
+
+project = nap.load_folder(str(DOWNLOAD_DIR))
+project.view
 
 
-def print_session_table(download_root):
-    table = session_inventory(download_root)
-    if len(table) == 0:
-        print(f"No NWB files found under {download_root}")
-        return table
-    print("\nDANDI session inventory")
-    print(table.to_string(index=False))
-    return table
+def parse_session_name(nwb_path):
+    """Subject, session, date, time, and modalities from an NWB filename."""
+    nwb_path = Path(nwb_path)
+    stem = nwb_path.stem
+
+    subject = re.search(r"(?:^|_)sub-([^_]+)", stem)
+    session = re.search(r"(?:^|_)ses-([^_]+)", stem)
+    subject = subject.group(1) if subject else nwb_path.parent.name.replace("sub-", "")
+    session = session.group(1) if session else "unknown"
+
+    date, time = None, None
+    if "T" in session:
+        raw_date, raw_time = session.split("T", 1)
+        if len(raw_date) == 8 and raw_date.isdigit():
+            date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
+        if len(raw_time) >= 6 and raw_time[:6].isdigit():
+            time = f"{raw_time[:2]}:{raw_time[2:4]}:{raw_time[4:6]}"
+
+    modalities = stem.split("_")[-1].split("+")
+    return {
+        "subject": subject,
+        "session": session,
+        "date": date,
+        "time": time,
+        "modalities": "+".join(modalities),
+        "has_behavior": "behavior" in modalities,
+        "size_mb": round(nwb_path.stat().st_size / 1e6, 1),
+        "nwb_file": str(nwb_path),
+    }
 
 
-inventory = print_session_table(DOWNLOAD_DIR)
+def session_inventory(root):
+    """Table of every NWB recording under the data mount."""
+    rows = [parse_session_name(p) for p in sorted(Path(root).rglob("*.nwb"))]
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["subject", "session"]).reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# 1. load one session and build the analysis epoch
-# ---------------------------------------------------------------------------
+inventory = session_inventory(DOWNLOAD_DIR)
+print(f"\n{len(inventory)} recordings, {inventory['subject'].nunique()} subjects")
+print(inventory.to_string(index=False))
 
-if SESSION_FILENAME is not None:
-    session_nwb_path = (DOWNLOAD_DIR / SESSION_FILENAME).resolve()
-else:
-    with_behavior = inventory[inventory["has_behavior"]]
-    if len(with_behavior) == 0:
-        raise FileNotFoundError(f"No behaviour+ecephys NWB files under {DOWNLOAD_DIR}")
-    session_nwb_path = Path(with_behavior.iloc[0]["nwb_file"]).resolve()
 
+# %% ==========================================================================
+# CELL 3 — load one session and build the analysis epoch
+# =============================================================================
+
+candidates = inventory[inventory["has_behavior"]]
+if SUBJECT is not None:
+    candidates = candidates[candidates["subject"] == SUBJECT]
+if SESSION is not None:
+    candidates = candidates[candidates["session"] == SESSION]
+if len(candidates) == 0:
+    raise FileNotFoundError(f"No behaviour recording for subject={SUBJECT}, session={SESSION}")
+
+session_nwb_path = Path(candidates.iloc[0]["nwb_file"]).resolve()
 session_nwb = nap.load_file(str(session_nwb_path))
-print("\nSession NWB path:", session_nwb_path)
+print("Session NWB path:", session_nwb_path)
 print("NWB keys:", list(session_nwb.keys()))
 
 spike_group = session_nwb["units"]
@@ -134,9 +166,9 @@ print(f"Maze epoch: {maze_start:.1f}s to {maze_end:.1f}s ({maze_end - maze_start
 print("Units before/after maze restriction:", len(spike_group), "/", len(spike_group_maze))
 
 
-# ---------------------------------------------------------------------------
-# 2. derive behaviour the archive does not ship
-# ---------------------------------------------------------------------------
+# %% ==========================================================================
+# CELL 4 — derive behaviour the archive does not ship
+# =============================================================================
 # Running speed is not in the downloaded NWB, so it is computed here rather than
 # inside the analysis object: how a derived behavioural channel is built is a
 # per-dataset decision.
@@ -147,27 +179,26 @@ speed_t, speed_vals = compute_speed_from_position(
 print(f"Derived running speed: {len(speed_t)} samples, median {np.median(speed_vals):.3f} units/s")
 
 
-# ---------------------------------------------------------------------------
-# 3. build the analysis object with its metadata tables
-# ---------------------------------------------------------------------------
-# Unit metadata is read off the TsGroup automatically. Trial, condition, and
-# region tables are optional and dataset-specific; this session ships none of
-# them, so they stay empty here and the object reports that in describe().
+# %% ==========================================================================
+# CELL 5 — build the analysis object with its metadata tables
+# =============================================================================
+# Unit metadata (region, cell type, anything else on the TsGroup) is read off
+# the spike group automatically and carried through unit filtering. Trial,
+# condition, and region tables are optional and dataset-specific.
 
-trial_table = None
+trials = None
 try:
     trials = session_nwb["trials"]
-    trial_table = trials  # IntervalSet is coerced to a start/end table
 except Exception:
-    pass
+    print("No trials table in this NWB.")
 
 hybdyn = HybridDynamicsAnalysis(
     spike_group=spike_group_maze,
     bin_size_s=BIN_SIZE_S,
     maze_epoch=maze_ep,
-    trial_table=trial_table,
+    trial_table=trials,  # an IntervalSet is coerced to a start/end table
     session_id=session_nwb_path.stem,
-    mouse_id=session_nwb_path.stem.split("_")[0].replace("sub-", ""),
+    mouse_id=candidates.iloc[0]["subject"],
     embedding_method="pca",
     state_discovery_method="gaussian_hmm",
     random_state=0,
@@ -175,11 +206,12 @@ hybdyn = HybridDynamicsAnalysis(
 )
 
 
-# ---------------------------------------------------------------------------
-# 4. register behaviour channels
-# ---------------------------------------------------------------------------
-# Continuous channels carry a sampling rate descriptor (inferred from the
-# timestamps here). Discrete channels carry an interval and optional subtypes.
+# %% ==========================================================================
+# CELL 6 — register behaviour channels
+# =============================================================================
+# Continuous channels carry a sampling-rate descriptor (inferred from the
+# timestamps here). Discrete channels carry a time interval and optional
+# subtypes. Both project onto the spike-matrix bins later.
 
 hybdyn.add_continuous_behavior(
     "position",
@@ -205,15 +237,19 @@ hybdyn.add_events_from_interval_set(
     description="position-tracked span used for all fitting",
 )
 
-if trial_table is not None:
+if trials is not None:
     hybdyn.add_events_from_interval_set("trials", trials, description="task trials")
 
 
-# ---------------------------------------------------------------------------
-# 5. spiking + behaviour EDA
-# ---------------------------------------------------------------------------
+# %% ==========================================================================
+# CELL 7 — spiking + behaviour EDA
+# =============================================================================
 # Human judgement: are the epoch, the unit sample, and the behavioural channels
 # sensible before anything is binned?
+#
+# Prints the metadata inventory and the region x cell-type unit counts, then
+# plots the unit inventory, the full-session behaviour overview, and spike
+# rasters over the behavioural traces.
 
 hybdyn.spiking_behavior_report(
     window_s=EDA_WINDOW_S,
@@ -222,35 +258,39 @@ hybdyn.spiking_behavior_report(
 )
 
 
-# ---------------------------------------------------------------------------
-# 6. normalization
-# ---------------------------------------------------------------------------
+# %% ==========================================================================
+# CELL 8 — normalization
+# =============================================================================
 # Human judgement: is the binning and normalization method appropriate for this
 # firing-rate distribution?
 
 hybdyn.normalize(method="proportion_zscore", zscore=True, restrict_to_epoch=True)
 hybdyn.normalization_report(show=True)
-
 print("Observation matrix:", hybdyn.spike_matrix.shape, "(bins x units)")
 
+
+# %% ==========================================================================
+# CELL 9 — behaviour on the observation bins
+# =============================================================================
 # Behaviour projected onto the same bins as the observation matrix. This is the
 # table that pairs with state_labels_ once the HMM has run.
+
 behavior_bins = hybdyn.align_behavior_to_bins()
-print("\nBehaviour aligned to bins:", behavior_bins.shape)
+print("Behaviour aligned to bins:", behavior_bins.shape)
 print(behavior_bins.head())
 
 
-# ---------------------------------------------------------------------------
-# 7. global embedding
-# ---------------------------------------------------------------------------
+# %% ==========================================================================
+# CELL 10 — global embedding
+# =============================================================================
 
 hybdyn.global_embedding(method="pca", n_components=10, whiten=False, standardize=True)
 hybdyn.report_embeddings(show=True)
 
 
-# ---------------------------------------------------------------------------
-# 8. folds, state fitting, HMM report
-# ---------------------------------------------------------------------------
+# %% ==========================================================================
+# CELL 11 — folds and state fitting
+# =============================================================================
 
 hybdyn.build_folds(
     k_fold=5,
@@ -272,6 +312,12 @@ hybdyn.fit_states(
     report="selected",
 )
 
+
+# %% ==========================================================================
+# CELL 12 — HMM report
+# =============================================================================
+# Human judgement: inspect the ranked CV scores and choose a working K.
+
 hybdyn.hmm_report(report="selected")
 # hybdyn.hmm_report(report="full")
 
@@ -280,18 +326,16 @@ hybdyn.hmm_report(report="selected")
 # hybdyn.report_embeddings(scope="local", label="state_0", show=True)
 
 
-# ---------------------------------------------------------------------------
-# 9. save, reload, summarize
-# ---------------------------------------------------------------------------
+# %% ==========================================================================
+# CELL 13 — save, reload, summarize
+# =============================================================================
 
 saved_model_path = MODEL_DIR / f"{session_nwb_path.stem}_best_hmm.pkl"
 hybdyn.save_hmm_model(saved_model_path)
 reloaded_artifact = hybdyn.load_hmm_model(saved_model_path)
 
-print("\nSaved model path:", saved_model_path)
+print("Saved model path:", saved_model_path)
 print("Reloaded model states:", reloaded_artifact["n_states"])
-print("Package root:", PACKAGE_ROOT)
-print("Download dir:", DOWNLOAD_DIR)
 print("Best K:", hybdyn.best_k)
 print("Model count:", len(hybdyn.hmm_models))
 
