@@ -1,5 +1,9 @@
 # Hydrangea demo
 
+Potential Acronyms: HYbrid Dynamics Regime Analysis of Neural Geometry, Embeddings, and Activity
+
+ HYbrid Dynamics Regime Analysis of Neural Geometry, Embeddings, and Attractors (I think attractors are too )
+
 This folder holds the early-stage analysis object for hybrid dynamics modeling.
 The design is object-oriented, modular, and ordered by analysis step.
 The remote notebook path is expected under /notebooks/CumulantDynamicsGuiltByAssociation/Hydrangea_demo/.
