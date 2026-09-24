@@ -1,38 +1,47 @@
-"""LFP band power on the UMAP manifold, plus our own sharp-wave ripples.
+"""LFP band power on the UMAP manifold, plus high-frequency events (HFEs).
 
-Standalone — does not depend on umap_lastday_test.py. Three notebook cells,
-split at the "CELL 2" and "CELL 3" banners. Nothing is written to disk.
+Standalone — does not depend on umap_lastday_test.py. Nothing is written to
+disk; everything is print() and plt.show().
 
-CELL 1     per day: load, compute band power, drop movement artifacts, detect
-           sharp-wave ripples, plot example events, fit the 1/f background,
-           fit the four embeddings
+CELL 1     per day: load, compute band power, screen for movement artifacts,
+           detect HFEs, read the authors' ripple annotations, plot examples of
+           both, fit the four embeddings
 CELL 2     plotting helpers
 CELLS 3-8  one band each (delta, theta, beta, slow gamma, mid gamma, ripple):
            rows = days, columns = groupings, coloured by that band alone
-CELL 9     the SWR figures: manifold coloured by running speed at our detected
-           sharp-wave ripple bins
-CELL 10    the aperiodic 1/f background: exponent, knee, and fit quality on
-           the same manifolds
+CELL 9     HFEs and the authors' annotated ripples on the manifold, both
+           coloured by running speed
 
 What "power" means here: each band is bandpassed (4th-order Butterworth in
 second-order-section form, zero-phase), turned into an amplitude envelope by
-the Hilbert transform, averaged into the analysis bins, then z-scored. So a
-threshold of "5 SD" means what it means in the ripple literature — SD of the
-band's envelope, not of raw power.
+the Hilbert transform, averaged into the analysis bins, then z-scored. A
+threshold of "5 SD" therefore means what it means in the ripple literature —
+SD of the band's envelope.
 
-Two things this does that the first script did not:
+Why HFE and not SWR: the events are defined on the ripple band plus multi-unit
+activity, with no requirement that they avoid theta. Events riding a theta
+trough are kept. That is a high-frequency event, which may or may not be a
+classic sharp-wave ripple, and calling it what it is keeps the claim honest.
 
-1. Artifact rejection. Movement and EMG raise every band at once. A bin is
-   dropped when all six bands are simultaneously elevated AND the ripple band
-   is below ARTIFACT_RIPPLE_KEEP_Z — the second clause protects genuine large
-   ripples, which also push broadband power up.
+An HFE is:
+    1. a ripple-band envelope peak above HFE_RIPPLE_Z, its extent taken out to
+       HFE_EDGE_Z on either side, lasting between HFE_MIN_MS and HFE_MAX_MS;
+    2. with z-scored MUA above HFE_MUA_Z somewhere in the window running from
+       HFE_MUA_LEAD_S before the event start to the event end — before or
+       during, never after;
+    3. at a running speed below HFE_MAX_SPEED_CM_S.
 
-2. Our own ripples. The dataset's Ripple annotations are almost absent from
-   the maze epoch, so events are detected here instead: a ripple-band envelope
-   peak above SWR_RIPPLE_Z, preceded within SWR_SW_WINDOW_S by a peak in the
-   z-scored CA3 pyramidal population rate (the sharp wave). Both halves are
-   required, which is what separates a sharp-wave ripple from a ripple-band
-   blip.
+The authors' own Ripple annotations are read out of the NWB and carried
+alongside, so ours and theirs can be compared directly rather than trusted.
+
+Artifact screen: movement and EMG raise every band at once, so the z-scored
+envelopes stop being independent *locally* — in a one-second window they lock
+together. Session-wide correlation says nothing (~0.05 here), so the statistic
+is rolling. A bin is dropped when that local correlation is high, the bands are
+genuinely elevated, and the ripple band is below ARTIFACT_RIPPLE_KEEP_Z, which
+protects real large events. What gets flagged is plotted, speed included: if
+the flagged bins are not concentrated at high speed they are probably not
+movement artifacts, and the recording was simply clean.
 """
 
 import gc
@@ -48,8 +57,7 @@ import pynapple as nap
 import umap
 from scipy import signal as sps
 from scipy.fft import next_fast_len
-from scipy.ndimage import gaussian_filter1d
-from scipy.optimize import curve_fit
+from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from sklearn.decomposition import PCA
 
 # =============================================================================
@@ -81,33 +89,27 @@ BAND_CMAPS = {
 BAND_Z_RANGE = (-1.0, 4.0)        # shared colour limits, in SD of the envelope
 
 # --- artifact rejection ------------------------------------------------------
-ARTIFACT_ALLBAND_Z = 2.0          # "all bands up together": min z across bands above this
+ARTIFACT_CORR_WINDOW_S = 1.0      # window for the rolling cross-band correlation
+ARTIFACT_CORR = 0.5               # mean pairwise correlation above this is suspicious
+ARTIFACT_ALLBAND_Z = 1.5          # ...and the mean z across bands must exceed this
 ARTIFACT_RIPPLE_KEEP_Z = 10.0     # ...unless ripple power exceeds this (a real event)
+N_ARTIFACT_EXAMPLES = 4
 
-# --- our sharp-wave ripple detector ------------------------------------------
-SWR_RIPPLE_Z = 5.0                # minimum ripple-band envelope peak
-SWR_MIN_SEP_S = 0.05              # refractory between ripple peaks
-SWR_SW_WINDOW_S = 0.20            # how far before the ripple to look for the sharp wave
-SWR_SW_Z = 2.0                    # minimum CA3 pyramidal population-rate peak
-SWR_FINE_BIN_S = 0.010            # bin for the CA3 population rate
-SWR_SMOOTH_S = 0.015              # Gaussian sigma on that rate
+# --- high-frequency events ---------------------------------------------------
+HFE_RIPPLE_Z = 5.0                # ripple-band envelope peak threshold
+HFE_EDGE_Z = 2.0                  # event extent runs out to this, either side of the peak
+HFE_MIN_SEP_S = 0.05              # refractory between peaks
+HFE_MIN_MS = 15.0                 # duration limits on the extent
+HFE_MAX_MS = 250.0
+HFE_MUA_Z = 2.0                   # MUA must exceed this...
+HFE_MUA_LEAD_S = 0.025            # ...within 25 ms BEFORE the event, or during it
+HFE_MUA_REGIONS = None            # None = every unit; e.g. ("CA1", "CA3") for hippocampus
+HFE_MAX_SPEED_CM_S = 5.0          # speed gate at the event peak
+HFE_FINE_BIN_S = 0.005            # bin for the MUA rate
+HFE_SMOOTH_S = 0.010              # Gaussian sigma on that rate
+HFE_MATCH_TOL_S = 0.05            # slack when matching ours to the authors' annotations
 N_EXAMPLE_EVENTS = 6
 EXAMPLE_WINDOW_S = 0.40
-
-# --- aperiodic (1/f) fit -----------------------------------------------------
-# Fit in sliding windows, not per bin: a 50 ms bin has no spectrum worth
-# fitting. 4 s windows with a 2 s hop give a stable fit, then the slope and
-# knee are interpolated back onto the analysis bins.
-#
-# The fit stops at 90 Hz on purpose. This channel's spectrum falls off steeply
-# above ~100 Hz, which is the shape of an acquisition low-pass rather than
-# brain 1/f, and fitting into it would bend the exponent. Theta is masked out
-# so the 8 Hz peak does not drag the aperiodic component with it.
-APERIODIC_WINDOW_S = 4.0
-APERIODIC_HOP_S = 2.0
-APERIODIC_FIT_RANGE = (1.0, 90.0)
-APERIODIC_EXCLUDE = ((5.0, 11.0),)
-APERIODIC_WELCH_S = 1.0
 
 # --- embedding ---------------------------------------------------------------
 UMAP_N_COMPONENTS = 3
@@ -121,12 +123,12 @@ UMAP_METRIC = "cosine"
 UMAP_RANDOM_STATE = 0
 GROUPINGS = ("global", "CA1", "CA3", "RSC")
 
-# 18 three-dimensional panels in one figure render slowly and read poorly, so
-# the band grid is drawn on UMAP 1 vs 2 by default. Set "3d" if you want the
-# full cloud in each cell of the grid; the SWR figures are always 3d.
+# Band grids are drawn on UMAP 1 vs 2 by default — twelve 3d panels in one
+# figure render slowly and read poorly. Set "3d" for the full cloud; the event
+# figures in cell 9 are always 3d.
 GRID_PROJECTION = "2d"
 
-RUN_EXAMPLES = True               # example event plots in cell 1
+RUN_EXAMPLES = True               # artifact and event example plots in cell 1
 
 
 def find_package_root(start):
@@ -169,8 +171,57 @@ def subject_session_table(root, subject):
     return pd.DataFrame(rows).sort_values("session").reset_index(drop=True)
 
 
+def read_labelled_intervals(path, name_hint="sleep"):
+    """The SleepStates table WITH its labels, straight from the NWB.
+
+    pynapple drops the label column on this dataset — the intervals are not
+    end-sorted (state intervals and ripple events are interleaved in one
+    table), so its IntervalSet constructor sorts them, warns, and discards the
+    metadata. That column is where the Ripple annotations live.
+    """
+    try:
+        from pynwb import NWBHDF5IO
+    except ImportError:
+        return None
+    try:
+        with NWBHDF5IO(str(path), "r", load_namespaces=True) as io:
+            nwbfile = io.read()
+            table = None
+            for key, obj in (nwbfile.intervals or {}).items():
+                if name_hint.lower() in key.lower():
+                    table = obj
+                    break
+            if table is None:
+                for module in (nwbfile.processing or {}).values():
+                    for key, obj in module.data_interfaces.items():
+                        if name_hint.lower() in key.lower():
+                            table = obj
+                            break
+            return None if table is None else table.to_dataframe()
+    except Exception:
+        return None
+
+
+def annotated_ripples(labels, t_start, t_end):
+    """The authors' Ripple intervals that fall inside the analysis epoch."""
+    empty = (np.array([]), np.array([]))
+    if labels is None or not len(labels):
+        return empty
+    col = next((c for c in labels.columns
+                if str(c).lower() in ("state", "label", "sleep_state", "tags")), None)
+    if col is None:
+        return empty
+    rip = labels[labels[col].astype(str).str.lower().str.startswith("ripple")]
+    if not len(rip):
+        return empty
+    starts = rip["start_time"].values.astype(float)
+    stops = rip["stop_time"].values.astype(float)
+    inside = (stops > t_start) & (starts < t_end)
+    return starts[inside], stops[inside]
+
+
 def load_session(row, verbose=True):
-    """Spikes as sorted arrays, unit metadata, behaviour, and the CA1 LFP."""
+    """Spikes as sorted arrays, unit metadata, behaviour, LFP, annotations."""
     path = (DOWNLOAD_DIR / row["file"]).resolve()
     t0 = time.perf_counter()
     nwb = nap.load_file(str(path))
@@ -205,6 +256,10 @@ def load_session(row, verbose=True):
     lfp_v = np.asarray(lfp_obj.values, dtype=float).ravel()
     fs = float(1.0 / np.median(np.diff(lfp_t)))
 
+    labels = read_labelled_intervals(path)
+    annot_start, annot_stop = annotated_ripples(labels, float(maze_ep.start[0]),
+                                                float(maze_ep.end[0]))
+
     session = {
         "label": f"{row['subject']} {row['date']}",
         "date": row["date"],
@@ -221,18 +276,21 @@ def load_session(row, verbose=True):
         "lfp_t": lfp_t,
         "lfp_v": lfp_v,
         "fs": fs,
+        "annot_start": annot_start,
+        "annot_stop": annot_stop,
     }
     del spikes, spikes_all, position, position_all, speed_obj, lfp_obj, nwb
     gc.collect()
     if verbose:
         print(f"loaded {row['file']}: {len(spike_times)} units, "
-              f"{maze_s / 60:.1f} min, LFP @ {fs:.0f} Hz "
+              f"{maze_s / 60:.1f} min, LFP @ {fs:.0f} Hz, "
+              f"{len(annot_start)} annotated ripples in the epoch "
               f"({time.perf_counter() - t0:.1f}s)")
     return session
 
 
 # =============================================================================
-# STEP 2 — band power, artifacts, and sharp-wave ripples
+# STEP 2 — band power and the artifact screen
 # =============================================================================
 
 
@@ -269,8 +327,8 @@ def zscore(values):
 def band_power_table(lfp_t, lfp_v, fs, edges):
     """z-scored envelope for every band, on the analysis bins.
 
-    The full-resolution ripple envelope and filtered trace are returned too —
-    the detector and the example plots need them before they are discarded.
+    The full-resolution ripple envelope and filtered trace come back too — the
+    detector and the example plots need them before they are discarded.
     """
     band_z, ripple_full, ripple_filt = {}, None, None
     for name, (lo, hi) in BANDS.items():
@@ -286,187 +344,339 @@ def band_power_table(lfp_t, lfp_v, fs, edges):
     return band_z, ripple_full, ripple_filt
 
 
-def artifact_mask(band_z):
+def rolling_cross_band_corr(stacked, window_bins):
+    """Mean pairwise correlation among the band envelopes, in a sliding window.
+
+    Computed from rolling moments rather than a loop over windows: for each
+    pair, corr = (E[xy] - E[x]E[y]) / (sd_x sd_y), every term a boxcar filter.
+    """
+    n_bands = stacked.shape[1]
+    mean = np.column_stack([uniform_filter1d(stacked[:, j], window_bins, mode="nearest")
+                            for j in range(n_bands)])
+    msq = np.column_stack([uniform_filter1d(stacked[:, j] ** 2, window_bins, mode="nearest")
+                           for j in range(n_bands)])
+    sd = np.sqrt(np.maximum(msq - mean ** 2, 1e-12))
+
+    total, n_pairs = np.zeros(len(stacked)), 0
+    for a in range(n_bands):
+        for b in range(a + 1, n_bands):
+            cross = uniform_filter1d(stacked[:, a] * stacked[:, b],
+                                     window_bins, mode="nearest")
+            total += (cross - mean[:, a] * mean[:, b]) / (sd[:, a] * sd[:, b])
+            n_pairs += 1
+    return total / n_pairs
+
+
+def artifact_mask(band_z, bin_s=BIN_SIZE_S):
     """True where a bin looks like a movement/EMG artifact.
 
-    Broadband co-activation is the signature: every band rises together, which
-    a genuine oscillation never does. The ripple-band escape clause keeps large
-    real ripples, which do drag the other bands up with them.
+    Three conditions, all required: the bands must be locally correlated (they
+    are rising together rather than independently), they must actually be
+    elevated (correlation in a quiet stretch means nothing), and the ripple
+    band must be below the escape threshold — a genuine large event drags
+    broadband power up with it and is not an artifact.
     """
     stacked = np.column_stack([band_z[name] for name in BANDS])
-    all_band_z = stacked.min(axis=1)          # high only if EVERY band is up
-    broadband = all_band_z > ARTIFACT_ALLBAND_Z
-    return broadband & (band_z["ripple"] < ARTIFACT_RIPPLE_KEEP_Z), stacked
+    broadband_z = stacked.mean(axis=1)
+    window_bins = max(3, int(round(ARTIFACT_CORR_WINDOW_S / bin_s)))
+    corr = rolling_cross_band_corr(stacked, window_bins)
+    bad = ((corr > ARTIFACT_CORR)
+           & (broadband_z > ARTIFACT_ALLBAND_Z)
+           & (band_z["ripple"] < ARTIFACT_RIPPLE_KEEP_Z))
+    return bad, stacked, corr, broadband_z
 
 
-def ca3_pyramidal_rate(session, fine_edges):
-    """z-scored CA3 pyramidal population rate — the sharp-wave proxy."""
-    meta = session["meta"]
-    is_ca3_pyr = ((meta["cell_area"].astype(str) == "CA3")
-                  & (meta["cell_type"].astype(str).str.contains("Pyramidal"))).values
-    if is_ca3_pyr.sum() == 0:
-        return None, 0
-    counts = np.zeros(len(fine_edges) - 1)
-    for st, take in zip(session["spike_times"], is_ca3_pyr):
-        if take:
-            counts += np.diff(np.searchsorted(st, fine_edges))
-    rate = counts / (SWR_FINE_BIN_S * is_ca3_pyr.sum())
-    rate = gaussian_filter1d(rate, sigma=SWR_SMOOTH_S / SWR_FINE_BIN_S, mode="nearest")
-    return zscore(rate), int(is_ca3_pyr.sum())
+def plot_artifacts(session, centers, band_z, bad, corr, broadband_z, speed):
+    """What the artifact rule caught, and whether it looks like movement."""
+    fig, axes = plt.subplots(1, 3, figsize=(14, 3.8))
+    fig.suptitle(f"{session['label']} — movement/EMG artifact screen "
+                 f"({bad.sum()} of {len(bad)} bins, {100 * bad.mean():.2f}%)")
 
+    ax = axes[0]
+    ax.hist(corr, bins=60, color="0.6")
+    ax.axvline(ARTIFACT_CORR, color="C3", ls="--", lw=1)
+    ax.set_xlabel(f"rolling cross-band correlation ({ARTIFACT_CORR_WINDOW_S:.0f}s)")
+    ax.set_ylabel("bins")
 
-def detect_sharp_wave_ripples(session, ripple_z_full, ca3_z, fine_centers):
-    """Ripple-band peak preceded by a CA3 pyramidal population peak.
+    ax = axes[1]
+    step = max(1, len(corr) // 20000)
+    sc = ax.scatter(corr[::step], broadband_z[::step], c=speed[::step], s=2,
+                    alpha=0.35, cmap="viridis", linewidths=0, rasterized=True)
+    ax.axvline(ARTIFACT_CORR, color="C3", ls="--", lw=1)
+    ax.axhline(ARTIFACT_ALLBAND_Z, color="C3", ls="--", lw=1)
+    ax.set_xlabel("cross-band correlation")
+    ax.set_ylabel("mean band power (z)")
+    ax.set_title(f"excluded = upper right, unless ripple > "
+                 f"{ARTIFACT_RIPPLE_KEEP_Z:.0f} SD", fontsize=8)
+    fig.colorbar(sc, ax=ax).set_label("speed (cm/s)", fontsize=8)
 
-    The sharp wave is the CA3 output that drives the CA1 ripple, so it leads
-    it. Requiring both, in that order, is what makes this a sharp-wave ripple
-    rather than any excursion of the ripple band — which on this channel is
-    mostly spike leakage from the high-rate interneurons.
-    """
-    fs = session["fs"]
-    peaks, props = sps.find_peaks(ripple_z_full, height=SWR_RIPPLE_Z,
-                                  distance=int(SWR_MIN_SEP_S * fs))
-    rows = []
-    for peak, height in zip(peaks, props["peak_heights"]):
-        t_ripple = session["lfp_t"][peak]
-        lo = np.searchsorted(fine_centers, t_ripple - SWR_SW_WINDOW_S)
-        hi = np.searchsorted(fine_centers, t_ripple)
-        if ca3_z is None or hi <= lo:
-            continue
-        window = ca3_z[lo:hi]
-        best = int(np.argmax(window))
-        if window[best] < SWR_SW_Z:
-            continue
-        t_sw = fine_centers[lo + best]
-        rows.append({
-            "t_ripple": t_ripple,
-            "t_sharpwave": t_sw,
-            "lag_ms": (t_ripple - t_sw) * 1e3,
-            "ripple_z": float(height),
-            "sharpwave_z": float(window[best]),
-            "speed": float(np.interp(t_ripple, session["speed_t"], session["speed_v"])),
-        })
-    events = pd.DataFrame(rows)
-    return events, len(peaks)
+    ax = axes[2]
+    bins = np.linspace(0, np.nanpercentile(speed, 99.5), 40)
+    ax.hist(speed[~bad], bins=bins, density=True, histtype="step", label="kept")
+    if bad.any():
+        ax.hist(speed[bad], bins=bins, density=True, histtype="step", label="artifact")
+    ax.set_xlabel("speed (cm/s)")
+    ax.set_ylabel("density")
+    ax.set_yscale("log")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
 
-
-def plot_example_events(session, ripple_filt, ripple_z_full, ca3_z, fine_centers,
-                        events, n_examples=N_EXAMPLE_EVENTS):
-    """A few putative events end to end: raw LFP, ripple band, sharp wave."""
-    if not len(events):
-        print("  no events to plot")
+    if not bad.any():
+        print("  no artifact bins flagged — nothing to plot in detail")
         return
-    # spread across the session rather than showing the biggest ones
-    picks = np.linspace(0, len(events) - 1, min(n_examples, len(events))).astype(int)
-    half = EXAMPLE_WINDOW_S / 2
-    fig, axes = plt.subplots(3, len(picks), figsize=(3.0 * len(picks), 6.5),
-                             sharex="col", squeeze=False)
-    fig.suptitle(f"{session['label']} — putative sharp-wave ripples "
-                 f"(ripple z > {SWR_RIPPLE_Z}, CA3 pyramidal z > {SWR_SW_Z} within "
-                 f"{SWR_SW_WINDOW_S * 1e3:.0f} ms before)")
 
-    for col, i in enumerate(picks):
-        ev = events.iloc[i]
-        t0, t1 = ev["t_ripple"] - half, ev["t_ripple"] + half
-        m = (session["lfp_t"] >= t0) & (session["lfp_t"] <= t1)
-        tt = (session["lfp_t"][m] - ev["t_ripple"]) * 1e3
+    # the longest flagged stretches, as raw LFP + the band envelopes + speed
+    flips = np.flatnonzero(np.diff(bad.astype(np.int8)))
+    starts = np.r_[0, flips + 1][np.r_[bad[0], bad[flips + 1]]]
+    lengths = []
+    for s in starts:
+        run = 0
+        while s + run < len(bad) and bad[s + run]:
+            run += 1
+        lengths.append(run)
+    order = np.argsort(lengths)[::-1][:N_ARTIFACT_EXAMPLES]
+
+    fig, axes = plt.subplots(3, len(order), figsize=(3.4 * len(order), 6.5),
+                             sharex="col", squeeze=False)
+    fig.suptitle(f"{session['label']} — longest flagged artifact stretches")
+    for col, k in enumerate(order):
+        s, run = starts[k], lengths[k]
+        stop = min(s + run, len(centers) - 1)
+        t0, t1 = centers[s] - 1.0, centers[stop] + 1.0
 
         ax = axes[0, col]
-        ax.plot(tt, session["lfp_v"][m], lw=0.6, color="k")
-        ax.set_title(f"{ev['t_ripple']:.1f}s | {ev['speed']:.1f} cm/s\n"
-                     f"lag {ev['lag_ms']:.0f} ms", fontsize=8)
+        m = (session["lfp_t"] >= t0) & (session["lfp_t"] <= t1)
+        ax.plot(session["lfp_t"][m], session["lfp_v"][m], lw=0.5, color="k")
+        ax.axvspan(centers[s], centers[stop], color="C3", alpha=0.15)
+        ax.set_title(f"{centers[s]:.1f}s | {run * BIN_SIZE_S * 1e3:.0f} ms flagged",
+                     fontsize=8)
         if col == 0:
             ax.set_ylabel("raw LFP")
 
         ax = axes[1, col]
-        ax.plot(tt, ripple_filt[m], lw=0.6, color="crimson")
-        ax.plot(tt, ripple_z_full[m] * np.std(ripple_filt[m]), lw=0.8, color="k", alpha=0.6)
+        bm = (centers >= t0) & (centers <= t1)
+        for name in BANDS:
+            ax.plot(centers[bm], band_z[name][bm], lw=0.9, label=name)
+        ax.axhline(ARTIFACT_ALLBAND_Z, color="C3", ls=":", lw=0.8)
         if col == 0:
-            ax.set_ylabel(f"{BANDS['ripple'][0]:.0f}-{BANDS['ripple'][1]:.0f} Hz\n"
-                          "(envelope in black)")
+            ax.set_ylabel("band power (z)")
+            ax.legend(fontsize=6, ncol=2)
 
         ax = axes[2, col]
-        fm = (fine_centers >= t0) & (fine_centers <= t1)
-        ax.plot((fine_centers[fm] - ev["t_ripple"]) * 1e3, ca3_z[fm], lw=0.9, color="C0")
-        ax.axhline(SWR_SW_Z, color="C0", ls=":", lw=0.8)
-        ax.axvline(0, color="crimson", lw=0.8)
-        ax.axvline(-ev["lag_ms"], color="C0", lw=0.8, ls="--")
-        ax.set_xlabel("ms from ripple peak")
+        ax.plot(centers[bm], speed[bm], lw=0.9, color="k")
         if col == 0:
-            ax.set_ylabel("CA3 pyramidal\nrate (z)")
-
+            ax.set_ylabel("speed\n(cm/s)")
+        ax.set_xlabel("time (s)")
     fig.tight_layout()
     plt.show()
     plt.close(fig)
 
 
 # =============================================================================
-# STEP 3 — the aperiodic (1/f) fit
+# STEP 3 — high-frequency events
 # =============================================================================
-# Slope and knee are state variables in their own right: the exponent tracks
-# excitation/inhibition balance and arousal, the knee moves with the timescale
-# of the underlying process. Both are computed here rather than in the plotting
-# cell because this is where the LFP is still in memory.
 
 
-def fit_aperiodic(freq, psd, f_range=APERIODIC_FIT_RANGE, exclude=APERIODIC_EXCLUDE):
-    """Knee-model fit: log10 P = offset - log10(knee + f ** exponent).
+def population_mua(session, fine_edges, regions=HFE_MUA_REGIONS):
+    """z-scored multi-unit rate.
 
-    The specparam/FOOOF parameterization, but fit in one shot with oscillatory
-    bands masked out rather than iteratively peak-stripped. Cruder than
-    specparam and with no extra dependency; stable on 4 s windows. Returns
-    (exponent, knee in Hz, offset, r2), all NaN if the fit fails.
+    `regions` of None means every recorded unit, which is what MUA normally
+    means. Note that high-rate units dominate the variance of a summed rate —
+    on this dataset RSC interneurons fire at ~17 Hz against ~1.3 Hz for
+    hippocampal pyramidal cells — so setting regions=("CA1", "CA3") gives a
+    hippocampal MUA that tracks the sharp wave more directly.
     """
-    keep = (freq >= f_range[0]) & (freq <= f_range[1]) & (psd > 0)
-    for lo, hi in exclude:
-        keep &= ~((freq >= lo) & (freq <= hi))
-    f, y = freq[keep], np.log10(psd[keep])
-    if f.size < 10:
-        return (np.nan,) * 4
-
-    def model(ff, offset, knee, exponent):
-        return offset - np.log10(knee + ff ** exponent)
-
-    try:
-        popt, _ = curve_fit(model, f, y, p0=[float(y[0]), 1.0, 2.0],
-                            bounds=([-np.inf, 0.0, 0.1], [np.inf, 1e6, 8.0]),
-                            maxfev=4000)
-    except Exception:
-        return (np.nan,) * 4
-
-    offset, knee, exponent = popt
-    resid = y - model(f, *popt)
-    r2 = 1.0 - np.sum(resid ** 2) / max(np.sum((y - y.mean()) ** 2), 1e-12)
-    # specparam's convention: the knee parameter is in units of f**exponent
-    knee_hz = knee ** (1.0 / exponent) if knee > 0 else np.nan
-    return float(exponent), float(knee_hz), float(offset), float(r2)
+    meta = session["meta"]
+    if regions is None:
+        take = np.ones(len(meta), dtype=bool)
+    else:
+        take = meta["cell_area"].astype(str).isin(regions).values
+    if take.sum() == 0:
+        return None, 0
+    counts = np.zeros(len(fine_edges) - 1)
+    for st, use in zip(session["spike_times"], take):
+        if use:
+            counts += np.diff(np.searchsorted(st, fine_edges))
+    rate = counts / (HFE_FINE_BIN_S * take.sum())
+    rate = gaussian_filter1d(rate, sigma=HFE_SMOOTH_S / HFE_FINE_BIN_S, mode="nearest")
+    return zscore(rate), int(take.sum())
 
 
-def aperiodic_timecourse(lfp_t, lfp_v, fs, centers):
-    """Sliding-window exponent and knee, interpolated onto the analysis bins."""
-    win = int(APERIODIC_WINDOW_S * fs)
-    hop = int(APERIODIC_HOP_S * fs)
-    nper = int(APERIODIC_WELCH_S * fs)
-    starts = np.arange(0, max(len(lfp_v) - win, 1), hop)
+def event_extent(envelope_z, peak, edge_z):
+    """Walk out from a peak to where the envelope drops below `edge_z`."""
+    start = peak
+    while start > 0 and envelope_z[start] > edge_z:
+        start -= 1
+    stop = peak
+    last = len(envelope_z) - 1
+    while stop < last and envelope_z[stop] > edge_z:
+        stop += 1
+    return start, stop
 
-    t_mid = np.empty(len(starts))
-    exponent = np.empty(len(starts))
-    knee = np.empty(len(starts))
-    r2 = np.empty(len(starts))
-    for i, s in enumerate(starts):
-        freq, psd = sps.welch(lfp_v[s:s + win], fs=fs, nperseg=nper)
-        exponent[i], knee[i], _, r2[i] = fit_aperiodic(freq, psd)
-        t_mid[i] = lfp_t[s + win // 2]
 
-    def to_bins(values):
-        ok = np.isfinite(values)
-        if ok.sum() < 2:
-            return np.full(len(centers), np.nan)
-        return np.interp(centers, t_mid[ok], values[ok])
+def detect_hfe(session, ripple_z_full, mua_z, fine_centers):
+    """Ripple-band events with MUA before or during them, below a speed gate.
 
-    n_failed = int((~np.isfinite(exponent)).sum())
-    return {"exponent": to_bins(exponent), "knee": to_bins(knee),
-            "r2": to_bins(r2), "n_windows": len(starts), "n_failed": n_failed}
+    The MUA window runs from HFE_MUA_LEAD_S before the event start to the event
+    end — never after. A population burst that only arrives once the ripple
+    band has finished is not evidence that the two belong together, and would
+    let any late, unrelated bump validate an event.
+    """
+    fs = session["fs"]
+    lfp_t = session["lfp_t"]
+    peaks, props = sps.find_peaks(ripple_z_full, height=HFE_RIPPLE_Z,
+                                  distance=int(HFE_MIN_SEP_S * fs))
+    funnel = {"candidates": len(peaks), "after_duration": 0,
+              "after_mua": 0, "after_speed": 0}
+
+    rows = []
+    for peak, height in zip(peaks, props["peak_heights"]):
+        i0, i1 = event_extent(ripple_z_full, peak, HFE_EDGE_Z)
+        dur_ms = (i1 - i0) / fs * 1e3
+        if not (HFE_MIN_MS <= dur_ms <= HFE_MAX_MS):
+            continue
+        funnel["after_duration"] += 1
+
+        t_peak, t0, t1 = lfp_t[peak], lfp_t[i0], lfp_t[i1]
+        if mua_z is None:
+            continue
+        lo = np.searchsorted(fine_centers, t0 - HFE_MUA_LEAD_S)
+        hi = np.searchsorted(fine_centers, t1, side="right")
+        if hi <= lo:
+            continue
+        window = mua_z[lo:hi]
+        best = int(np.argmax(window))
+        if window[best] < HFE_MUA_Z:
+            continue
+        funnel["after_mua"] += 1
+
+        speed = float(np.interp(t_peak, session["speed_t"], session["speed_v"]))
+        if speed > HFE_MAX_SPEED_CM_S:
+            continue
+        funnel["after_speed"] += 1
+
+        t_mua = fine_centers[lo + best]
+        rows.append({
+            "t_peak": t_peak,
+            "t_start": t0,
+            "t_end": t1,
+            "duration_ms": dur_ms,
+            "ripple_z": float(height),
+            "mua_z": float(window[best]),
+            "t_mua": t_mua,
+            "mua_lead_ms": (t_peak - t_mua) * 1e3,   # >0 = MUA before the peak
+            "speed": speed,
+        })
+    return pd.DataFrame(rows), funnel
+
+
+def match_to_annotations(events, annot_start, annot_stop, tol=HFE_MATCH_TOL_S):
+    """Which of our events overlap an annotated ripple, and vice versa."""
+    if not len(events) or not len(annot_start):
+        return (np.zeros(len(events), dtype=bool),
+                np.zeros(len(annot_start), dtype=bool))
+    ours_start = events["t_start"].values - tol
+    ours_end = events["t_end"].values + tol
+    ours_hit = np.zeros(len(events), dtype=bool)
+    theirs_hit = np.zeros(len(annot_start), dtype=bool)
+    for j, (a0, a1) in enumerate(zip(annot_start, annot_stop)):
+        overlap = (ours_start <= a1) & (ours_end >= a0)
+        ours_hit |= overlap
+        theirs_hit[j] = overlap.any()
+    return ours_hit, theirs_hit
+
+
+def _event_panel(session, ripple_filt, ripple_z_full, mua_z, fine_centers,
+                 axes, col, t_center, t0_span, t1_span, title, shade=None):
+    """Three stacked panels for one event: raw LFP, ripple band, MUA."""
+    m = (session["lfp_t"] >= t0_span) & (session["lfp_t"] <= t1_span)
+    tt = (session["lfp_t"][m] - t_center) * 1e3
+
+    ax = axes[0, col]
+    ax.plot(tt, session["lfp_v"][m], lw=0.6, color="k")
+    if shade is not None:
+        ax.axvspan((shade[0] - t_center) * 1e3, (shade[1] - t_center) * 1e3,
+                   color="crimson", alpha=0.12)
+    ax.set_title(title, fontsize=8)
+    if col == 0:
+        ax.set_ylabel("raw LFP")
+
+    ax = axes[1, col]
+    ax.plot(tt, ripple_filt[m], lw=0.6, color="crimson")
+    ax.plot(tt, ripple_z_full[m] * np.std(ripple_filt[m]), lw=0.8, color="k", alpha=0.6)
+    if col == 0:
+        ax.set_ylabel(f"{BANDS['ripple'][0]:.0f}-{BANDS['ripple'][1]:.0f} Hz\n"
+                      "(envelope in black)")
+
+    ax = axes[2, col]
+    fm = (fine_centers >= t0_span) & (fine_centers <= t1_span)
+    ax.plot((fine_centers[fm] - t_center) * 1e3, mua_z[fm], lw=0.9, color="C0")
+    ax.axhline(HFE_MUA_Z, color="C0", ls=":", lw=0.8)
+    ax.axvline(0, color="crimson", lw=0.8)
+    if shade is not None:
+        ax.axvspan((shade[0] - HFE_MUA_LEAD_S - t_center) * 1e3,
+                   (shade[1] - t_center) * 1e3, color="C0", alpha=0.10)
+    ax.set_xlabel("ms from peak")
+    if col == 0:
+        ax.set_ylabel("MUA (z)")
+
+
+def plot_hfe_examples(session, ripple_filt, ripple_z_full, mua_z, fine_centers,
+                      events, matched, n_examples=N_EXAMPLE_EVENTS):
+    """Our events, spread across the session rather than the biggest ones."""
+    if not len(events):
+        print("  no HFEs to plot")
+        return
+    picks = np.linspace(0, len(events) - 1, min(n_examples, len(events))).astype(int)
+    half = EXAMPLE_WINDOW_S / 2
+    fig, axes = plt.subplots(3, len(picks), figsize=(3.0 * len(picks), 6.5),
+                             sharex="col", squeeze=False)
+    fig.suptitle(f"{session['label']} — our HFEs (ripple z > {HFE_RIPPLE_Z}, "
+                 f"MUA z > {HFE_MUA_Z} within {HFE_MUA_LEAD_S * 1e3:.0f} ms before "
+                 f"or during, speed < {HFE_MAX_SPEED_CM_S:.0f} cm/s). "
+                 "Shaded: event extent, and the MUA search window")
+    for col, i in enumerate(picks):
+        ev = events.iloc[i]
+        tag = "matches annotation" if matched[i] else "ours only"
+        _event_panel(session, ripple_filt, ripple_z_full, mua_z, fine_centers,
+                     axes, col, ev["t_peak"],
+                     ev["t_peak"] - half, ev["t_peak"] + half,
+                     f"{ev['t_peak']:.1f}s | {ev['speed']:.1f} cm/s | "
+                     f"{ev['duration_ms']:.0f} ms\nMUA lead {ev['mua_lead_ms']:.0f} ms "
+                     f"| {tag}",
+                     shade=(ev["t_start"], ev["t_end"]))
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
+def plot_annotated_examples(session, ripple_filt, ripple_z_full, mua_z, fine_centers,
+                            theirs_hit, n_examples=N_EXAMPLE_EVENTS):
+    """The authors' annotated ripples, drawn exactly the same way."""
+    starts, stops = session["annot_start"], session["annot_stop"]
+    if not len(starts):
+        print("  no annotated ripples inside the maze epoch")
+        return
+    picks = np.linspace(0, len(starts) - 1, min(n_examples, len(starts))).astype(int)
+    half = EXAMPLE_WINDOW_S / 2
+    fig, axes = plt.subplots(3, len(picks), figsize=(3.0 * len(picks), 6.5),
+                             sharex="col", squeeze=False)
+    fig.suptitle(f"{session['label']} — the authors' annotated ripples "
+                 f"({len(starts)} in this epoch)")
+    for col, i in enumerate(picks):
+        mid = 0.5 * (starts[i] + stops[i])
+        speed = float(np.interp(mid, session["speed_t"], session["speed_v"]))
+        tag = "we found it" if theirs_hit[i] else "we missed it"
+        _event_panel(session, ripple_filt, ripple_z_full, mua_z, fine_centers,
+                     axes, col, mid, mid - half, mid + half,
+                     f"{mid:.1f}s | {speed:.1f} cm/s | "
+                     f"{(stops[i] - starts[i]) * 1e3:.0f} ms\n{tag}",
+                     shade=(starts[i], stops[i]))
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
 
 
 # =============================================================================
@@ -492,7 +702,7 @@ def subsample_index(n_rows, must_keep, max_bins=UMAP_MAX_BINS):
     """Strided subsample, with every must-keep bin forced in.
 
     Events are rare enough that a plain stride would drop most of them, and
-    then there would be nothing to colour in cell 3.
+    then there would be nothing to colour in cell 9.
     """
     stride = max(1, n_rows // max_bins)
     idx = np.union1d(np.arange(0, n_rows, stride), np.flatnonzero(must_keep))
@@ -506,6 +716,22 @@ def run_umap(X, seed=UMAP_RANDOM_STATE):
     reducer = umap.UMAP(n_components=UMAP_N_COMPONENTS, n_neighbors=UMAP_N_NEIGHBORS,
                         min_dist=UMAP_MIN_DIST, metric=UMAP_METRIC, random_state=seed)
     return reducer.fit_transform(scores), float(pca.explained_variance_ratio_.sum())
+
+
+def bins_covering(edges, starts, stops=None):
+    """Boolean over bins: True where an event falls inside the bin."""
+    hit = np.zeros(len(edges) - 1, dtype=bool)
+    if starts is None or len(starts) == 0:
+        return hit
+    if stops is None:
+        stops = starts
+    for a, b in zip(np.atleast_1d(starts), np.atleast_1d(stops)):
+        lo = np.searchsorted(edges, a, side="right") - 1
+        hi = np.searchsorted(edges, b, side="right") - 1
+        lo, hi = max(lo, 0), min(hi, len(hit) - 1)
+        if hi >= lo:
+            hit[lo:hi + 1] = True
+    return hit
 
 
 def process_day(row):
@@ -522,60 +748,58 @@ def process_day(row):
     print(f"  band power: {len(BANDS)} bands in {time.perf_counter() - t0:.1f}s")
 
     # --- artifacts ----------------------------------------------------------
-    bad, stacked = artifact_mask(band_z)
-    cross_band = np.corrcoef(stacked.T)
-    off_diag = cross_band[np.triu_indices(len(BANDS), k=1)]
-    print(f"  cross-band correlation: mean {off_diag.mean():.2f} "
-          f"(min {off_diag.min():.2f}, max {off_diag.max():.2f})")
+    speed = np.interp(centers, session["speed_t"], session["speed_v"])
+    bad, stacked, corr, broadband_z = artifact_mask(band_z)
+    session_corr = np.corrcoef(stacked.T)[np.triu_indices(len(BANDS), k=1)]
+    print(f"  cross-band correlation: session-wide mean {session_corr.mean():.2f}, "
+          f"rolling ({ARTIFACT_CORR_WINDOW_S:.0f}s) median {np.median(corr):.2f}, "
+          f"95th pct {np.percentile(corr, 95):.2f}, max {corr.max():.2f}")
     print(f"  artifact bins dropped: {bad.sum()} of {len(bad)} "
-          f"({100 * bad.mean():.2f}%) — all bands > {ARTIFACT_ALLBAND_Z} SD "
-          f"with ripple < {ARTIFACT_RIPPLE_KEEP_Z} SD")
+          f"({100 * bad.mean():.2f}%)")
+    if bad.any():
+        print(f"  speed in flagged bins: median {np.median(speed[bad]):.2f} cm/s "
+              f"vs {np.median(speed[~bad]):.2f} cm/s elsewhere")
+    if RUN_EXAMPLES:
+        plot_artifacts(session, centers, band_z, bad, corr, broadband_z, speed)
     keep = ~bad
 
-    # --- sharp-wave ripples -------------------------------------------------
-    fine_edges = np.arange(session["t_start"], session["t_end"], SWR_FINE_BIN_S)
-    fine_centers = fine_edges[:-1] + SWR_FINE_BIN_S / 2
-    ca3_z, n_ca3 = ca3_pyramidal_rate(session, fine_edges)
-    events, n_candidates = detect_sharp_wave_ripples(session, ripple_z_full,
-                                                     ca3_z, fine_centers)
-    print(f"  CA3 pyramidal units: {n_ca3}")
-    print(f"  ripple-band peaks > {SWR_RIPPLE_Z} SD: {n_candidates} | "
-          f"with a preceding sharp wave: {len(events)} "
-          f"({len(events) / (session['maze_s'] / 60):.2f}/min)")
+    # --- high-frequency events ----------------------------------------------
+    fine_edges = np.arange(session["t_start"], session["t_end"], HFE_FINE_BIN_S)
+    fine_centers = fine_edges[:-1] + HFE_FINE_BIN_S / 2
+    mua_z, n_mua_units = population_mua(session, fine_edges)
+    events, funnel = detect_hfe(session, ripple_z_full, mua_z, fine_centers)
+    ours_hit, theirs_hit = match_to_annotations(events, session["annot_start"],
+                                                session["annot_stop"])
+
+    minutes = session["maze_s"] / 60
+    print(f"  MUA from {n_mua_units} units "
+          f"({'all regions' if HFE_MUA_REGIONS is None else '+'.join(HFE_MUA_REGIONS)})")
+    print(f"  HFE funnel: {funnel['candidates']} ripple peaks > {HFE_RIPPLE_Z} SD "
+          f"-> {funnel['after_duration']} within {HFE_MIN_MS:.0f}-{HFE_MAX_MS:.0f} ms "
+          f"-> {funnel['after_mua']} with MUA > {HFE_MUA_Z} SD in window "
+          f"-> {funnel['after_speed']} below {HFE_MAX_SPEED_CM_S:.0f} cm/s "
+          f"({len(events) / minutes:.2f}/min)")
     if len(events):
-        print(f"  lag (sharp wave -> ripple): median {events['lag_ms'].median():.0f} ms")
-        print(f"  speed at event: median {events['speed'].median():.2f} cm/s, "
-              f"{100 * (events['speed'] < 2.0).mean():.0f}% below 2 cm/s")
+        print(f"  duration: median {events['duration_ms'].median():.0f} ms | "
+              f"MUA lead: median {events['mua_lead_ms'].median():.0f} ms | "
+              f"speed: median {events['speed'].median():.2f} cm/s")
+    print(f"  annotated ripples in epoch: {len(session['annot_start'])} | "
+          f"ours matching one: {int(ours_hit.sum())}/{len(events)} | "
+          f"theirs we recovered: {int(theirs_hit.sum())}/{len(session['annot_start'])}")
 
     if RUN_EXAMPLES:
-        plot_example_events(session, ripple_filt, ripple_z_full, ca3_z,
-                            fine_centers, events)
-    del ripple_filt, ripple_z_full
+        plot_hfe_examples(session, ripple_filt, ripple_z_full, mua_z,
+                          fine_centers, events, ours_hit)
+        plot_annotated_examples(session, ripple_filt, ripple_z_full, mua_z,
+                                fine_centers, theirs_hit)
+    del ripple_filt, ripple_z_full, mua_z
     gc.collect()
 
-    # --- aperiodic 1/f ------------------------------------------------------
-    t0 = time.perf_counter()
-    aper = aperiodic_timecourse(session["lfp_t"], session["lfp_v"],
-                                session["fs"], centers)
-    print(f"  1/f fit: {aper['n_windows']} windows "
-          f"({APERIODIC_WINDOW_S:.0f}s / {APERIODIC_HOP_S:.0f}s hop), "
-          f"{aper['n_failed']} failed, {time.perf_counter() - t0:.1f}s")
-    print(f"  exponent: median {np.nanmedian(aper['exponent']):.2f} "
-          f"(IQR {np.nanpercentile(aper['exponent'], 25):.2f}-"
-          f"{np.nanpercentile(aper['exponent'], 75):.2f}) | "
-          f"knee: median {np.nanmedian(aper['knee']):.1f} Hz | "
-          f"fit r2 median {np.nanmedian(aper['r2']):.3f}")
-
-    # bins holding an event, on the kept bins
-    swr_bin = np.zeros(len(centers), dtype=bool)
-    if len(events):
-        hit = np.searchsorted(edges, events["t_ripple"].values, side="right") - 1
-        hit = hit[(hit >= 0) & (hit < len(centers))]
-        swr_bin[hit] = True
-
-    # --- covariates on kept bins -------------------------------------------
-    speed = np.interp(centers, session["speed_t"], session["speed_v"])
+    # --- covariates ---------------------------------------------------------
     track_x = np.interp(centers, session["pos_t"], session["pos_x"])
+    hfe_bin = bins_covering(edges, events["t_start"].values if len(events) else None,
+                            events["t_end"].values if len(events) else None)
+    annot_bin = bins_covering(edges, session["annot_start"], session["annot_stop"])
 
     # --- embeddings ---------------------------------------------------------
     counts = counts_from_spike_times(session["spike_times"], edges)
@@ -584,8 +808,8 @@ def process_day(row):
     region = meta["cell_area"].astype(str).values
     alive = meta["rate_maze_hz"].values > UMAP_MIN_RATE_HZ
 
-    swr_kept = swr_bin[keep]
-    sub = subsample_index(X.shape[0], swr_kept)
+    hfe_kept, annot_kept = hfe_bin[keep], annot_bin[keep]
+    sub = subsample_index(X.shape[0], hfe_kept | annot_kept)
 
     embeddings = {}
     for name in GROUPINGS:
@@ -599,25 +823,19 @@ def process_day(row):
         print(f"  {name:7s}: {int(mask.sum()):3d} units, {len(sub)} bins, "
               f"PCA kept {100 * var:.1f}%, {time.perf_counter() - t_fit:.0f}s")
 
-    speed_kept = speed[keep][sub]
-    exponent_kept = aper["exponent"][keep][sub]
-    finite = np.isfinite(exponent_kept) & np.isfinite(speed_kept)
-    if finite.sum() > 10:
-        print(f"  corr(1/f exponent, speed) = "
-              f"{np.corrcoef(exponent_kept[finite], speed_kept[finite])[0, 1]:.3f}")
-
     day = {
         "label": label,
         "date": session["date"],
         "embeddings": embeddings,
         "band_z": {name: band_z[name][keep][sub] for name in BANDS},
-        "speed": speed_kept,
+        "speed": speed[keep][sub],
         "track_x": track_x[keep][sub],
-        "exponent": exponent_kept,
-        "knee": aper["knee"][keep][sub],
-        "fit_r2": aper["r2"][keep][sub],
-        "swr": swr_kept[sub],
+        "hfe": hfe_kept[sub],
+        "annot": annot_kept[sub],
         "events": events,
+        "n_annotated": int(len(session["annot_start"])),
+        "n_matched": int(ours_hit.sum()),
+        "n_recovered": int(theirs_hit.sum()),
         "n_bins": len(sub),
         "frac_artifact": float(bad.mean()),
     }
@@ -644,9 +862,13 @@ print(pd.DataFrame([{
     "date": d["date"],
     "bins_embedded": d["n_bins"],
     "frac_artifact": round(d["frac_artifact"], 4),
-    "swr_events": len(d["events"]),
-    "swr_bins": int(d["swr"].sum()),
-    "median_speed_at_swr": (round(d["events"]["speed"].median(), 2)
+    "hfe": len(d["events"]),
+    "hfe_bins": int(d["hfe"].sum()),
+    "annotated": d["n_annotated"],
+    "annotated_bins": int(d["annot"].sum()),
+    "ours_matching_theirs": d["n_matched"],
+    "theirs_recovered": d["n_recovered"],
+    "median_speed_at_hfe": (round(d["events"]["speed"].median(), 2)
                             if len(d["events"]) else np.nan),
 } for d in days]).to_string(index=False))
 
@@ -751,176 +973,80 @@ band_figure("ripple", days)
 
 
 # %% ===========================================================================
-# CELL 9 — our sharp-wave ripples on the manifold, coloured by speed
+# CELL 9 — events on the manifold: ours and the authors'
 # ==============================================================================
-# Every bin in grey, the detected sharp-wave ripple bins on top in colour. The
-# colour is running speed at the event, not ripple power: the question is
-# whether the events that land in one part of the manifold are the ones the
-# animal was still for.
+# Two rows per grouping. Top: the authors' annotated ripples. Bottom: our HFEs.
+# Every bin in grey underneath, the event bins on top coloured by running speed
+# at the event — the question is whether events landing in one part of the
+# manifold are the ones the animal was still for.
 
 
-def swr_speed_figure(grouping, days):
+def event_figure(grouping, days):
     rows = [d for d in days if grouping in d["embeddings"]]
     if not rows:
         return
-    fig, axes = plt.subplots(1, len(rows), figsize=(5.0 * len(rows), 4.6),
+    fig, axes = plt.subplots(2, len(rows), figsize=(4.8 * len(rows), 8.8),
                              squeeze=False, subplot_kw={"projection": "3d"})
-    fig.suptitle(f"{SUBJECT} — {grouping} — sharp-wave ripple bins, "
-                 f"coloured by speed at the event")
+    fig.suptitle(f"{SUBJECT} — {grouping} — event bins coloured by speed\n"
+                 f"top: authors' annotated ripples | bottom: our HFEs "
+                 f"(speed < {HFE_MAX_SPEED_CM_S:.0f} cm/s by construction)")
 
-    speeds = np.concatenate([d["speed"][d["swr"]] for d in rows if d["swr"].any()]) \
-        if any(d["swr"].any() for d in rows) else np.array([0.0, 1.0])
+    pooled = [d["speed"][d[key]] for d in rows for key in ("annot", "hfe")
+              if d[key].any()]
+    speeds = np.concatenate(pooled) if pooled else np.array([0.0, 1.0])
     vmin, vmax = float(np.min(speeds)), float(max(np.max(speeds), 1e-3))
 
-    for c, day in enumerate(rows):
-        ax = axes[0, c]
-        emb, hit = day["embeddings"][grouping], day["swr"]
-        ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c="0.82", s=1.0,
-                   alpha=0.35, linewidths=0, rasterized=True)
-        if hit.any():
-            sc = ax.scatter(emb[hit, 0], emb[hit, 1], emb[hit, 2],
-                            c=day["speed"][hit], cmap="viridis", vmin=vmin, vmax=vmax,
-                            s=34, edgecolors="k", linewidths=0.4)
-            fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.08).set_label("speed (cm/s)",
-                                                                    fontsize=8)
-        ax.set_title(f"{day['date']} — {int(hit.sum())} SWR bins", fontsize=9)
-        ax.set_xlabel("UMAP 1", fontsize=8)
-        ax.set_ylabel("UMAP 2", fontsize=8)
-        ax.set_zlabel("UMAP 3", fontsize=8)
-        ax.tick_params(labelsize=6)
+    for r, key in enumerate(("annot", "hfe")):
+        for c, day in enumerate(rows):
+            ax = axes[r, c]
+            emb, hit = day["embeddings"][grouping], day[key]
+            ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c="0.82", s=1.0,
+                       alpha=0.35, linewidths=0, rasterized=True)
+            if hit.any():
+                sc = ax.scatter(emb[hit, 0], emb[hit, 1], emb[hit, 2],
+                                c=day["speed"][hit], cmap="viridis",
+                                vmin=vmin, vmax=vmax, s=34,
+                                edgecolors="k", linewidths=0.4)
+                fig.colorbar(sc, ax=ax, shrink=0.55,
+                             pad=0.08).set_label("speed (cm/s)", fontsize=8)
+            kind = "annotated" if key == "annot" else "HFE"
+            ax.set_title(f"{day['date']} — {int(hit.sum())} {kind} bins", fontsize=9)
+            ax.set_xlabel("UMAP 1", fontsize=8)
+            ax.set_ylabel("UMAP 2", fontsize=8)
+            ax.set_zlabel("UMAP 3", fontsize=8)
+            ax.tick_params(labelsize=6)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
 
 
 for grouping in GROUPINGS:
-    swr_speed_figure(grouping, days)
+    event_figure(grouping, days)
 
-# Event-level summary across days: does speed at our events look like the
-# immobility the SWR literature expects?
+# Event-level summary: durations, how far the MUA leads, and the speed the
+# events happen at.
 all_events = pd.concat([d["events"].assign(date=d["date"]) for d in days
                         if len(d["events"])], ignore_index=True)
 if len(all_events):
-    print("\nsharp-wave ripple events, all days")
-    print(all_events.groupby("date")[["ripple_z", "sharpwave_z", "lag_ms", "speed"]]
-          .describe()[[("ripple_z", "count"), ("ripple_z", "50%"),
-                       ("sharpwave_z", "50%"), ("lag_ms", "50%"),
-                       ("speed", "50%")]].round(2).to_string())
+    print("\nHFEs, all days")
+    print(all_events.groupby("date")[["ripple_z", "mua_z", "duration_ms",
+                                      "mua_lead_ms", "speed"]]
+          .median().round(2).to_string())
 
-    fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
-    fig.suptitle(f"{SUBJECT} — detected sharp-wave ripples")
-    axes[0].hist(all_events["lag_ms"], bins=30, color="C0")
-    axes[0].set_xlabel("sharp wave -> ripple lag (ms)")
+    fig, axes = plt.subplots(1, 4, figsize=(16, 3.6))
+    fig.suptitle(f"{SUBJECT} — high-frequency events")
+    axes[0].hist(all_events["duration_ms"], bins=30, color="C0")
+    axes[0].set_xlabel("event duration (ms)")
     axes[0].set_ylabel("events")
-    axes[1].hist(all_events["speed"], bins=30, color="C2")
-    axes[1].axvline(2.0, color="C3", ls=":", lw=1)
-    axes[1].set_xlabel("speed at ripple peak (cm/s)")
-    axes[2].scatter(all_events["sharpwave_z"], all_events["ripple_z"],
-                    s=8, alpha=0.5, c="k")
-    axes[2].set_xlabel("sharp wave (CA3 pyramidal z)")
-    axes[2].set_ylabel("ripple-band z")
+    axes[1].hist(all_events["mua_lead_ms"], bins=30, color="C1")
+    axes[1].axvline(0, color="crimson", lw=1)
+    axes[1].set_xlabel("MUA lead (ms; >0 = before the peak)")
+    axes[2].hist(all_events["speed"], bins=30, color="C2")
+    axes[2].axvline(HFE_MAX_SPEED_CM_S, color="C3", ls=":", lw=1)
+    axes[2].set_xlabel("speed at peak (cm/s)")
+    axes[3].scatter(all_events["mua_z"], all_events["ripple_z"], s=8, alpha=0.5, c="k")
+    axes[3].set_xlabel("MUA (z)")
+    axes[3].set_ylabel("ripple-band (z)")
     fig.tight_layout()
     plt.show()
     plt.close(fig)
-
-
-# %% ===========================================================================
-# CELL 10 — the aperiodic 1/f background on the manifold
-# ==============================================================================
-# Exponent and knee, fit in cell 1 and mapped onto the same clouds. The r2
-# column is not decoration: a region that looks like it has a distinctive
-# exponent but a poor fit is telling you about the fit, not about the brain.
-#
-# Colour limits come from the 2nd-98th percentile pooled over days, so the
-# three rows are directly comparable and a couple of bad windows do not
-# flatten the scale.
-
-APERIODIC_PANELS = (
-    ("exponent", "1/f exponent (slope)", "inferno"),
-    ("knee", "knee (Hz)", "cividis"),
-    ("fit_r2", "fit r2", "Greys"),
-)
-
-
-def aperiodic_limits(days, key):
-    pooled = np.concatenate([d[key][np.isfinite(d[key])] for d in days
-                             if np.isfinite(d[key]).any()])
-    if pooled.size == 0:
-        return 0.0, 1.0
-    return float(np.percentile(pooled, 2)), float(np.percentile(pooled, 98))
-
-
-def aperiodic_figure(grouping, days, projection=GRID_PROJECTION):
-    rows = [d for d in days if grouping in d["embeddings"]]
-    if not rows:
-        return
-    subplot_kw = {"projection": "3d"} if projection == "3d" else {}
-    fig, axes = plt.subplots(len(rows), len(APERIODIC_PANELS),
-                             figsize=(4.0 * len(APERIODIC_PANELS), 3.2 * len(rows)),
-                             squeeze=False, subplot_kw=subplot_kw)
-    fig.suptitle(f"{SUBJECT} — {grouping} — aperiodic 1/f background "
-                 f"({APERIODIC_FIT_RANGE[0]:.0f}-{APERIODIC_FIT_RANGE[1]:.0f} Hz, "
-                 f"{APERIODIC_WINDOW_S:.0f}s windows)")
-
-    limits = {key: aperiodic_limits(rows, key) for key, _, _ in APERIODIC_PANELS}
-    for r, day in enumerate(rows):
-        emb = day["embeddings"][grouping]
-        for c, (key, label, cmap) in enumerate(APERIODIC_PANELS):
-            ax = axes[r, c]
-            vmin, vmax = limits[key]
-            sc = scatter_panel(ax, emb, day[key], cmap, vmin, vmax, projection)
-            if r == 0:
-                ax.set_title(label, fontsize=10)
-            if c == 0:
-                ax.set_ylabel(day["date"], fontsize=9)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            if projection == "3d":
-                ax.set_zticks([])
-            if r == len(rows) - 1:
-                fig.colorbar(sc, ax=ax, orientation="horizontal",
-                             fraction=0.05, pad=0.06).ax.tick_params(labelsize=7)
-    fig.tight_layout()
-    plt.show()
-    plt.close(fig)
-
-
-for grouping in GROUPINGS:
-    aperiodic_figure(grouping, days)
-
-# How the aperiodic parameters relate to behaviour and to the ripple band —
-# a flattening exponent during running is the usual expectation, so this is
-# the sanity check on the fit before reading anything into the manifold.
-print("\naperiodic summary")
-print(pd.DataFrame([{
-    "date": d["date"],
-    "exponent_median": round(float(np.nanmedian(d["exponent"])), 3),
-    "knee_hz_median": round(float(np.nanmedian(d["knee"])), 2),
-    "r2_median": round(float(np.nanmedian(d["fit_r2"])), 3),
-    "corr_exponent_speed": round(float(pd.Series(d["exponent"]).corr(
-        pd.Series(d["speed"]))), 3),
-    "corr_knee_speed": round(float(pd.Series(d["knee"]).corr(
-        pd.Series(d["speed"]))), 3),
-    "corr_exponent_ripple": round(float(pd.Series(d["exponent"]).corr(
-        pd.Series(d["band_z"]["ripple"]))), 3),
-} for d in days]).to_string(index=False))
-
-fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
-fig.suptitle(f"{SUBJECT} — aperiodic parameters")
-for day in days:
-    ok = np.isfinite(day["exponent"])
-    axes[0].hist(day["exponent"][ok], bins=40, histtype="step", label=day["date"])
-    ok_k = np.isfinite(day["knee"])
-    axes[1].hist(day["knee"][ok_k], bins=40, histtype="step", label=day["date"])
-    axes[2].scatter(day["speed"][ok], day["exponent"][ok], s=2, alpha=0.2,
-                    label=day["date"])
-axes[0].set_xlabel("1/f exponent")
-axes[0].set_ylabel("bins")
-axes[0].legend(fontsize=7)
-axes[1].set_xlabel("knee (Hz)")
-axes[2].set_xlabel("speed (cm/s)")
-axes[2].set_ylabel("1/f exponent")
-axes[2].set_xscale("symlog", linthresh=1)
-fig.tight_layout()
-plt.show()
-plt.close(fig)
