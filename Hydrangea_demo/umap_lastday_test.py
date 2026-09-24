@@ -1,10 +1,13 @@
-"""UMAP / SWR exploratory analysis — STAGE 1: gather and characterize the data.
+"""UMAP / SWR exploratory analysis — gather, characterize, embed, view.
 
-Paste the whole file into one notebook cell and run it. It is written to be a
-single script: no `# %%` splits, no files written, everything reported with
+Three notebook cells, split at the "CELL 2" and "CELL 3" banners:
+    cell 1  gather and characterize
+    cell 2  the shared session loader and the UMAP sweep (the slow one)
+    cell 3  the scrollable viewer
+Each cell depends on the ones before it. No files are written — everything is
 print() and plt.show().
 
-What it does
+CELL 1 does
     1. inventory the data mount (same paths as test_hydan_obj.py)
     2. take the LAST behaviour session of every subject, count units, pick the
        subject whose last day has the most units
@@ -16,9 +19,14 @@ What it does
     5. population-level spiking views for the chosen session
     6. a filter report: what each candidate inclusion rule would cost
 
-Stage 2 (the UMAP itself, down to 3 components) is not here yet — the bundle
-this builds is the input to it. `load_session_bundle()` and `session_profile()`
-take any inventory row, so widening from one mouse to all of them is a loop.
+CELL 2 does
+    7. the UMAP sweep: per session, one global embedding plus one per region,
+       3 components each — 12 figures for 3 sessions x 4 groupings.
+
+CELL 3 does
+    8. a scrollable viewer: position (x and y as two lines), speed, the
+       author's state/ripple labels as a bar, and a region x cell-type raster,
+       with a session dropdown. One session is held in memory at a time.
 
 The hydrangea package is used only for two small helpers (unit metadata
 extraction, speed from position); nothing here depends on the analysis object.
@@ -35,11 +43,7 @@ import numpy as np
 import pandas as pd
 import pynapple as nap
 
-try:
-    from scipy import signal as sps
-    HAVE_SCIPY = True
-except ImportError:  # the LFP sections degrade to a plain periodogram
-    HAVE_SCIPY = False
+from scipy import signal as sps
 
 # numpy 2 renamed trapz; keep working on both
 _trapz = getattr(np, "trapezoid", None) or np.trapz
@@ -262,12 +266,8 @@ def band_power(freq, psd, lo, hi):
 
 
 def lfp_psd(values, fs, seg_s=4.0):
-    """Welch PSD, or a plain periodogram on a slice if scipy is unavailable."""
-    if HAVE_SCIPY:
-        return sps.welch(values, fs=fs, nperseg=int(seg_s * fs))
-    seg = values[: int(60 * fs)]
-    psd = np.abs(np.fft.rfft(seg)) ** 2 / len(seg)
-    return np.fft.rfftfreq(len(seg), 1 / fs), psd
+    """Welch PSD over `seg_s`-second segments."""
+    return sps.welch(values, fs=fs, nperseg=int(seg_s * fs))
 
 
 def bandpass(values, fs, lo, hi, order=4):
@@ -284,8 +284,6 @@ def detect_ripple_events(t, values, fs, z_thresh=RIPPLE_Z,
     channel, and roughly how often", not to produce an event set to analyze.
     Returns event times plus the z-scored envelope for plotting.
     """
-    if not HAVE_SCIPY:
-        return None
     lo, hi = BANDS["ripple"]
     filt = bandpass(values, fs, lo, hi)
     win = max(1, int(smooth_ms * 1e-3 * fs))
@@ -493,24 +491,22 @@ def session_profile(row, verbose=True):
             profile[f"rel_{name}"] = p / total if total else np.nan
         profile["theta_delta"] = profile["abs_theta"] / profile["abs_delta"]
 
-        if HAVE_SCIPY:
-            nper = int(2.0 * fs)
-            f_s, t_s, sxx = sps.spectrogram(values, fs=fs, nperseg=nper, noverlap=nper // 2)
-            t_s = t_s + b["lfp_t"][0]
-            keep = (f_s >= 0.5) & (f_s <= SPEC_MAX_HZ)
-            profile["spec_f"] = f_s[keep]
-            profile["spec_t"] = t_s
-            profile["spec_db"] = 10 * np.log10(sxx[keep] + 1e-12)
-            rip = (f_s >= BANDS["ripple"][0]) & (f_s <= BANDS["ripple"][1])
-            rip_p = sxx[rip].mean(axis=0)
-            profile["rip_t"] = t_s
-            profile["rip_z"] = (rip_p - rip_p.mean()) / (rip_p.std() + 1e-12)
+        nper = int(2.0 * fs)
+        f_s, t_s, sxx = sps.spectrogram(values, fs=fs, nperseg=nper, noverlap=nper // 2)
+        t_s = t_s + b["lfp_t"][0]
+        keep = (f_s >= 0.5) & (f_s <= SPEC_MAX_HZ)
+        profile["spec_f"] = f_s[keep]
+        profile["spec_t"] = t_s
+        profile["spec_db"] = 10 * np.log10(sxx[keep] + 1e-12)
+        rip = (f_s >= BANDS["ripple"][0]) & (f_s <= BANDS["ripple"][1])
+        rip_p = sxx[rip].mean(axis=0)
+        profile["rip_t"] = t_s
+        profile["rip_z"] = (rip_p - rip_p.mean()) / (rip_p.std() + 1e-12)
 
         events = detect_ripple_events(b["lfp_t"], values, fs)
-        if events is not None:
-            profile["swr_n"] = events["n"]
-            profile["swr_per_min"] = events["n"] / (b["maze_s"] / 60)
-            profile["swr_t"] = events["t_peak"]
+        profile["swr_n"] = events["n"]
+        profile["swr_per_min"] = events["n"] / (b["maze_s"] / 60)
+        profile["swr_t"] = events["t_peak"]
 
     if verbose:
         print(f"  profiled {label}: {profile['n_units']} units, "
@@ -1000,18 +996,17 @@ if SHOW_POPULATION:
     ax.set_ylabel("speed\n(cm/s)")
 
     ax = axes[2]
-    if b["lfp_v"] is not None and HAVE_SCIPY:
+    if b["lfp_v"] is not None:
         # z-scored within this window, so the 3 SD line is window-local and not
         # comparable to the session-wide counts in step 6
         m = (b["lfp_t"] >= t_mid) & (b["lfp_t"] <= t_end)
         ev = detect_ripple_events(b["lfp_t"][m], b["lfp_v"][m], b["lfp_hz"])
-        if ev is not None:
-            ax.plot(b["lfp_t"][m], ev["z"], lw=0.5, color="crimson")
-            ax.axhline(RIPPLE_Z, color="k", ls="--", lw=0.8)
-            for tp in ev["t_peak"]:
-                axes[0].axvline(tp, color="crimson", alpha=0.25, lw=1)
-            print(f"ripple-band excursions in this {WINDOW_S:.0f}s window: {ev['n']} "
-                  "(marked on the raster)")
+        ax.plot(b["lfp_t"][m], ev["z"], lw=0.5, color="crimson")
+        ax.axhline(RIPPLE_Z, color="k", ls="--", lw=0.8)
+        for tp in ev["t_peak"]:
+            axes[0].axvline(tp, color="crimson", alpha=0.25, lw=1)
+        print(f"ripple-band excursions in this {WINDOW_S:.0f}s window: {ev['n']} "
+              "(marked on the raster)")
     ax.set_ylabel("ripple\npower (z)")
     ax.set_xlabel("time (s)")
     fig.tight_layout()
@@ -1083,3 +1078,493 @@ if SHOW_FILTER_REPORT:
         print(f"umap-learn {umap.__version__} available")
     except ImportError:
         print("umap-learn NOT installed — `%pip install umap-learn` in the notebook")
+
+
+# %% ===========================================================================
+# CELL 2 — shared session loader and the UMAP sweep
+# ==============================================================================
+# Split the file here for the second notebook cell. It assumes cell 1 has run
+# (it reuses DOWNLOAD_DIR, the inventory and the config constants) and it
+# defines the light session loader that cell 3's viewer also needs.
+#
+# Memory is the constraint both this cell and the next are built around. One
+# session's spikes are ~50 MB and its LFP another ~26 MB, so nothing here holds
+# more than a single session: the sweep frees each one before loading the next,
+# and the LFP is not loaded at all — neither the sweep nor the viewer needs it.
+
+import gc  # noqa: E402
+
+import matplotlib.colors as mcolors  # noqa: E402
+import umap  # noqa: E402
+from scipy.ndimage import gaussian_filter1d  # noqa: E402
+from sklearn.decomposition import PCA  # noqa: E402
+
+# umap-learn must be importable by THIS kernel — `%pip install umap-learn`
+# (not `!pip`, which may target a different interpreter), then restart it.
+
+# --- UMAP config -------------------------------------------------------------
+# The embedding is built from binned counts, variance-stabilized (sqrt),
+# smoothed, z-scored per unit, then reduced by PCA before UMAP. The PCA step is
+# not cosmetic: UMAP on 300+ sparse columns is slow and mostly fits noise.
+UMAP_MIN_RATE_HZ = 0.1            # drop near-silent units — they contribute only zeros
+UMAP_SMOOTH_S = 0.10              # Gaussian sigma applied along time before embedding
+UMAP_PCA_COMPONENTS = 40
+UMAP_MAX_BINS = 20000             # subsample bins to keep each fit near a minute
+UMAP_N_NEIGHBORS = 30
+UMAP_MIN_DIST = 0.05
+UMAP_METRIC = "cosine"            # rate-vector direction, not magnitude
+UMAP_REGIONS = ("CA1", "CA3", "RSC")
+RUN_UMAP = True
+
+
+# =============================================================================
+# STEP 9 — a light session loader shared by the viewer and the UMAP sweep
+# =============================================================================
+# Deliberately not load_session_bundle(): no LFP, no derived speed, no pynapple
+# objects kept. Spike times come out as plain sorted numpy arrays, which makes
+# both windowed rasters (searchsorted) and binning (diff of searchsorted) cheap
+# and lets the NWB handle be dropped immediately.
+
+
+def load_light_session(row, verbose=False):
+    """Spikes as sorted arrays, behaviour, labels. No LFP, nothing lazy."""
+    path = (DOWNLOAD_DIR / row["file"]).resolve()
+    t0 = time.perf_counter()
+    nwb = nap.load_file(str(path))
+
+    spikes_all = nwb["units"]
+    position_all = nwb["Position"]
+    maze_ep = maze_epoch_from(position_all)
+    maze_s = float(maze_ep.tot_length())
+    spikes = spikes_all.restrict(maze_ep)
+
+    meta = extract_unit_metadata(spikes_all).reindex(np.asarray(spikes.index))
+    n_spikes = np.array([len(spikes[u]) for u in spikes.index], dtype=int)
+    meta["n_spikes_maze"] = n_spikes
+    meta["rate_maze_hz"] = n_spikes / maze_s
+
+    # Units are ordered region -> cell type -> rate once, here, so the raster
+    # rows and the UMAP column blocks share one ordering.
+    sort_cols = [c for c in ("cell_area", "cell_type") if c in meta.columns]
+    meta = meta.sort_values(sort_cols + ["rate_maze_hz"]) if sort_cols else meta
+    spike_times = [np.sort(np.asarray(spikes[u].index.values, dtype=np.float64))
+                   for u in meta.index]
+
+    position = position_all.restrict(maze_ep)
+    pos_t = np.asarray(position.index.values, dtype=float)
+    pos_x = np.asarray(position["x"].values, dtype=float)
+    pos_y = np.asarray(position["y"].values, dtype=float)
+
+    speed_key = find_key(nwb, "speed")
+    if speed_key is not None:
+        speed_t, speed_v = as_time_values(nwb[speed_key].restrict(maze_ep))
+    else:
+        speed_t, speed_v = pos_t, np.full_like(pos_t, np.nan)
+
+    labels = read_sleep_states_pynwb(path)
+
+    session = {
+        "subject": row["subject"],
+        "date": row["date"],
+        "session": row["session"],
+        "label": f"{row['subject']} {row['date']}",
+        "t_start": float(maze_ep.start[0]),
+        "t_end": float(maze_ep.end[0]),
+        "maze_s": maze_s,
+        "meta": meta,
+        "spike_times": spike_times,
+        "pos_t": pos_t,
+        "pos_x": pos_x,
+        "pos_y": pos_y,
+        "speed_t": speed_t,
+        "speed_v": speed_v,
+        "labels": labels,
+    }
+    del spikes, spikes_all, position, position_all, nwb
+    gc.collect()
+    if verbose:
+        print(f"loaded {row['file']} ({len(spike_times)} units) in "
+              f"{time.perf_counter() - t0:.1f}s")
+    return session
+
+
+def unit_groups(meta):
+    """(region, cell_type) label and an RGBA colour for every unit row.
+
+    Colour carries region; lightness within a region carries cell type, so the
+    raster shows both dimensions without needing two legends.
+    """
+    region = (meta["cell_area"].astype(str).values if "cell_area" in meta.columns
+              else np.array(["all"] * len(meta)))
+    ctype = (meta["cell_type"].astype(str).values if "cell_type" in meta.columns
+             else np.array(["unknown"] * len(meta)))
+    regions = sorted(set(region))
+    base = {r: np.array(mcolors.to_rgb(f"C{i}")) for i, r in enumerate(regions)}
+    shades = {}
+    for r in regions:
+        types = sorted(set(ctype[region == r]))
+        for j, c in enumerate(types):
+            mix = 0.25 + 0.75 * (j / max(len(types) - 1, 1))  # pale -> saturated
+            shades[(r, c)] = tuple(1 - mix * (1 - base[r])) + (0.9,)
+    colors = [shades[(r, c)] for r, c in zip(region, ctype)]
+    group = np.array([f"{r} {c}" for r, c in zip(region, ctype)])
+    return region, ctype, group, colors
+
+
+def label_spans(labels, t0, t1):
+    """State intervals and ripple times overlapping [t0, t1]."""
+    if labels is None or not len(labels):
+        return {}, np.array([])
+    col = next((c for c in labels.columns
+                if str(c).lower() in ("state", "label", "sleep_state", "tags")), None)
+    if col is None:
+        return {}, np.array([])
+    m = (labels["stop_time"] > t0) & (labels["start_time"] < t1)
+    sub = labels[m]
+    states, ripples = {}, np.array([])
+    for name, grp in sub.groupby(sub[col].astype(str)):
+        starts = np.maximum(grp["start_time"].values, t0)
+        stops = np.minimum(grp["stop_time"].values, t1)
+        if name.lower().startswith("ripple"):
+            ripples = (starts + stops) / 2
+        else:
+            states[name] = list(zip(starts, stops - starts))
+    return states, ripples
+
+
+
+# =============================================================================
+# STEP 10 — the UMAP sweep: global + per region, every session
+# =============================================================================
+# 3 sessions x (global, CA1, CA3, RSC) = 12 embeddings, 12 figures, 3 components
+# each. Every figure shows the same point cloud three times, coloured by the
+# three things that could explain its structure: track position, running speed,
+# and behavioural state with ripples marked.
+#
+# Preprocessing per embedding: counts -> sqrt (variance stabilization) ->
+# Gaussian smoothing along time -> per-unit z-score -> PCA -> UMAP. Bins are
+# subsampled to UMAP_MAX_BINS *after* smoothing, so each point still summarizes
+# its local neighbourhood in time.
+
+
+def counts_from_spike_times(spike_times, edges):
+    """Binned counts (n_bins x n_units) from sorted spike-time arrays."""
+    out = np.empty((len(edges) - 1, len(spike_times)), dtype=np.float32)
+    for j, st in enumerate(spike_times):
+        out[:, j] = np.diff(np.searchsorted(st, edges))
+    return out
+
+
+def bin_covariates(session, centers):
+    """Position, speed, state and ripple flags interpolated onto bin centres."""
+    x = np.interp(centers, session["pos_t"], session["pos_x"])
+    y = np.interp(centers, session["pos_t"], session["pos_y"])
+    speed = np.interp(centers, session["speed_t"], session["speed_v"])
+
+    ripple = np.zeros(len(centers), dtype=bool)
+    labels = session["labels"]
+    if labels is not None and len(labels):
+        col = next((c for c in labels.columns
+                    if str(c).lower() in ("state", "label", "sleep_state", "tags")), None)
+        if col is not None:
+            rip = labels[labels[col].astype(str).str.lower().str.startswith("ripple")]
+            for s0, s1 in zip(rip["start_time"].values, rip["stop_time"].values):
+                ripple |= (centers >= s0) & (centers <= s1)
+    return {"x": x, "y": y, "speed": speed, "ripple": ripple,
+            "immobile": speed < IMMOBILE_CM_S}
+
+
+def embed_counts(counts, bin_s, seed=UMAP_RANDOM_STATE):
+    """counts -> sqrt -> smooth -> z-score -> PCA -> 3-component UMAP."""
+    X = np.sqrt(counts)
+    sigma_bins = UMAP_SMOOTH_S / bin_s
+    if sigma_bins > 0:
+        X = gaussian_filter1d(X, sigma=sigma_bins, axis=0, mode="nearest")
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-9)
+
+    stride = max(1, len(X) // UMAP_MAX_BINS)
+    keep = np.arange(0, len(X), stride)
+    X = X[keep]
+
+    n_pcs = int(min(UMAP_PCA_COMPONENTS, X.shape[1], X.shape[0] - 1))
+    pca = PCA(n_components=n_pcs, random_state=seed)
+    scores = pca.fit_transform(X)
+
+    reducer = umap.UMAP(n_components=UMAP_N_COMPONENTS, n_neighbors=UMAP_N_NEIGHBORS,
+                        min_dist=UMAP_MIN_DIST, metric=UMAP_METRIC, random_state=seed)
+    emb = reducer.fit_transform(scores)
+    return emb, keep, float(pca.explained_variance_ratio_.sum())
+
+
+def plot_embedding(emb, cov, keep, title):
+    """One figure per embedding: the same cloud coloured three ways."""
+    fig = plt.figure(figsize=(15, 4.6))
+    fig.suptitle(title)
+    panels = [
+        ("track position x (cm)", cov["x"][keep], "viridis"),
+        ("log10 speed (cm/s)", np.log10(np.clip(cov["speed"][keep], 0.05, None)), "magma"),
+        ("immobile (0) vs moving (1)", (~cov["immobile"][keep]).astype(float), "coolwarm"),
+    ]
+    for i, (label, colour, cmap) in enumerate(panels, start=1):
+        ax = fig.add_subplot(1, 3, i, projection="3d")
+        sc = ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=colour, cmap=cmap,
+                        s=1.5, alpha=0.5, linewidths=0, rasterized=True)
+        if i == 3:
+            rip = cov["ripple"][keep]
+            if rip.any():
+                ax.scatter(emb[rip, 0], emb[rip, 1], emb[rip, 2], c="lime",
+                           s=28, edgecolors="k", linewidths=0.4,
+                           label=f"ripple bins (n={int(rip.sum())})")
+                ax.legend(fontsize=8, loc="upper left")
+        fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.08).set_label(label, fontsize=8)
+        ax.set_xlabel("UMAP 1", fontsize=8)
+        ax.set_ylabel("UMAP 2", fontsize=8)
+        ax.set_zlabel("UMAP 3", fontsize=8)
+        ax.tick_params(labelsize=6)
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
+if RUN_UMAP:
+    rule = "=" * 78
+    print("\n" + rule)
+    print(f"UMAP sweep: {len(subject_sessions)} sessions x "
+          f"{1 + len(UMAP_REGIONS)} groupings = "
+          f"{len(subject_sessions) * (1 + len(UMAP_REGIONS))} embeddings")
+    print(f"expect ~1-2 min per embedding (random_state is set, which forces "
+          f"single-threaded UMAP); lower UMAP_MAX_BINS to speed it up")
+    print(rule)
+
+    umap_summary = []
+    for _, row in subject_sessions.iterrows():
+        sess = load_light_session(row, verbose=True)
+        edges = np.arange(sess["t_start"], sess["t_end"], UMAP_BIN_SIZE_S)
+        centers = edges[:-1] + UMAP_BIN_SIZE_S / 2
+        counts = counts_from_spike_times(sess["spike_times"], edges)
+        cov = bin_covariates(sess, centers)
+
+        meta = sess["meta"]
+        region = (meta["cell_area"].astype(str).values if "cell_area" in meta.columns
+                  else np.array(["all"] * len(meta)))
+        alive = (meta["rate_maze_hz"].values > UMAP_MIN_RATE_HZ)
+
+        groupings = [("global", alive)]
+        groupings += [(r, alive & (region == r)) for r in UMAP_REGIONS]
+
+        for name, mask in groupings:
+            if mask.sum() < 5:
+                print(f"  {sess['label']} {name}: only {int(mask.sum())} units, skipped")
+                continue
+            t0 = time.perf_counter()
+            emb, keep, var = embed_counts(counts[:, mask], UMAP_BIN_SIZE_S)
+            elapsed = time.perf_counter() - t0
+            print(f"  {sess['label']} {name:7s}: {int(mask.sum()):3d} units, "
+                  f"{len(keep)} bins, PCA kept {100 * var:.1f}%, {elapsed:.0f}s")
+            umap_summary.append({"session": sess["label"], "grouping": name,
+                                 "n_units": int(mask.sum()), "n_bins": len(keep),
+                                 "pca_var": round(var, 3), "fit_s": round(elapsed, 1),
+                                 "ripple_bins": int(cov["ripple"][keep].sum())})
+            plot_embedding(emb, cov, keep,
+                           f"{sess['label']} — {name} — UMAP "
+                           f"({int(mask.sum())} units, {UMAP_BIN_SIZE_S * 1e3:.0f} ms bins)")
+            del emb, keep
+            gc.collect()
+
+        del sess, counts, cov, edges, centers
+        gc.collect()
+
+    print("\n" + rule)
+    print("UMAP sweep summary")
+    print(rule)
+    print(pd.DataFrame(umap_summary).to_string(index=False))
+
+
+# %% ===========================================================================
+# CELL 3 — the scrollable viewer
+# ==============================================================================
+# Split here for the third notebook cell. It needs cell 2 to have run, which is
+# where load_light_session / unit_groups / label_spans are defined — set
+# RUN_UMAP = False there to get the definitions without sitting through the
+# 20-minute sweep. Re-running this cell alone re-renders the viewer.
+
+VIEWER_WINDOW_S = 20.0            # initial width of the scrolling window
+VIEWER_WIDTH_CHOICES = (5.0, 10.0, 20.0, 60.0, 120.0)
+VIEWER_ALL_SUBJECTS = False       # True to list every subject in the dropdown
+RUN_VIEWER = True
+
+# =============================================================================
+# STEP 11 — the scrollable viewer
+# =============================================================================
+# Four stacked panels on one clock: position as x(t) and y(t), speed, the
+# author's labels as a bar, and the raster grouped by region x cell type.
+# The session dropdown swaps which recording is loaded; the previous one is
+# released before the next is read, so RAM holds one session, not four.
+
+STATE_COLORS = {"WAKE": "#b0b0b0", "NREM": "#4c72b0", "REM": "#55a868"}
+
+
+class MazeViewer:
+    """Scrollable multi-panel view of one maze epoch at a time."""
+
+    def __init__(self, rows, window_s=VIEWER_WINDOW_S):
+        self.rows = rows.reset_index(drop=True)
+        self.window_s = window_s
+        self._cached_idx = None
+        self._session = None
+
+    def session(self, idx):
+        """Load session `idx`, dropping whichever one is currently held."""
+        if self._cached_idx == idx and self._session is not None:
+            return self._session
+        self._session = None          # release before allocating the next one
+        gc.collect()
+        self._session = load_light_session(self.rows.iloc[idx])
+        self._cached_idx = idx
+        return self._session
+
+    def draw(self, idx, t_start, window_s):
+        s = self.session(idx)
+        t0 = float(np.clip(t_start, s["t_start"], max(s["t_start"], s["t_end"] - window_s)))
+        t1 = min(t0 + window_s, s["t_end"])
+        meta = s["meta"]
+        _, _, group, colors = unit_groups(meta)
+
+        fig, axes = plt.subplots(4, 1, figsize=(13, 9), sharex=True,
+                                 gridspec_kw={"height_ratios": [1.2, 1.0, 0.35, 4.5]})
+        fig.suptitle(f"{s['label']} — {t0:.1f}-{t1:.1f}s of "
+                     f"{s['t_start']:.0f}-{s['t_end']:.0f}s ({s['maze_s'] / 60:.1f} min)")
+
+        # --- position: x and y as two lines on one axes --------------------
+        ax = axes[0]
+        pm = (s["pos_t"] >= t0) & (s["pos_t"] <= t1)
+        ax.plot(s["pos_t"][pm], s["pos_x"][pm], lw=1.0, color="C0", label="x")
+        ax.plot(s["pos_t"][pm], s["pos_y"][pm], lw=1.0, color="C1", label="y")
+        ax.set_ylabel("position\n(cm)")
+        ax.legend(fontsize=8, ncol=2, loc="upper right")
+
+        # --- speed ----------------------------------------------------------
+        ax = axes[1]
+        sm = (s["speed_t"] >= t0) & (s["speed_t"] <= t1)
+        ax.plot(s["speed_t"][sm], s["speed_v"][sm], lw=0.9, color="k")
+        ax.axhline(IMMOBILE_CM_S, color="C3", ls=":", lw=0.8)
+        ax.axhline(RUN_CM_S, color="C2", ls="--", lw=0.8)
+        ax.set_ylabel("speed\n(cm/s)")
+
+        # --- label bar: the author's states, with ripples marked ------------
+        ax = axes[2]
+        states, ripples = label_spans(s["labels"], t0, t1)
+        for name, spans in states.items():
+            ax.broken_barh(spans, (0.05, 0.9),
+                           facecolors=STATE_COLORS.get(name.upper(), "#cccccc"),
+                           label=name)
+        for tr in ripples:
+            ax.axvline(tr, color="crimson", lw=1.2, alpha=0.9)
+        if len(ripples):
+            ax.plot([], [], color="crimson", lw=1.2, label=f"ripple ({len(ripples)})")
+        ax.set_ylim(0, 1)
+        ax.set_yticks([])
+        ax.set_ylabel("labels", rotation=0, ha="right", va="center")
+        if states or len(ripples):
+            ax.legend(fontsize=7, ncol=5, loc="upper right", framealpha=0.9)
+
+        # --- raster, grouped by region x cell type --------------------------
+        ax = axes[3]
+        windowed = []
+        for st in s["spike_times"]:
+            lo, hi = np.searchsorted(st, (t0, t1))
+            windowed.append(st[lo:hi])
+        ax.eventplot(windowed, lineoffsets=np.arange(len(windowed)),
+                     linelengths=0.85, linewidths=0.6, colors=colors)
+        # separators and one tick per region x cell-type block
+        boundaries, centers, names = [], [], []
+        start = 0
+        for i in range(1, len(group) + 1):
+            if i == len(group) or group[i] != group[start]:
+                boundaries.append(i - 0.5)
+                centers.append((start + i - 1) / 2)
+                names.append(f"{group[start]} (n={i - start})")
+                start = i
+        for bnd in boundaries[:-1]:
+            ax.axhline(bnd, color="k", lw=0.4, alpha=0.3)
+        ax.set_yticks(centers)
+        ax.set_yticklabels(names, fontsize=7)
+        ax.set_ylim(-1, len(windowed))
+        ax.set_xlim(t0, t1)
+        ax.set_xlabel("time (s)")
+        ax.set_ylabel("units")
+
+        fig.tight_layout()
+        plt.show()
+        plt.close(fig)
+
+    def show(self):
+        """Render the widget UI, or fall back to three static windows."""
+        try:
+            import ipywidgets as widgets
+            from IPython.display import display, clear_output
+        except ImportError:
+            print("ipywidgets not available — showing three static windows instead.\n"
+                  "`%pip install ipywidgets` for the scrollable version.")
+            for frac in (0.1, 0.5, 0.9):
+                s = self.session(0)
+                self.draw(0, s["t_start"] + frac * s["maze_s"], self.window_s)
+            return
+
+        options = [(f"{r['subject']} {r['date']}", i) for i, r in self.rows.iterrows()]
+        session_dd = widgets.Dropdown(options=options, value=0, description="session:")
+        width_dd = widgets.Dropdown(options=[(f"{w:.0f}s", w) for w in VIEWER_WIDTH_CHOICES],
+                                    value=self.window_s, description="window:")
+        scrub = widgets.FloatSlider(description="start (s)", continuous_update=False,
+                                    readout_format=".1f", layout=widgets.Layout(width="70%"))
+        back = widgets.Button(description="◀", layout=widgets.Layout(width="45px"))
+        fwd = widgets.Button(description="▶", layout=widgets.Layout(width="45px"))
+        out = widgets.Output()
+
+        quiet = {"on": False}  # suppress redraws while the slider is reconfigured
+
+        def rescale(*_):
+            s = self.session(session_dd.value)
+            lo = s["t_start"]
+            hi = max(s["t_start"], s["t_end"] - width_dd.value)
+            quiet["on"] = True
+            # widen before tightening: setting max below the current min (or the
+            # reverse) is a traitlet error when sessions have disjoint clocks
+            scrub.min = min(scrub.min, lo)
+            scrub.max = max(scrub.max, hi)
+            scrub.value = lo
+            scrub.min, scrub.max = lo, hi
+            scrub.step = width_dd.value / 4
+            quiet["on"] = False
+            refresh()
+
+        def refresh(*_):
+            if quiet["on"]:
+                return
+            with out:
+                clear_output(wait=True)
+                self.draw(session_dd.value, scrub.value, width_dd.value)
+
+        def step(delta):
+            def handler(_):
+                scrub.value = float(np.clip(scrub.value + delta * width_dd.value / 2,
+                                            scrub.min, scrub.max))
+            return handler
+
+        session_dd.observe(rescale, names="value")
+        width_dd.observe(rescale, names="value")
+        scrub.observe(refresh, names="value")
+        back.on_click(step(-1))
+        fwd.on_click(step(+1))
+
+        display(widgets.VBox([widgets.HBox([session_dd, width_dd]),
+                              widgets.HBox([back, fwd, scrub]), out]))
+        rescale()
+
+
+viewer_rows = (inventory[inventory["has_behavior"]] if VIEWER_ALL_SUBJECTS
+               else subject_sessions)
+viewer = MazeViewer(viewer_rows)
+if RUN_VIEWER:
+    viewer.show()
+
