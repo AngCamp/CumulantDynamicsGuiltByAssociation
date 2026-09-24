@@ -3,14 +3,14 @@
 Standalone — does not depend on umap_lastday_test.py. Nothing is written to
 disk; everything is print() and plt.show().
 
-CELL 1     per day: load, compute band power, screen for movement artifacts,
-           detect HFEs, read the authors' ripple annotations, plot examples of
-           both, fit the four embeddings
+CELL 1     per day: load, compute band power (with its raw amplitude range),
+           screen for movement artifacts, detect HFEs, read the authors' ripple
+           annotations, plot examples of both, fit the four embeddings
 CELL 2     plotting helpers
-CELLS 3-8  one band each (delta, theta, beta, slow gamma, mid gamma, ripple):
-           rows = days, columns = groupings, coloured by that band alone
-CELL 9     HFEs and the authors' annotated ripples on the manifold, both
-           coloured by running speed
+CELLS 3-6  one band each (low theta, high theta, gamma, ripple): rows = days,
+           columns = groupings, coloured by that band alone
+CELL 7     HFEs and the authors' annotated ripples marked on a manifold
+           coloured by track position
 
 What "power" means here: each band is bandpassed (4th-order Butterworth in
 second-order-section form, zero-phase), turned into an amplitude envelope by
@@ -50,6 +50,7 @@ import sys
 import time
 from pathlib import Path
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -69,24 +70,33 @@ SUBJECT = "M05"                   # the mouse with the most units on its last da
 
 BIN_SIZE_S = 0.050                # analysis bin for counts, band power, covariates
 
+# Bands follow the measured spectrum rather than convention: the only clear
+# peak on this channel is theta, sitting high at ~8-10 Hz, so it is split into
+# a low and a high half. Delta, beta and the slow/mid gamma split are gone —
+# there was no feature in the PSD to justify them.
 BANDS = {
-    "delta": (0.5, 4.0),
-    "theta": (6.0, 10.0),
-    "beta": (12.0, 30.0),
-    "slow_gamma": (30.0, 50.0),
-    "mid_gamma": (50.0, 90.0),
+    "low_theta": (6.0, 10.0),
+    "high_theta": (10.0, 12.0),
+    "gamma": (30.0, 90.0),
     "ripple": (120.0, 200.0),
 }
 # one colormap per band, reused down every row so days are comparable
 BAND_CMAPS = {
-    "delta": "Blues",
-    "theta": "Greens",
-    "beta": "Purples",
-    "slow_gamma": "Oranges",
-    "mid_gamma": "YlOrRd",
+    "low_theta": "Greens",
+    "high_theta": "Blues",
+    "gamma": "Oranges",
     "ripple": "RdPu",
 }
-BAND_Z_RANGE = (-1.0, 4.0)        # shared colour limits, in SD of the envelope
+
+# Colour scaling for the band grids. Everything below BAND_Z_FLOOR renders in
+# one flat light grey, so the manifold stays visible as a shape instead of
+# being painted over by the bottom of a colormap, and the colour range is spent
+# entirely on the excursions. The gamma above 1 pushes colour toward the top of
+# the range, so a 3 SD bin looks obviously different from a 1.5 SD one.
+BAND_Z_FLOOR = 1.0                # below this: all the same colour
+BAND_Z_CEIL = 4.0                 # saturates here
+BAND_COLOR_GAMMA = 1.6            # >1 makes the high end far more prominent
+UNDER_COLOR = "0.88"              # the flat colour used below the floor
 
 # --- artifact rejection ------------------------------------------------------
 ARTIFACT_CORR_WINDOW_S = 1.0      # window for the rolling cross-band correlation
@@ -327,21 +337,36 @@ def zscore(values):
 def band_power_table(lfp_t, lfp_v, fs, edges):
     """z-scored envelope for every band, on the analysis bins.
 
-    The full-resolution ripple envelope and filtered trace come back too — the
-    detector and the example plots need them before they are discarded.
+    A raw-amplitude summary comes back alongside the z-scores: z-scoring throws
+    away the scale, and the scale is what says whether a band carries real
+    signal or is scraping the noise floor. The full-resolution ripple envelope
+    and filtered trace come back too — the detector and the example plots need
+    them before they are discarded.
     """
-    band_z, ripple_full, ripple_filt = {}, None, None
+    band_z, raw_rows, ripple_full, ripple_filt = {}, [], None, None
     for name, (lo, hi) in BANDS.items():
         filt = bandpass_sos(lfp_v, fs, lo, hi)
         env = analytic_envelope(filt)
-        band_z[name] = zscore(bin_mean(lfp_t, env, edges))
+        binned = bin_mean(lfp_t, env, edges)
+        band_z[name] = zscore(binned)
+        raw_rows.append({
+            "band": name,
+            "range_hz": f"{lo:.0f}-{hi:.0f}",
+            "min": binned.min(),
+            "p05": np.percentile(binned, 5),
+            "median": np.median(binned),
+            "mean": binned.mean(),
+            "p95": np.percentile(binned, 95),
+            "max": binned.max(),
+            "sd": binned.std(),
+        })
         if name == "ripple":
             ripple_full = zscore(env)
             ripple_filt = filt
         else:
             del filt, env
             gc.collect()
-    return band_z, ripple_full, ripple_filt
+    return band_z, pd.DataFrame(raw_rows), ripple_full, ripple_filt
 
 
 def rolling_cross_band_corr(stacked, window_bins):
@@ -743,9 +768,12 @@ def process_day(row):
 
     # --- band power ---------------------------------------------------------
     t0 = time.perf_counter()
-    band_z, ripple_z_full, ripple_filt = band_power_table(
+    band_z, raw_power, ripple_z_full, ripple_filt = band_power_table(
         session["lfp_t"], session["lfp_v"], session["fs"], edges)
     print(f"  band power: {len(BANDS)} bands in {time.perf_counter() - t0:.1f}s")
+    print("  raw envelope amplitude per bin (same units as the LFP):")
+    print(raw_power.to_string(index=False,
+                              float_format=lambda v: f"{v:8.1f}"))
 
     # --- artifacts ----------------------------------------------------------
     speed = np.interp(centers, session["speed_t"], session["speed_v"])
@@ -827,6 +855,7 @@ def process_day(row):
         "label": label,
         "date": session["date"],
         "embeddings": embeddings,
+        "raw_power": raw_power,
         "band_z": {name: band_z[name][keep][sub] for name in BANDS},
         "speed": speed[keep][sub],
         "track_x": track_x[keep][sub],
@@ -872,6 +901,12 @@ print(pd.DataFrame([{
                             if len(d["events"]) else np.nan),
 } for d in days]).to_string(index=False))
 
+print("\nraw band amplitude across days (median / p95 / max per bin)")
+print(pd.concat([d["raw_power"].assign(date=d["date"]) for d in days],
+                ignore_index=True)
+      .pivot(index="band", columns="date", values=["median", "p95", "max"])
+      .round(1).to_string())
+
 
 # %% ===========================================================================
 # CELL 2 — plotting helpers (instant; run before any band cell)
@@ -882,14 +917,30 @@ print(pd.DataFrame([{
 # shifts between days shows as a change in colour, not a change in scale.
 
 
-def scatter_panel(ax, emb, colour, cmap, vmin, vmax, projection):
+def band_colormap(name):
+    """The band's colormap with everything below the floor forced to grey."""
+    cmap = plt.get_cmap(BAND_CMAPS[name]).copy()
+    cmap.set_under(UNDER_COLOR)
+    return cmap
+
+
+def band_norm():
+    """Power-law norm starting at the floor, so the top of the range dominates.
+
+    clip=False is what lets set_under fire: with clipping on, values below vmin
+    would be pulled up to the bottom colour of the map instead of the grey.
+    """
+    return mcolors.PowerNorm(gamma=BAND_COLOR_GAMMA, vmin=BAND_Z_FLOOR,
+                             vmax=BAND_Z_CEIL, clip=False)
+
+
+def scatter_panel(ax, emb, colour, cmap, norm, projection):
     if projection == "3d":
         return ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=colour, cmap=cmap,
-                          vmin=vmin, vmax=vmax, s=1.2, alpha=0.55,
+                          norm=norm, s=1.6, alpha=0.7,
                           linewidths=0, rasterized=True)
-    return ax.scatter(emb[:, 0], emb[:, 1], c=colour, cmap=cmap,
-                      vmin=vmin, vmax=vmax, s=1.5, alpha=0.6,
-                      linewidths=0, rasterized=True)
+    return ax.scatter(emb[:, 0], emb[:, 1], c=colour, cmap=cmap, norm=norm,
+                      s=2.0, alpha=0.75, linewidths=0, rasterized=True)
 
 
 def band_figure(band, days, projection=GRID_PROJECTION):
@@ -904,8 +955,10 @@ def band_figure(band, days, projection=GRID_PROJECTION):
                              figsize=(3.2 * len(groupings), 3.1 * len(rows)),
                              squeeze=False, subplot_kw=subplot_kw)
     lo, hi = BANDS[band]
-    fig.suptitle(f"{SUBJECT} — {band} ({lo:.0f}-{hi:.0f} Hz) power on the manifold "
-                 f"(z, {BAND_Z_RANGE[0]:.0f} to {BAND_Z_RANGE[1]:.0f} SD)")
+    cmap, norm = band_colormap(band), band_norm()
+    fig.suptitle(f"{SUBJECT} — {band} ({lo:.0f}-{hi:.0f} Hz) power on the manifold\n"
+                 f"grey below {BAND_Z_FLOOR:.0f} SD, colour saturating at "
+                 f"{BAND_Z_CEIL:.0f} SD")
 
     for r, day in enumerate(rows):
         for c, grouping in enumerate(groupings):
@@ -914,8 +967,7 @@ def band_figure(band, days, projection=GRID_PROJECTION):
                 ax.axis("off")
                 continue
             sc = scatter_panel(ax, day["embeddings"][grouping], day["band_z"][band],
-                               BAND_CMAPS[band], BAND_Z_RANGE[0], BAND_Z_RANGE[1],
-                               projection)
+                               cmap, norm, projection)
             if r == 0:
                 ax.set_title(grouping, fontsize=10)
             if c == 0:
@@ -924,97 +976,151 @@ def band_figure(band, days, projection=GRID_PROJECTION):
             ax.set_yticks([])
             if projection == "3d":
                 ax.set_zticks([])
-    fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.6,
+    fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.6, extend="min",
                  pad=0.02).set_label(f"{band} power (z)", fontsize=9)
     plt.show()
     plt.close(fig)
 
 
 # %% ===========================================================================
-# CELL 3 — delta
+# CELL 3 — low theta
 # ==============================================================================
 
-band_figure("delta", days)
+band_figure("low_theta", days)
 
 
 # %% ===========================================================================
-# CELL 4 — theta
+# CELL 4 — high theta
 # ==============================================================================
 
-band_figure("theta", days)
+band_figure("high_theta", days)
 
 
 # %% ===========================================================================
-# CELL 5 — beta
+# CELL 5 — gamma
 # ==============================================================================
 
-band_figure("beta", days)
+band_figure("gamma", days)
 
 
 # %% ===========================================================================
-# CELL 6 — slow gamma
-# ==============================================================================
-
-band_figure("slow_gamma", days)
-
-
-# %% ===========================================================================
-# CELL 7 — mid gamma
-# ==============================================================================
-
-band_figure("mid_gamma", days)
-
-
-# %% ===========================================================================
-# CELL 8 — ripple band
+# CELL 6 — ripple band
 # ==============================================================================
 
 band_figure("ripple", days)
 
 
 # %% ===========================================================================
-# CELL 9 — events on the manifold: ours and the authors'
+# CELL 7 — events on the manifold, over position
 # ==============================================================================
-# Two rows per grouping. Top: the authors' annotated ripples. Bottom: our HFEs.
-# Every bin in grey underneath, the event bins on top coloured by running speed
-# at the event — the question is whether events landing in one part of the
-# manifold are the ones the animal was still for.
+# The cloud carries track position on a blue-yellow map; events sit on top in
+# red, magenta and cyan, none of which appears in that map, so they read as
+# events rather than as extreme positions. All three classes share one panel so
+# they can be compared directly — where ours and the authors' agree, and
+# whether immobile and moving events prefer different parts of the manifold.
+#
+# Speed is no longer a colour; it is the thing that splits our events into the
+# immobile and moving classes, and it is in the histograms below.
+
+POSITION_CMAP = "cividis"
+IMMOBILE_CM_S = 2.0               # the immobile/moving split for our events
+
+# Shape carries the distinction as well as colour, so the figure still reads if
+# it is printed in grey. None of these three colours appears in cividis.
+EVENT_STYLE = {
+    "annot": {"color": "#E8000B", "marker": "D", "size": 46, "short": "annotated",
+              "label": "authors' annotated ripple"},
+    "hfe_immobile": {"color": "#FF00FF", "marker": "o", "size": 42,
+                     "short": "HFE immobile",
+                     "label": f"our HFE, immobile (< {IMMOBILE_CM_S:.0f} cm/s)"},
+    "hfe_mobile": {"color": "#00E5FF", "marker": "^", "size": 46,
+                   "short": "HFE moving",
+                   "label": f"our HFE, moving ({IMMOBILE_CM_S:.0f}-"
+                            f"{HFE_MAX_SPEED_CM_S:.0f} cm/s)"},
+}
+
+
+def event_masks(day):
+    """Bin masks for the three event classes drawn here.
+
+    "Moving" tops out at HFE_MAX_SPEED_CM_S because the detector gates there —
+    these are events between the two thresholds, not events at full running
+    speed.
+    """
+    immobile = day["speed"] < IMMOBILE_CM_S
+    return {
+        "annot": day["annot"],
+        "hfe_immobile": day["hfe"] & immobile,
+        "hfe_mobile": day["hfe"] & ~immobile,
+    }
+
+
+def colour_limits(values, lo=1, hi=99):
+    """Percentile limits that survive NaNs and degenerate data.
+
+    np.percentile propagates NaN: one NaN anywhere makes both limits NaN,
+    matplotlib silently discards them, and every point clips to one end of the
+    colormap — which is what collapsed the position colouring. Returns a note
+    describing anything that had to be worked around, so a broken covariate is
+    visible in the output instead of just looking like a boring figure.
+    """
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0, 1.0, "no finite values at all"
+
+    vmin, vmax = float(np.percentile(finite, lo)), float(np.percentile(finite, hi))
+    note = ""
+    if vmin >= vmax:
+        vmin, vmax = float(finite.min()), float(finite.max())
+        note = "percentiles collapsed, using min/max"
+    if vmin >= vmax:
+        vmin, vmax = vmin - 0.5, vmax + 0.5
+        note = "covariate is constant"
+    dropped = arr.size - finite.size
+    if dropped:
+        note = (note + "; " if note else "") + f"{dropped} non-finite values ignored"
+    return vmin, vmax, note
 
 
 def event_figure(grouping, days):
     rows = [d for d in days if grouping in d["embeddings"]]
     if not rows:
         return
-    fig, axes = plt.subplots(2, len(rows), figsize=(4.8 * len(rows), 8.8),
+    fig, axes = plt.subplots(1, len(rows), figsize=(5.4 * len(rows), 5.0),
                              squeeze=False, subplot_kw={"projection": "3d"})
-    fig.suptitle(f"{SUBJECT} — {grouping} — event bins coloured by speed\n"
-                 f"top: authors' annotated ripples | bottom: our HFEs "
-                 f"(speed < {HFE_MAX_SPEED_CM_S:.0f} cm/s by construction)")
+    fig.suptitle(f"{SUBJECT} — {grouping} — manifold coloured by track position, "
+                 f"events marked on top")
 
-    pooled = [d["speed"][d[key]] for d in rows for key in ("annot", "hfe")
-              if d[key].any()]
-    speeds = np.concatenate(pooled) if pooled else np.array([0.0, 1.0])
-    vmin, vmax = float(np.min(speeds)), float(max(np.max(speeds), 1e-3))
+    pos = np.concatenate([d["track_x"] for d in rows])
+    vmin, vmax, note = colour_limits(pos)
+    print(f"{grouping}: position colour limits {vmin:.1f} to {vmax:.1f} cm"
+          + (f"  [{note}]" if note else ""))
 
-    for r, key in enumerate(("annot", "hfe")):
-        for c, day in enumerate(rows):
-            ax = axes[r, c]
-            emb, hit = day["embeddings"][grouping], day[key]
-            ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c="0.82", s=1.0,
-                       alpha=0.35, linewidths=0, rasterized=True)
+    for c, day in enumerate(rows):
+        ax = axes[0, c]
+        emb = day["embeddings"][grouping]
+        sc = ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=day["track_x"],
+                        cmap=POSITION_CMAP, vmin=vmin, vmax=vmax, s=2.2,
+                        alpha=0.65, linewidths=0, rasterized=True)
+        masks, counts = event_masks(day), []
+        for key, style in EVENT_STYLE.items():
+            hit = masks[key]
+            counts.append(f"{int(hit.sum())} {style['short']}")
             if hit.any():
-                sc = ax.scatter(emb[hit, 0], emb[hit, 1], emb[hit, 2],
-                                c=day["speed"][hit], cmap="viridis",
-                                vmin=vmin, vmax=vmax, s=34,
-                                edgecolors="k", linewidths=0.4)
-                fig.colorbar(sc, ax=ax, shrink=0.55,
-                             pad=0.08).set_label("speed (cm/s)", fontsize=8)
-            kind = "annotated" if key == "annot" else "HFE"
-            ax.set_title(f"{day['date']} — {int(hit.sum())} {kind} bins", fontsize=9)
-            ax.set_xlabel("UMAP 1", fontsize=8)
-            ax.set_ylabel("UMAP 2", fontsize=8)
-            ax.set_zlabel("UMAP 3", fontsize=8)
-            ax.tick_params(labelsize=6)
+                ax.scatter(emb[hit, 0], emb[hit, 1], emb[hit, 2],
+                           c=style["color"], marker=style["marker"],
+                           s=style["size"], edgecolors="k", linewidths=0.5,
+                           depthshade=False, label=style["label"])
+        fig.colorbar(sc, ax=ax, shrink=0.55,
+                     pad=0.10).set_label("track position x (cm)", fontsize=8)
+        ax.set_title(f"{day['date']} — {', '.join(counts)}", fontsize=9)
+        ax.set_xlabel("UMAP 1", fontsize=8)
+        ax.set_ylabel("UMAP 2", fontsize=8)
+        ax.set_zlabel("UMAP 3", fontsize=8)
+        ax.tick_params(labelsize=6)
+        if c == 0:
+            ax.legend(fontsize=7, loc="upper left")
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -1023,30 +1129,52 @@ def event_figure(grouping, days):
 for grouping in GROUPINGS:
     event_figure(grouping, days)
 
-# Event-level summary: durations, how far the MUA leads, and the speed the
-# events happen at.
+# Event-level summary, split the same way as the figure: if the immobile and
+# moving events differ in duration, MUA lead or amplitude, they are probably
+# not the same phenomenon and should not be pooled later.
 all_events = pd.concat([d["events"].assign(date=d["date"]) for d in days
                         if len(d["events"])], ignore_index=True)
 if len(all_events):
-    print("\nHFEs, all days")
-    print(all_events.groupby("date")[["ripple_z", "mua_z", "duration_ms",
-                                      "mua_lead_ms", "speed"]]
-          .median().round(2).to_string())
+    all_events["mobility"] = np.where(all_events["speed"] < IMMOBILE_CM_S,
+                                      "immobile", "moving")
+    print("\nHFEs per day and mobility class")
+    print(all_events.groupby(["date", "mobility"]).size()
+          .unstack(fill_value=0).to_string())
+    print("\nmedians by mobility class")
+    print(all_events.groupby("mobility")[["ripple_z", "mua_z", "duration_ms",
+                                          "mua_lead_ms", "speed"]]
+          .agg(["count", "median"]).round(2).to_string())
+
+    immobile = all_events["mobility"] == "immobile"
+    style = {"immobile": EVENT_STYLE["hfe_immobile"]["color"],
+             "moving": EVENT_STYLE["hfe_mobile"]["color"]}
 
     fig, axes = plt.subplots(1, 4, figsize=(16, 3.6))
-    fig.suptitle(f"{SUBJECT} — high-frequency events")
-    axes[0].hist(all_events["duration_ms"], bins=30, color="C0")
+    fig.suptitle(f"{SUBJECT} — high-frequency events, immobile vs moving")
+    for name, sub in all_events.groupby("mobility"):
+        axes[0].hist(sub["duration_ms"], bins=30, histtype="step", lw=1.4,
+                     color=style[name], label=f"{name} (n={len(sub)})")
+        axes[1].hist(sub["mua_lead_ms"], bins=30, histtype="step", lw=1.4,
+                     color=style[name])
+        axes[2].hist(sub["speed"], bins=30, histtype="step", lw=1.4,
+                     color=style[name])
     axes[0].set_xlabel("event duration (ms)")
     axes[0].set_ylabel("events")
-    axes[1].hist(all_events["mua_lead_ms"], bins=30, color="C1")
-    axes[1].axvline(0, color="crimson", lw=1)
+    axes[0].legend(fontsize=8)
+    axes[1].axvline(0, color="k", lw=1)
     axes[1].set_xlabel("MUA lead (ms; >0 = before the peak)")
-    axes[2].hist(all_events["speed"], bins=30, color="C2")
+    axes[2].axvline(IMMOBILE_CM_S, color="k", ls="--", lw=1)
     axes[2].axvline(HFE_MAX_SPEED_CM_S, color="C3", ls=":", lw=1)
     axes[2].set_xlabel("speed at peak (cm/s)")
-    axes[3].scatter(all_events["mua_z"], all_events["ripple_z"], s=8, alpha=0.5, c="k")
+    axes[3].scatter(all_events.loc[immobile, "mua_z"],
+                    all_events.loc[immobile, "ripple_z"], s=10, alpha=0.6,
+                    color=style["immobile"], label="immobile")
+    axes[3].scatter(all_events.loc[~immobile, "mua_z"],
+                    all_events.loc[~immobile, "ripple_z"], s=10, alpha=0.6,
+                    color=style["moving"], marker="^", label="moving")
     axes[3].set_xlabel("MUA (z)")
     axes[3].set_ylabel("ripple-band (z)")
+    axes[3].legend(fontsize=8)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
