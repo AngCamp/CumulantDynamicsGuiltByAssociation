@@ -3,13 +3,16 @@
 Standalone — does not depend on umap_lastday_test.py. Three notebook cells,
 split at the "CELL 2" and "CELL 3" banners. Nothing is written to disk.
 
-CELL 1  per day: load, compute band power, drop movement artifacts, detect
-        sharp-wave ripples, plot example events, fit the four embeddings
-CELL 2  band grids: one figure per grouping (global / CA1 / CA3 / RSC),
-        rows = days, columns = bands, each panel the same manifold coloured
-        by that band's power
-CELL 3  the SWR figures: manifold coloured by running speed at our detected
-        sharp-wave ripple bins
+CELL 1     per day: load, compute band power, drop movement artifacts, detect
+           sharp-wave ripples, plot example events, fit the 1/f background,
+           fit the four embeddings
+CELL 2     plotting helpers
+CELLS 3-8  one band each (delta, theta, beta, slow gamma, mid gamma, ripple):
+           rows = days, columns = groupings, coloured by that band alone
+CELL 9     the SWR figures: manifold coloured by running speed at our detected
+           sharp-wave ripple bins
+CELL 10    the aperiodic 1/f background: exponent, knee, and fit quality on
+           the same manifolds
 
 What "power" means here: each band is bandpassed (4th-order Butterworth in
 second-order-section form, zero-phase), turned into an amplitude envelope by
@@ -46,6 +49,7 @@ import umap
 from scipy import signal as sps
 from scipy.fft import next_fast_len
 from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import curve_fit
 from sklearn.decomposition import PCA
 
 # =============================================================================
@@ -89,6 +93,21 @@ SWR_FINE_BIN_S = 0.010            # bin for the CA3 population rate
 SWR_SMOOTH_S = 0.015              # Gaussian sigma on that rate
 N_EXAMPLE_EVENTS = 6
 EXAMPLE_WINDOW_S = 0.40
+
+# --- aperiodic (1/f) fit -----------------------------------------------------
+# Fit in sliding windows, not per bin: a 50 ms bin has no spectrum worth
+# fitting. 4 s windows with a 2 s hop give a stable fit, then the slope and
+# knee are interpolated back onto the analysis bins.
+#
+# The fit stops at 90 Hz on purpose. This channel's spectrum falls off steeply
+# above ~100 Hz, which is the shape of an acquisition low-pass rather than
+# brain 1/f, and fitting into it would bend the exponent. Theta is masked out
+# so the 8 Hz peak does not drag the aperiodic component with it.
+APERIODIC_WINDOW_S = 4.0
+APERIODIC_HOP_S = 2.0
+APERIODIC_FIT_RANGE = (1.0, 90.0)
+APERIODIC_EXCLUDE = ((5.0, 11.0),)
+APERIODIC_WELCH_S = 1.0
 
 # --- embedding ---------------------------------------------------------------
 UMAP_N_COMPONENTS = 3
@@ -382,7 +401,76 @@ def plot_example_events(session, ripple_filt, ripple_z_full, ca3_z, fine_centers
 
 
 # =============================================================================
-# STEP 3 — the embeddings
+# STEP 3 — the aperiodic (1/f) fit
+# =============================================================================
+# Slope and knee are state variables in their own right: the exponent tracks
+# excitation/inhibition balance and arousal, the knee moves with the timescale
+# of the underlying process. Both are computed here rather than in the plotting
+# cell because this is where the LFP is still in memory.
+
+
+def fit_aperiodic(freq, psd, f_range=APERIODIC_FIT_RANGE, exclude=APERIODIC_EXCLUDE):
+    """Knee-model fit: log10 P = offset - log10(knee + f ** exponent).
+
+    The specparam/FOOOF parameterization, but fit in one shot with oscillatory
+    bands masked out rather than iteratively peak-stripped. Cruder than
+    specparam and with no extra dependency; stable on 4 s windows. Returns
+    (exponent, knee in Hz, offset, r2), all NaN if the fit fails.
+    """
+    keep = (freq >= f_range[0]) & (freq <= f_range[1]) & (psd > 0)
+    for lo, hi in exclude:
+        keep &= ~((freq >= lo) & (freq <= hi))
+    f, y = freq[keep], np.log10(psd[keep])
+    if f.size < 10:
+        return (np.nan,) * 4
+
+    def model(ff, offset, knee, exponent):
+        return offset - np.log10(knee + ff ** exponent)
+
+    try:
+        popt, _ = curve_fit(model, f, y, p0=[float(y[0]), 1.0, 2.0],
+                            bounds=([-np.inf, 0.0, 0.1], [np.inf, 1e6, 8.0]),
+                            maxfev=4000)
+    except Exception:
+        return (np.nan,) * 4
+
+    offset, knee, exponent = popt
+    resid = y - model(f, *popt)
+    r2 = 1.0 - np.sum(resid ** 2) / max(np.sum((y - y.mean()) ** 2), 1e-12)
+    # specparam's convention: the knee parameter is in units of f**exponent
+    knee_hz = knee ** (1.0 / exponent) if knee > 0 else np.nan
+    return float(exponent), float(knee_hz), float(offset), float(r2)
+
+
+def aperiodic_timecourse(lfp_t, lfp_v, fs, centers):
+    """Sliding-window exponent and knee, interpolated onto the analysis bins."""
+    win = int(APERIODIC_WINDOW_S * fs)
+    hop = int(APERIODIC_HOP_S * fs)
+    nper = int(APERIODIC_WELCH_S * fs)
+    starts = np.arange(0, max(len(lfp_v) - win, 1), hop)
+
+    t_mid = np.empty(len(starts))
+    exponent = np.empty(len(starts))
+    knee = np.empty(len(starts))
+    r2 = np.empty(len(starts))
+    for i, s in enumerate(starts):
+        freq, psd = sps.welch(lfp_v[s:s + win], fs=fs, nperseg=nper)
+        exponent[i], knee[i], _, r2[i] = fit_aperiodic(freq, psd)
+        t_mid[i] = lfp_t[s + win // 2]
+
+    def to_bins(values):
+        ok = np.isfinite(values)
+        if ok.sum() < 2:
+            return np.full(len(centers), np.nan)
+        return np.interp(centers, t_mid[ok], values[ok])
+
+    n_failed = int((~np.isfinite(exponent)).sum())
+    return {"exponent": to_bins(exponent), "knee": to_bins(knee),
+            "r2": to_bins(r2), "n_windows": len(starts), "n_failed": n_failed}
+
+
+# =============================================================================
+# STEP 4 — the embeddings
 # =============================================================================
 
 
@@ -465,6 +553,19 @@ def process_day(row):
     del ripple_filt, ripple_z_full
     gc.collect()
 
+    # --- aperiodic 1/f ------------------------------------------------------
+    t0 = time.perf_counter()
+    aper = aperiodic_timecourse(session["lfp_t"], session["lfp_v"],
+                                session["fs"], centers)
+    print(f"  1/f fit: {aper['n_windows']} windows "
+          f"({APERIODIC_WINDOW_S:.0f}s / {APERIODIC_HOP_S:.0f}s hop), "
+          f"{aper['n_failed']} failed, {time.perf_counter() - t0:.1f}s")
+    print(f"  exponent: median {np.nanmedian(aper['exponent']):.2f} "
+          f"(IQR {np.nanpercentile(aper['exponent'], 25):.2f}-"
+          f"{np.nanpercentile(aper['exponent'], 75):.2f}) | "
+          f"knee: median {np.nanmedian(aper['knee']):.1f} Hz | "
+          f"fit r2 median {np.nanmedian(aper['r2']):.3f}")
+
     # bins holding an event, on the kept bins
     swr_bin = np.zeros(len(centers), dtype=bool)
     if len(events):
@@ -498,13 +599,23 @@ def process_day(row):
         print(f"  {name:7s}: {int(mask.sum()):3d} units, {len(sub)} bins, "
               f"PCA kept {100 * var:.1f}%, {time.perf_counter() - t_fit:.0f}s")
 
+    speed_kept = speed[keep][sub]
+    exponent_kept = aper["exponent"][keep][sub]
+    finite = np.isfinite(exponent_kept) & np.isfinite(speed_kept)
+    if finite.sum() > 10:
+        print(f"  corr(1/f exponent, speed) = "
+              f"{np.corrcoef(exponent_kept[finite], speed_kept[finite])[0, 1]:.3f}")
+
     day = {
         "label": label,
         "date": session["date"],
         "embeddings": embeddings,
         "band_z": {name: band_z[name][keep][sub] for name in BANDS},
-        "speed": speed[keep][sub],
+        "speed": speed_kept,
         "track_x": track_x[keep][sub],
+        "exponent": exponent_kept,
+        "knee": aper["knee"][keep][sub],
+        "fit_r2": aper["r2"][keep][sub],
         "swr": swr_kept[sub],
         "events": events,
         "n_bins": len(sub),
@@ -541,11 +652,12 @@ print(pd.DataFrame([{
 
 
 # %% ===========================================================================
-# CELL 2 — band grids: one figure per grouping, rows = days, columns = bands
+# CELL 2 — plotting helpers (instant; run before any band cell)
 # ==============================================================================
-# The same manifold in every panel of a row; only the colouring changes. Colour
-# limits are shared down each column, so a band that shifts between days shows
-# up as a change in colour, not just a change in scale.
+# One band per cell from here on, so a single band can be re-rendered without
+# redrawing the other five. Each band figure is rows = days, columns = the four
+# groupings, coloured by that band alone on one shared scale — a band that
+# shifts between days shows as a change in colour, not a change in scale.
 
 
 def scatter_panel(ax, emb, colour, cmap, vmin, vmax, projection):
@@ -558,48 +670,88 @@ def scatter_panel(ax, emb, colour, cmap, vmin, vmax, projection):
                       linewidths=0, rasterized=True)
 
 
-def band_grid(grouping, days, projection=GRID_PROJECTION):
-    rows = [d for d in days if grouping in d["embeddings"]]
+def band_figure(band, days, projection=GRID_PROJECTION):
+    """One band: rows = days, columns = groupings, one shared colour scale."""
+    rows = [d for d in days if d["embeddings"]]
     if not rows:
-        print(f"{grouping}: nothing to plot")
+        print(f"{band}: nothing to plot")
         return
-    n_rows, bands = len(rows), list(BANDS)
+    groupings = [g for g in GROUPINGS if any(g in d["embeddings"] for d in rows)]
     subplot_kw = {"projection": "3d"} if projection == "3d" else {}
-    fig, axes = plt.subplots(n_rows, len(bands),
-                             figsize=(2.6 * len(bands), 2.7 * n_rows),
+    fig, axes = plt.subplots(len(rows), len(groupings),
+                             figsize=(3.2 * len(groupings), 3.1 * len(rows)),
                              squeeze=False, subplot_kw=subplot_kw)
-    fig.suptitle(f"{SUBJECT} — {grouping} — manifold coloured by band power "
+    lo, hi = BANDS[band]
+    fig.suptitle(f"{SUBJECT} — {band} ({lo:.0f}-{hi:.0f} Hz) power on the manifold "
                  f"(z, {BAND_Z_RANGE[0]:.0f} to {BAND_Z_RANGE[1]:.0f} SD)")
 
     for r, day in enumerate(rows):
-        emb = day["embeddings"][grouping]
-        for c, band in enumerate(bands):
+        for c, grouping in enumerate(groupings):
             ax = axes[r, c]
-            sc = scatter_panel(ax, emb, day["band_z"][band], BAND_CMAPS[band],
-                               BAND_Z_RANGE[0], BAND_Z_RANGE[1], projection)
+            if grouping not in day["embeddings"]:
+                ax.axis("off")
+                continue
+            sc = scatter_panel(ax, day["embeddings"][grouping], day["band_z"][band],
+                               BAND_CMAPS[band], BAND_Z_RANGE[0], BAND_Z_RANGE[1],
+                               projection)
             if r == 0:
-                ax.set_title(f"{band}\n{BANDS[band][0]:.0f}-{BANDS[band][1]:.0f} Hz",
-                             fontsize=9)
+                ax.set_title(grouping, fontsize=10)
             if c == 0:
-                ax.set_ylabel(f"{day['date']}", fontsize=9)
+                ax.set_ylabel(day["date"], fontsize=9)
             ax.set_xticks([])
             ax.set_yticks([])
             if projection == "3d":
                 ax.set_zticks([])
-            if r == n_rows - 1:
-                fig.colorbar(sc, ax=ax, orientation="horizontal",
-                             fraction=0.05, pad=0.08).ax.tick_params(labelsize=6)
-    fig.tight_layout()
+    fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.6,
+                 pad=0.02).set_label(f"{band} power (z)", fontsize=9)
     plt.show()
     plt.close(fig)
 
 
-for grouping in GROUPINGS:
-    band_grid(grouping, days)
+# %% ===========================================================================
+# CELL 3 — delta
+# ==============================================================================
+
+band_figure("delta", days)
 
 
 # %% ===========================================================================
-# CELL 3 — our sharp-wave ripples on the manifold, coloured by speed
+# CELL 4 — theta
+# ==============================================================================
+
+band_figure("theta", days)
+
+
+# %% ===========================================================================
+# CELL 5 — beta
+# ==============================================================================
+
+band_figure("beta", days)
+
+
+# %% ===========================================================================
+# CELL 6 — slow gamma
+# ==============================================================================
+
+band_figure("slow_gamma", days)
+
+
+# %% ===========================================================================
+# CELL 7 — mid gamma
+# ==============================================================================
+
+band_figure("mid_gamma", days)
+
+
+# %% ===========================================================================
+# CELL 8 — ripple band
+# ==============================================================================
+
+band_figure("ripple", days)
+
+
+# %% ===========================================================================
+# CELL 9 — our sharp-wave ripples on the manifold, coloured by speed
 # ==============================================================================
 # Every bin in grey, the detected sharp-wave ripple bins on top in colour. The
 # colour is running speed at the event, not ripple power: the question is
@@ -670,3 +822,105 @@ if len(all_events):
     fig.tight_layout()
     plt.show()
     plt.close(fig)
+
+
+# %% ===========================================================================
+# CELL 10 — the aperiodic 1/f background on the manifold
+# ==============================================================================
+# Exponent and knee, fit in cell 1 and mapped onto the same clouds. The r2
+# column is not decoration: a region that looks like it has a distinctive
+# exponent but a poor fit is telling you about the fit, not about the brain.
+#
+# Colour limits come from the 2nd-98th percentile pooled over days, so the
+# three rows are directly comparable and a couple of bad windows do not
+# flatten the scale.
+
+APERIODIC_PANELS = (
+    ("exponent", "1/f exponent (slope)", "inferno"),
+    ("knee", "knee (Hz)", "cividis"),
+    ("fit_r2", "fit r2", "Greys"),
+)
+
+
+def aperiodic_limits(days, key):
+    pooled = np.concatenate([d[key][np.isfinite(d[key])] for d in days
+                             if np.isfinite(d[key]).any()])
+    if pooled.size == 0:
+        return 0.0, 1.0
+    return float(np.percentile(pooled, 2)), float(np.percentile(pooled, 98))
+
+
+def aperiodic_figure(grouping, days, projection=GRID_PROJECTION):
+    rows = [d for d in days if grouping in d["embeddings"]]
+    if not rows:
+        return
+    subplot_kw = {"projection": "3d"} if projection == "3d" else {}
+    fig, axes = plt.subplots(len(rows), len(APERIODIC_PANELS),
+                             figsize=(4.0 * len(APERIODIC_PANELS), 3.2 * len(rows)),
+                             squeeze=False, subplot_kw=subplot_kw)
+    fig.suptitle(f"{SUBJECT} — {grouping} — aperiodic 1/f background "
+                 f"({APERIODIC_FIT_RANGE[0]:.0f}-{APERIODIC_FIT_RANGE[1]:.0f} Hz, "
+                 f"{APERIODIC_WINDOW_S:.0f}s windows)")
+
+    limits = {key: aperiodic_limits(rows, key) for key, _, _ in APERIODIC_PANELS}
+    for r, day in enumerate(rows):
+        emb = day["embeddings"][grouping]
+        for c, (key, label, cmap) in enumerate(APERIODIC_PANELS):
+            ax = axes[r, c]
+            vmin, vmax = limits[key]
+            sc = scatter_panel(ax, emb, day[key], cmap, vmin, vmax, projection)
+            if r == 0:
+                ax.set_title(label, fontsize=10)
+            if c == 0:
+                ax.set_ylabel(day["date"], fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if projection == "3d":
+                ax.set_zticks([])
+            if r == len(rows) - 1:
+                fig.colorbar(sc, ax=ax, orientation="horizontal",
+                             fraction=0.05, pad=0.06).ax.tick_params(labelsize=7)
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
+for grouping in GROUPINGS:
+    aperiodic_figure(grouping, days)
+
+# How the aperiodic parameters relate to behaviour and to the ripple band —
+# a flattening exponent during running is the usual expectation, so this is
+# the sanity check on the fit before reading anything into the manifold.
+print("\naperiodic summary")
+print(pd.DataFrame([{
+    "date": d["date"],
+    "exponent_median": round(float(np.nanmedian(d["exponent"])), 3),
+    "knee_hz_median": round(float(np.nanmedian(d["knee"])), 2),
+    "r2_median": round(float(np.nanmedian(d["fit_r2"])), 3),
+    "corr_exponent_speed": round(float(pd.Series(d["exponent"]).corr(
+        pd.Series(d["speed"]))), 3),
+    "corr_knee_speed": round(float(pd.Series(d["knee"]).corr(
+        pd.Series(d["speed"]))), 3),
+    "corr_exponent_ripple": round(float(pd.Series(d["exponent"]).corr(
+        pd.Series(d["band_z"]["ripple"]))), 3),
+} for d in days]).to_string(index=False))
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
+fig.suptitle(f"{SUBJECT} — aperiodic parameters")
+for day in days:
+    ok = np.isfinite(day["exponent"])
+    axes[0].hist(day["exponent"][ok], bins=40, histtype="step", label=day["date"])
+    ok_k = np.isfinite(day["knee"])
+    axes[1].hist(day["knee"][ok_k], bins=40, histtype="step", label=day["date"])
+    axes[2].scatter(day["speed"][ok], day["exponent"][ok], s=2, alpha=0.2,
+                    label=day["date"])
+axes[0].set_xlabel("1/f exponent")
+axes[0].set_ylabel("bins")
+axes[0].legend(fontsize=7)
+axes[1].set_xlabel("knee (Hz)")
+axes[2].set_xlabel("speed (cm/s)")
+axes[2].set_ylabel("1/f exponent")
+axes[2].set_xscale("symlog", linthresh=1)
+fig.tight_layout()
+plt.show()
+plt.close(fig)
