@@ -8,17 +8,19 @@ Their pipeline, reimplemented here because NMLfunc.py is not vendored:
 
     X                cosine distances on the binned activity, downsampled
     embedding        fit on X, then normalized by max|x_embd|
-    RMSE             an optimal linear estimator from the first k embedding
-                     dimensions to behaviour, 10-fold CV — decoding error,
-                     not reconstruction error
     variance         cumulative eigenvalue spectrum of classical MDS on the
     explained        cosine distance matrix, a property of the data rather
                      than of any one method
     reconstruction   out-of-sample LLE mapping from embedding back to
                      activity (K_LLE neighbours, LAMBDA regularization),
-                     10-fold CV, scored by corr(real, reconstructed)
+                     10-fold CV, scored by corr(real, reconstructed) and RMSE
     dimensionality   correlation dimension: neighbour count against radius,
                      log-log slope over the middle of the range
+
+One thing of theirs is deliberately absent: their RMSE figure is an optimal
+linear estimator decoding behaviour out of the embedding. This is an analysis
+of the activity itself, so there is no behaviour in it at all — no position, no
+speed, no decoding. RMSE here means reconstruction RMSE.
 
 Added on top of theirs, and marked as such where they appear:
 
@@ -35,17 +37,21 @@ Added on top of theirs, and marked as such where they appear:
                      embedding is fit per recording, so its error is an
                      average over minutes that are not alike, and this is
                      where that average comes apart
+    simulation       DATA_SOURCE = "simulated" replaces the dandiset with a
+                     synthetic population of known latent dimensionality.
+                     It runs in seconds and the right answer is known, so
+                     the pipeline can be debugged without waiting on real
+                     data, and the estimators can be checked against a truth
 
 CELL 1  config, loaders, the sweep. Leaves `scores`, `spectra`, `timepoints`,
         `minutes`
-CELL 2  decoding RMSE and correlation (their headline pair)
-CELL 3  reconstruction similarity and cross-validated R^2
-CELL 4  population moments by region, against dimensions
-CELL 5  intrinsic dimensionality, and the MDS variance-explained spectrum
-CELL 6  when the global embedding does badly
-CELL 7  dimension x minute heatmaps from one recording: error, variance,
+CELL 2  reconstruction similarity, RMSE and cross-validated R^2
+CELL 3  population moments by region, against dimensions
+CELL 4  intrinsic dimensionality, and the MDS variance-explained spectrum
+CELL 5  held-out error over time
+CELL 6  dimension x minute heatmaps from one recording: error, variance,
         skew, kurtosis
-CELL 8  a real-vs-reconstructed example
+CELL 7  a real-vs-reconstructed example
 """
 
 import gc
@@ -58,6 +64,7 @@ import numpy as np
 import pandas as pd
 import pynapple as nap
 from scipy import stats
+from scipy.ndimage import gaussian_filter1d
 from sklearn.decomposition import PCA, KernelPCA
 from sklearn.manifold import SpectralEmbedding
 from sklearn.metrics.pairwise import cosine_distances
@@ -69,6 +76,22 @@ from sklearn.neighbors import NearestNeighbors
 # =============================================================================
 
 DOWNLOAD_DIR = Path("/storage/dandi_downloads").resolve()
+
+# "nwb" reads the dandiset. "simulated" generates a synthetic population with
+# a known number of latent dimensions instead — a few seconds per recording,
+# and the answer is known, so it is the thing to debug against. If the
+# reconstruction curve does not saturate near SIM_LATENT_DIM on simulated
+# data, the pipeline is wrong and nothing it says about real data is worth
+# reading.
+DATA_SOURCE = "nwb"               # "nwb" | "simulated"
+SIM_RECORDINGS = 3                # how many synthetic sessions to generate
+SIM_UNITS = 150
+SIM_DURATION_S = 600.0
+SIM_LATENT_DIM = 4                # the ground truth the curves should find
+SIM_SMOOTH_S = 0.5                # timescale of the latent trajectories
+SIM_GAIN = 0.8                    # how strongly latents modulate log rate
+SIM_BASE_RATE_HZ = 5.0
+SIM_REGIONS = 3
 
 RECORDINGS = None                 # None = all; or substrings e.g. ["sub-M05"]
 MAX_RECORDINGS = None             # cap for a smoke test
@@ -114,15 +137,14 @@ METHODS = {
 METHOD_COLORS = {"PCA": "#1f77b4", "KernelPCA": "#d62728",
                  "Laplacian": "#9467bd"}
 
-# Dimensions scored: every one up to FIRST_DIMS, plus these fractions of the
-# neuron count, so the curve can also be read against the population size.
+# Every dimension from 1 to the neuron count is scored — the curve is the
+# whole curve, not a grid through it. FIRST_DIMS only sets the x-limit of the
+# left-hand plot panels, where the drop-off is; the right-hand panels always
+# run to 100% of the neuron count.
 FIRST_DIMS = 30
-K_EVAL_FRAC = (0.10, 0.25, 0.50, 1.00)
 
-DECODE_TARGETS = ("track_x", "speed")
 TIME_K = 10                       # dims at which per-timepoint error is kept
 EXAMPLE_K = 10                    # dims for the real-vs-reconstructed figure
-IMMOBILE_CM_S = 2.0
 VAR_THRESHOLDS = (0.5, 0.8, 0.9)
 
 # --- the dimension x minute heatmaps ----------------------------------------
@@ -170,8 +192,38 @@ def unit_regions(spike_group):
         return np.array(["all"] * len(spike_group.index))
 
 
+def simulate_session(row, bin_size_s):
+    """A synthetic population with a known number of latent dimensions.
+
+    Smooth latent trajectories drive log firing rates through a random loading
+    matrix, and spikes are Poisson. The population therefore has an intrinsic
+    dimensionality of SIM_LATENT_DIM by construction, buried under Poisson
+    noise and a nonlinearity — which is the point. Reconstruction curves
+    should saturate near it, and the correlation dimension should land near it
+    too. An estimator that misses on this has no business being trusted on a
+    recording where the truth is unknown.
+    """
+    rng = np.random.default_rng(int(row["seed"]))
+    n_bins = int(SIM_DURATION_S / bin_size_s)
+
+    latent = rng.normal(size=(n_bins, SIM_LATENT_DIM))
+    latent = gaussian_filter1d(latent, sigma=SIM_SMOOTH_S / bin_size_s,
+                               axis=0, mode="wrap")
+    latent /= latent.std(axis=0) + 1e-9
+
+    loadings = rng.normal(size=(SIM_LATENT_DIM, SIM_UNITS))
+    rate_hz = SIM_BASE_RATE_HZ * np.exp(SIM_GAIN * (latent @ loadings))
+    rates = rng.poisson(rate_hz * bin_size_s).astype(np.float32) / bin_size_s
+
+    regions = np.array([f"sim{1 + i % SIM_REGIONS}" for i in range(SIM_UNITS)])
+    centers = np.arange(n_bins) * bin_size_s
+    info = {"epoch_kind": "simulated", "duration_s": SIM_DURATION_S,
+            "n_units": SIM_UNITS}
+    return rates, centers, regions, info
+
+
 def load_session(row, bin_size_s):
-    """Binned rates (bins x units), bin centres, regions, and behaviour."""
+    """Binned rates (bins x units), bin centres, and regions."""
     path = (DOWNLOAD_DIR / row["file"]).resolve()
     nwb = nap.load_file(str(path))
     spikes_all = nwb["units"]
@@ -205,28 +257,18 @@ def load_session(row, bin_size_s):
     rates = rates[:, keep]
     regions = unit_regions(spikes_all)[keep]
 
-    behaviour = {"speed": np.full(len(centers), np.nan),
-                 "track_x": np.full(len(centers), np.nan)}
-    try:
-        spd = nwb["Speed"].restrict(epoch)
-        behaviour["speed"] = np.interp(centers,
-                                       np.asarray(spd.index.values, dtype=float),
-                                       np.asarray(spd.values, dtype=float).ravel())
-    except Exception:
-        pass
-    try:
-        pos = nwb["Position"].restrict(epoch)
-        behaviour["track_x"] = np.interp(centers,
-                                         np.asarray(pos.index.values, dtype=float),
-                                         np.asarray(pos["x"].values, dtype=float))
-    except Exception:
-        pass
-
     info = {"epoch_kind": epoch_kind, "duration_s": t1 - t0,
             "n_units": int(keep.sum())}
     del spikes, spikes_all, counts, spike_times, nwb
     gc.collect()
-    return rates, centers, regions, behaviour, info
+    return rates, centers, regions, info
+
+
+def get_session(row, bin_size_s):
+    """Whichever source DATA_SOURCE names."""
+    if DATA_SOURCE == "simulated":
+        return simulate_session(row, bin_size_s)
+    return load_session(row, bin_size_s)
 
 
 def transform_rates(rates, how=RATE_TRANSFORM):
@@ -295,24 +337,6 @@ def intrinsic_dimensionality(Y, nstep=ID_NSTEP, thr_start=ID_THR_START,
         return np.nan, radii, counts
     slope = np.polyfit(np.log(radii[band]), np.log(counts[band]), 1)[0]
     return float(slope), radii, counts
-
-
-def ole_decode(Y_train, y_train, Y_test, y_test):
-    """Optimal linear estimator, then RMSE and r on held-out samples.
-
-    Least squares from the embedding coordinates to a behavioural variable,
-    with an intercept. This is what their RMSE figure plots — decoding error,
-    not reconstruction error, which is worth keeping straight: it asks whether
-    the embedding retains behavioural information, not whether it retains the
-    activity.
-    """
-    A = np.column_stack([Y_train, np.ones(len(Y_train))])
-    f, *_ = np.linalg.lstsq(A, y_train, rcond=None)
-    y_pred = np.column_stack([Y_test, np.ones(len(Y_test))]) @ f
-    rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
-    r = (float(np.corrcoef(y_test, y_pred)[0, 1])
-         if np.std(y_pred) > 1e-12 and np.std(y_test) > 1e-12 else np.nan)
-    return rmse, r
 
 
 def lle_reconstruct(Y_train, X_train, Y_test, k_lle=K_LLE, lam=LAMBDA):
@@ -428,27 +452,42 @@ def population_moments(X_true, X_rec, groups):
     return out
 
 
+def hms(seconds):
+    """Seconds as m:ss, or h:mm:ss once it runs long enough to matter."""
+    seconds = int(round(seconds))
+    if seconds < 3600:
+        return f"{seconds // 60:d}:{seconds % 60:02d}"
+    return f"{seconds // 3600:d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
 def eval_dims(n_components):
-    ks = set(k for k in range(1, FIRST_DIMS + 1) if k <= n_components)
-    ks |= set(max(1, int(round(f * n_components))) for f in K_EVAL_FRAC)
-    return sorted(k for k in ks if 1 <= k <= n_components)
+    """Every dimension from 1 to n_components. The curve is not subsampled."""
+    return list(range(1, int(n_components) + 1))
 
 
 # =============================================================================
 # STEP 4 — the sweep
 # =============================================================================
 
-recordings = recording_table(DOWNLOAD_DIR)
-print(f"{len(recordings)} recordings")
-print(recordings[["subject", "date", "has_behavior", "file"]].to_string(index=False))
+if DATA_SOURCE == "simulated":
+    recordings = pd.DataFrame([{
+        "subject": "sim", "session": f"{i:02d}", "date": f"sim{i:02d}",
+        "has_behavior": False, "seed": i,
+        "file": f"simulated/session_{i:02d}"} for i in range(SIM_RECORDINGS)])
+    print(f"SIMULATED data: {SIM_RECORDINGS} sessions, {SIM_UNITS} units, "
+          f"{SIM_DURATION_S / 60:.0f} min, {SIM_LATENT_DIM} latent dimensions "
+          f"— the curves should saturate near {SIM_LATENT_DIM}")
+else:
+    recordings = recording_table(DOWNLOAD_DIR)
+    print(f"{len(recordings)} recordings")
+print(recordings[["subject", "date", "file"]].to_string(index=False))
 print(f"\nmethods: {', '.join(METHODS)} | bins: "
       f"{', '.join(f'{b * 1e3:.0f} ms' for b in BIN_SIZES_S)} | "
       f"transform: {RATE_TRANSFORM}")
 print(f"fit on: " + ", ".join(
     f"{m} every {c['downsample']} bin(s)" for m, c in METHODS.items()))
 print(f"reconstruction: LLE k={K_LLE}, lambda={LAMBDA}, {CV_FOLDS}-fold CV on "
-      f"bins[::{RECON_STRIDE}] capped at {RECON_MAX_SAMPLES} | "
-      f"decoding: OLE to {', '.join(DECODE_TARGETS)}")
+      f"bins[::{RECON_STRIDE}] capped at {RECON_MAX_SAMPLES}")
 
 score_rows, spectrum_rows, time_rows, minute_rows = [], [], [], []
 example_store, skipped = {}, []
@@ -458,12 +497,12 @@ example_file = (recordings["file"].iloc[0] if EXAMPLE_FILE is None else
 sweep_started = time.perf_counter()
 print(f"dimension x minute heatmaps will be built from {example_file}")
 
-for _, rec in recordings.iterrows():
+for rec_i, (_, rec) in enumerate(recordings.iterrows(), start=1):
     is_example = rec["file"] == example_file
     for bin_size_s in BIN_SIZES_S:
         t_load = time.perf_counter()
         try:
-            rates, centers, regions, behaviour, info = load_session(rec, bin_size_s)
+            rates, centers, regions, info = get_session(rec, bin_size_s)
         except Exception as exc:
             print(f"\n{rec['file']}: could not load ({type(exc).__name__}: {exc})")
             skipped.append({"file": rec["file"], "reason": str(exc)})
@@ -472,11 +511,15 @@ for _, rec in recordings.iterrows():
         X_all = np.asarray(transform_rates(rates), dtype=np.float64)
         n_units = X_all.shape[1]
         groups = region_groups(regions)
-        print(f"\n{rec['subject']} {rec['date']} | {bin_size_s * 1e3:.0f} ms | "
-              f"{info['epoch_kind']} epoch {info['duration_s'] / 60:.1f} min | "
+        done = time.perf_counter() - sweep_started
+        eta = (done / max(rec_i - 1, 1)) * (len(recordings) - rec_i + 1)
+        print(f"\n[{rec_i}/{len(recordings)}] {rec['subject']} {rec['date']} | "
+              f"{bin_size_s * 1e3:.0f} ms | elapsed {hms(done)}"
+              + (f", ~{hms(eta)} left" if rec_i > 1 else ""))
+        print(f"    {info['epoch_kind']} epoch {info['duration_s'] / 60:.1f} min | "
               f"{n_units} units | {X_all.shape[0]} bins | regions: "
               f"{', '.join(f'{g} ({m.sum()})' for g, m in groups.items())} "
-              f"({time.perf_counter() - t_load:.1f}s to load)")
+              f"| loaded in {time.perf_counter() - t_load:.1f}s")
         del rates
         gc.collect()
 
@@ -532,12 +575,18 @@ for _, rec in recordings.iterrows():
             Y_recon = Y_scaled[local]
             X_recon = X_all[idx_recon]
             times = centers[idx_recon]
-            targets = {t: behaviour[t][idx_recon] for t in DECODE_TARGETS}
 
             minute_id = ((times - times[0]) // MINUTE_S).astype(int)
 
+            # the CV loop below is the slow part — len(dim_grid) x CV_FOLDS LLE
+            # solves — so it reports as it goes rather than going quiet
+            dim_grid = eval_dims(Y.shape[1])
+            print(f"    {name:10s} fit {fit_s:5.1f}s on {X_embed.shape[0]} bins "
+                  f"(stride {stride}), {Y.shape[1]} comps, dim {dim_id:.2f} | "
+                  f"reconstructing {len(dim_grid)} dims x {CV_FOLDS} folds on "
+                  f"{len(idx_recon)} samples", flush=True)
             t_cv = time.perf_counter()
-            for k in eval_dims(Y.shape[1]):
+            for dim_i, k in enumerate(dim_grid, start=1):
                 per_sample = np.full(len(X_recon), np.nan) if k == TIME_K else None
                 # the example recording keeps the whole held-out reconstruction
                 # for this k, so it can be cut into minutes below
@@ -566,19 +615,6 @@ for _, rec in recordings.iterrows():
                         "var_explained_cv": float(1 - ss_res / max(ss_tot, 1e-12)),
                     }
                     row.update(population_moments(X_test, X_rec, groups))
-
-                    # their RMSE: decoding behaviour out of the same dimensions
-                    for target, values in targets.items():
-                        ok = np.isfinite(values)
-                        tr = train_idx[ok[train_idx]]
-                        te = test_idx[ok[test_idx]]
-                        if len(tr) > k + 1 and len(te) > 2:
-                            rmse, r = ole_decode(Y_recon[tr, :k], values[tr],
-                                                 Y_recon[te, :k], values[te])
-                        else:
-                            rmse, r = np.nan, np.nan
-                        row[f"decode_rmse_{target}"] = rmse
-                        row[f"decode_r_{target}"] = r
                     score_rows.append(row)
 
                     if per_sample is not None:
@@ -604,8 +640,6 @@ for _, rec in recordings.iterrows():
                             "method": name, "k": k, "minute": int(minute),
                             "n_samples": int(sel.sum()),
                             "rmse": float(np.sqrt(np.mean(resid_m ** 2))),
-                            "speed": float(np.nanmedian(
-                                behaviour["speed"][idx_recon][sel])),
                         }
                         entry.update(population_moments(X_recon[sel], X_hat[sel],
                                                         groups))
@@ -613,24 +647,27 @@ for _, rec in recordings.iterrows():
                     del X_hat
                     gc.collect()
 
+                if dim_i % 25 == 0 or dim_i == len(dim_grid):
+                    spent = time.perf_counter() - t_cv
+                    print(f"        {dim_i:3d}/{len(dim_grid)} dims (k={k}) | "
+                          f"{hms(spent)} spent, "
+                          f"~{hms(spent / dim_i * (len(dim_grid) - dim_i))} left",
+                          flush=True)
+
                 if per_sample is not None:
                     time_rows.append(pd.DataFrame({
                         "subject": rec["subject"], "date": rec["date"],
                         "file": rec["file"], "bin_size_s": bin_size_s,
                         "method": name, "k": k, "time_s": times,
                         "rmse": per_sample.astype(np.float32),
-                        "speed": behaviour["speed"][idx_recon].astype(np.float32),
-                        "track_x": behaviour["track_x"][idx_recon].astype(np.float32),
                     }))
 
             recent = [r for r in score_rows if r["method"] == name
                       and r["file"] == rec["file"] and r["k"] == min(10, n_comp)]
             corr10 = np.mean([r["rec_corr"] for r in recent]) if recent else np.nan
-            print(f"    {name:10s} {Y.shape[1]:3d} comps | fit on "
-                  f"{X_embed.shape[0]:6d} bins (stride {stride}) {fit_s:6.1f}s | "
-                  f"reconstructed on {len(idx_recon):5d} "
-                  f"{time.perf_counter() - t_cv:6.1f}s | dim {dim_id:.2f} | "
-                  f"rec r at k=10 {corr10:.3f}" + (f" | {note}" if note else ""))
+            print(f"    {name:10s} done in {hms(time.perf_counter() - t_cv)} | "
+                  f"rec r at k=10 {corr10:.3f}" + (f" | {note}" if note else ""),
+                  flush=True)
             del Y, Y_scaled, Y_recon, X_embed, X_recon
             gc.collect()
 
@@ -654,12 +691,12 @@ by_k = (scores.groupby(["file", "subject", "date", "bin_size_s", "method",
 
 
 # %% ===========================================================================
-# CELL 2 — decoding: their RMSE and r
+# CELL 2 — reconstruction: similarity, RMSE and cross-validated R^2
 # ==============================================================================
-# An optimal linear estimator from the first k embedding dimensions to
-# behaviour, scored on held-out folds. This is what their RMSE figure shows.
-# It asks whether the embedding kept behavioural information, which is a
-# different question from whether it kept the activity — cell 3 asks that one.
+# corr(real, reconstructed) over held-out folds is their reconstruction figure.
+# The R^2 panel is their commented-out var_expl line, uncommented: it is the
+# stricter question, because a reconstruction can correlate well while being
+# systematically compressed, and R^2 sees the compression.
 
 
 def curve_panel(ax, frame, xcol, ycol, xlim=None):
@@ -696,27 +733,8 @@ def two_axis_figure(frame, ycol, ylabel, title, hline=None):
 
 
 for bin_size_s, frame in by_k.groupby("bin_size_s"):
-    label = f"{bin_size_s * 1e3:.0f} ms bins, {frame['file'].nunique()} recordings"
-    for target in DECODE_TARGETS:
-        unit = "cm" if target == "track_x" else "cm/s"
-        two_axis_figure(frame, f"decode_rmse_{target}",
-                        f"decoding RMSE ({unit})",
-                        f"decoding {target} — {label}")
-        two_axis_figure(frame, f"decode_r_{target}",
-                        "decoding performance [$r$]",
-                        f"decoding {target}, correlation — {label}")
-
-
-# %% ===========================================================================
-# CELL 3 — reconstruction: similarity and cross-validated R^2
-# ==============================================================================
-# corr(real, reconstructed) over held-out folds is their reconstruction figure.
-# The R^2 panel is their commented-out var_expl line, uncommented: it is the
-# stricter question, because a reconstruction can correlate well while being
-# systematically compressed, and R^2 sees the compression.
-
-for bin_size_s, frame in by_k.groupby("bin_size_s"):
-    label = f"{bin_size_s * 1e3:.0f} ms bins"
+    label = (f"{bin_size_s * 1e3:.0f} ms bins, "
+             f"{frame['file'].nunique()} recordings")
     two_axis_figure(frame, "rec_corr", "reconstruction similarity [$r$]",
                     f"activity reconstruction — {label}")
     two_axis_figure(frame, "var_explained_cv", "variance explained (CV $R^2$)",
@@ -726,7 +744,7 @@ for bin_size_s, frame in by_k.groupby("bin_size_s"):
 
 
 # %% ===========================================================================
-# CELL 4 — population moments, by region
+# CELL 3 — population moments, by region
 # ==============================================================================
 # Variance, skew and kurtosis of the summed activity of each region, in the
 # reconstruction against the data. Variance is shown as a ratio (1 = recovered)
@@ -791,7 +809,7 @@ for bin_size_s, frame in moments.groupby("bin_size_s"):
 
 
 # %% ===========================================================================
-# CELL 5 — intrinsic dimensionality and the data's own spectrum
+# CELL 4 — intrinsic dimensionality and the data's own spectrum
 # ==============================================================================
 # Left: the correlation dimension of each method's embedding, one point per
 # recording — their dimensionality bar chart, with the spread across sixteen
@@ -835,11 +853,13 @@ plt.close(fig)
 
 
 # %% ===========================================================================
-# CELL 6 — when the global embedding does badly
+# CELL 5 — held-out error over time
 # ==============================================================================
 # One embedding is fit for the whole recording, so its error is an average over
-# moments that are not alike. Per-sample held-out error at TIME_K dimensions,
-# against time, against running speed, and split by immobility.
+# stretches of the session that are not alike. Per-sample held-out error at
+# TIME_K dimensions, one row per recording, with the spread across the session
+# printed alongside: a large ratio between the worst and best decile means the
+# average is hiding a lot.
 
 if len(timepoints):
     for bin_size_s, frame in timepoints.groupby("bin_size_s"):
@@ -867,60 +887,17 @@ if len(timepoints):
         plt.show()
         plt.close(fig)
 
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
-        fig.suptitle(f"where the global embedding fails — {label}")
-
-        ax = axes[0]
-        has_speed = frame["speed"].notna()
-        if has_speed.any():
-            sub = frame[has_speed].copy()
-            sub["speed_bin"] = pd.qcut(sub["speed"], 10, duplicates="drop")
-            for method, one in sub.groupby("method"):
-                grouped = one.groupby("speed_bin", observed=True)
-                ax.plot(grouped["speed"].median().values,
-                        grouped["rmse"].median().values, "o-",
-                        color=METHOD_COLORS.get(method, "0.4"), label=method, lw=1.5)
-            ax.axvline(IMMOBILE_CM_S, color="k", ls="--", lw=1)
-            ax.set_xlabel("running speed (cm/s, decile median)")
-            ax.set_ylabel("held-out RMSE")
-            ax.legend(fontsize=8)
-        else:
-            ax.text(0.5, 0.5, "no speed channel", ha="center", transform=ax.transAxes)
-
-        ax = axes[1]
-        has_pos = frame["track_x"].notna()
-        if has_pos.any():
-            sub = frame[has_pos].copy()
-            sub["pos_bin"] = pd.cut(sub["track_x"], 20)
-            for method, one in sub.groupby("method"):
-                grouped = one.groupby("pos_bin", observed=True)
-                ax.plot(grouped["track_x"].median().values,
-                        grouped["rmse"].median().values, "o-", ms=3,
-                        color=METHOD_COLORS.get(method, "0.4"), lw=1.2)
-            ax.set_xlabel("track position x (cm)")
-            ax.set_ylabel("held-out RMSE")
-        else:
-            ax.text(0.5, 0.5, "no position channel", ha="center",
-                    transform=ax.transAxes)
-
-        ax = axes[2]
-        if has_speed.any():
-            sub = frame[has_speed].copy()
-            sub["state"] = np.where(sub["speed"] < IMMOBILE_CM_S, "immobile", "moving")
-            table = sub.groupby(["method", "state"])["rmse"].median().unstack()
-            table.plot(kind="bar", ax=ax, color=["0.62", "0.25"])
-            ax.set_ylabel("median held-out RMSE")
-            ax.set_xlabel("")
-            ax.tick_params(axis="x", labelrotation=20)
-            print(f"\nmedian held-out RMSE by state — {label}")
-            print(table.round(3).to_string())
-        fig.tight_layout()
-        plt.show()
-        plt.close(fig)
+        spread = (frame.groupby(["subject", "date", "method"])["rmse"]
+                  .agg(median="median",
+                       p10=lambda v: np.nanpercentile(v, 10),
+                       p90=lambda v: np.nanpercentile(v, 90)))
+        spread["p90_over_p10"] = spread["p90"] / spread["p10"]
+        print(f"\nhow much the error moves within a session — {label}")
+        print(spread.round(3).to_string())
 
 
 # %% ===========================================================================
-# CELL 7 — dimension x minute heatmaps, one recording
+# CELL 6 — dimension x minute heatmaps, one recording
 # ==============================================================================
 # One embedding is fit for the whole session, and everything above averages
 # over it. This cell takes that average apart: rows are dimensions included,
@@ -994,10 +971,9 @@ if len(minutes):
         plt.show()
         plt.close(fig)
 
-    # the same thing as curves, for the minutes that stand out
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.0))
+    # the same thing as a curve: one row of the heatmap, per method
+    fig, ax = plt.subplots(figsize=(9, 4.0))
     fig.suptitle("per-minute held-out RMSE, one recording")
-    ax = axes[0]
     for method, sub in minutes.groupby("method"):
         grid = sub.pivot_table(index="k", columns="minute", values="rmse")
         # nearest available k, since a method may have returned fewer than TIME_K
@@ -1005,22 +981,15 @@ if len(minutes):
         ax.plot(grid.columns.values, grid.loc[row_k].values, "o-", ms=3,
                 color=METHOD_COLORS.get(method, "0.4"), label=f"{method} (k={row_k})")
     ax.set_xlabel("minute of recording")
-    ax.set_ylabel(f"held-out RMSE at k={TIME_K}")
+    ax.set_ylabel("held-out RMSE")
     ax.legend(fontsize=8)
-
-    ax = axes[1]
-    speed_by_minute = minutes.groupby("minute")["speed"].median()
-    ax.plot(speed_by_minute.index, speed_by_minute.values, "o-", ms=3, color="k")
-    ax.axhline(IMMOBILE_CM_S, color="C3", ls="--", lw=1)
-    ax.set_xlabel("minute of recording")
-    ax.set_ylabel("median speed (cm/s)")
     fig.tight_layout()
     plt.show()
     plt.close(fig)
 
 
 # %% ===========================================================================
-# CELL 8 — a reconstruction, side by side
+# CELL 7 — a reconstruction, side by side
 # ==============================================================================
 # Their sanity check: the held-out activity and its reconstruction as images on
 # the same colour scale. Compression shows up here directly — the
