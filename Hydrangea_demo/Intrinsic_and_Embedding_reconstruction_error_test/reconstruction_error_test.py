@@ -13,7 +13,10 @@ Their pipeline, reimplemented here because NMLfunc.py is not vendored:
                      than of any one method
     reconstruction   out-of-sample LLE mapping from embedding back to
                      activity (K_LLE neighbours, LAMBDA regularization),
-                     10-fold CV, scored by corr(real, reconstructed) and RMSE
+                     10-fold CV with a randomly drawn held-out tenth, scored
+                     by corr(real, reconstructed) and RMSE. Some holdout is
+                     unavoidable: query the set the mapping was built from and
+                     every point finds itself among its own neighbours
     dimensionality   correlation dimension: neighbour count against radius,
                      log-log slope over the middle of the range
 
@@ -77,6 +80,17 @@ from sklearn.neighbors import NearestNeighbors
 
 DOWNLOAD_DIR = Path("/storage/dandi_downloads").resolve()
 
+# Where the computed reductions go: one .npz per recording x bin size x
+# method, holding the embedding and the indices of the bins it was fit on,
+# plus the result frames as CSVs at the end of the sweep. A run checks this
+# directory first and reuses whatever is already there, so a killed sweep does
+# not refit what it already finished — which matters most for Laplacian
+# eigenmaps, where the fit alone is several minutes.
+CACHE_DIR = Path("/storage/manifold_embeddings")
+USE_CACHE = True                  # read existing embeddings and skip the fit
+SAVE_CACHE = True                 # write embeddings as they are computed
+SAVE_RESULTS = True               # write the score frames at the end of cell 1
+
 # "nwb" reads the dandiset. "simulated" generates a synthetic population with
 # a known number of latent dimensions instead — a few seconds per recording,
 # and the answer is known, so it is the thing to debug against. If the
@@ -104,8 +118,26 @@ MIN_RATE_HZ = 0.0
 # --- their parameters --------------------------------------------------------
 K_LLE = 10                        # neighbours for the LLE reconstruction
 LAMBDA = 1.0                      # regularization on the local Gram matrix
-CV_FOLDS = 10
 RECON_STRIDE = 2                  # they reconstruct on X[::2]
+
+# How the reconstruction is held out. Some holdout is needed at all because
+# the LLE mapping rebuilds a point from its nearest neighbours: query the set
+# it was built from and each point finds itself, so the score measures
+# memorization rather than structure.
+#
+#   "kfold"  CV_FOLDS passes; each one holds out a random tenth and rebuilds
+#            it from the other nine tenths. The default.
+#   "split"  two complementary halves, two passes — the cheap version.
+#
+# RECON_SHUFFLE picks the partition. True draws the held-out tenth at random,
+# which is the usual convention. False takes it as one contiguous block of
+# time, which is stricter here: consecutive 50 ms bins are highly correlated,
+# so a randomly held-out bin usually has its immediate neighbours sitting in
+# the training set, and the score comes out better than the embedding deserves.
+RECON_VALIDATION = "kfold"        # "kfold" | "split"
+CV_FOLDS = 10
+RECON_SHUFFLE = True              # random partition; False = contiguous blocks
+RECON_SEED = 0
 # ...and then capped, because the embedding is now fit on every bin. The LLE
 # reconstruction runs CV_FOLDS times at every evaluated dimension, so its cost
 # is what has to be bounded — the fit itself is cheap by comparison.
@@ -452,6 +484,44 @@ def population_moments(X_true, X_rec, groups):
     return out
 
 
+def cache_path(row, bin_size_s, method_name):
+    """Where the embedding for one recording x bin x method lives."""
+    stem = Path(row["file"]).stem
+    return CACHE_DIR / f"{stem}__{bin_size_s * 1e3:.0f}ms__{method_name}.npz"
+
+
+def load_cached_embedding(path, expected_rows, expected_units):
+    """The stored embedding, or None if it is absent or does not match.
+
+    The shape check matters: a cached file made under a different bin size,
+    epoch or unit filter would silently produce nonsense if it were reused, so
+    a mismatch is treated as a miss rather than an error.
+    """
+    if not (USE_CACHE and path.exists()):
+        return None, ""
+    try:
+        with np.load(path, allow_pickle=False) as stored:
+            Y = stored["embedding"]
+            n_rows = int(stored["n_rows"])
+            n_units = int(stored["n_units"])
+    except Exception as exc:
+        return None, f"cache unreadable ({type(exc).__name__})"
+    if n_rows != expected_rows or n_units != expected_units:
+        return None, (f"cache shape {n_rows}x{n_units} != "
+                      f"{expected_rows}x{expected_units}, refitting")
+    return Y, "from cache"
+
+
+def save_embedding(path, Y, idx_embed, n_units, bin_size_s, method_name):
+    if not SAVE_CACHE:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path, embedding=Y.astype(np.float32), idx_embed=idx_embed.astype(np.int64),
+        n_rows=len(idx_embed), n_units=n_units, bin_size_s=bin_size_s,
+        method=method_name, rate_transform=RATE_TRANSFORM, epoch=EPOCH)
+
+
 def hms(seconds):
     """Seconds as m:ss, or h:mm:ss once it runs long enough to matter."""
     seconds = int(round(seconds))
@@ -486,8 +556,17 @@ print(f"\nmethods: {', '.join(METHODS)} | bins: "
       f"transform: {RATE_TRANSFORM}")
 print(f"fit on: " + ", ".join(
     f"{m} every {c['downsample']} bin(s)" for m, c in METHODS.items()))
-print(f"reconstruction: LLE k={K_LLE}, lambda={LAMBDA}, {CV_FOLDS}-fold CV on "
-      f"bins[::{RECON_STRIDE}] capped at {RECON_MAX_SAMPLES}")
+print(f"reconstruction: LLE k={K_LLE}, lambda={LAMBDA}, holdout="
+      f"{RECON_VALIDATION}"
+      + (f" ({CV_FOLDS} folds, "
+         f"{'random' if RECON_SHUFFLE else 'contiguous'} 1/{CV_FOLDS} held out"
+         f")" if RECON_VALIDATION == "kfold" else " (2 halves)")
+      + f", on bins[::{RECON_STRIDE}] capped at {RECON_MAX_SAMPLES}")
+if USE_CACHE or SAVE_CACHE:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    existing = sorted(CACHE_DIR.glob("*.npz"))
+    print(f"embedding cache: {CACHE_DIR} ({len(existing)} already stored, "
+          f"read={USE_CACHE}, write={SAVE_CACHE})")
 
 score_rows, spectrum_rows, time_rows, minute_rows = [], [], [], []
 example_store, skipped = {}, []
@@ -552,13 +631,17 @@ for rec_i, (_, rec) in enumerate(recordings.iterrows(), start=1):
                              X_embed.shape[0] - 1))
 
             t_fit = time.perf_counter()
-            try:
-                Y, note = embed(X_embed, method, n_comp)
-            except Exception as exc:
-                print(f"    {name:10s} failed: {type(exc).__name__}: {exc}")
-                skipped.append({"file": rec["file"], "method": name,
-                                "reason": str(exc)})
-                continue
+            path = cache_path(rec, bin_size_s, name)
+            Y, note = load_cached_embedding(path, len(idx_embed), n_units)
+            if Y is None:
+                try:
+                    Y, note = embed(X_embed, method, n_comp)
+                except Exception as exc:
+                    print(f"    {name:10s} failed: {type(exc).__name__}: {exc}")
+                    skipped.append({"file": rec["file"], "method": name,
+                                    "reason": str(exc)})
+                    continue
+                save_embedding(path, Y, idx_embed, n_units, bin_size_s, name)
             fit_s = time.perf_counter() - t_fit
 
             dim_id, _, _ = intrinsic_dimensionality(Y[:, :min(ID_DIMS, Y.shape[1])])
@@ -581,9 +664,15 @@ for rec_i, (_, rec) in enumerate(recordings.iterrows(), start=1):
             # the CV loop below is the slow part — len(dim_grid) x CV_FOLDS LLE
             # solves — so it reports as it goes rather than going quiet
             dim_grid = eval_dims(Y.shape[1])
+            n_splits = CV_FOLDS if RECON_VALIDATION == "kfold" else 2
+            folder = KFold(n_splits=n_splits, shuffle=RECON_SHUFFLE,
+                           random_state=RECON_SEED if RECON_SHUFFLE else None)
+            splits = list(folder.split(X_recon))
             print(f"    {name:10s} fit {fit_s:5.1f}s on {X_embed.shape[0]} bins "
-                  f"(stride {stride}), {Y.shape[1]} comps, dim {dim_id:.2f} | "
-                  f"reconstructing {len(dim_grid)} dims x {CV_FOLDS} folds on "
+                  f"(stride {stride}), {Y.shape[1]} comps, dim {dim_id:.2f}"
+                  + (f" [{note}]" if note else "") + " | reconstructing "
+                  f"{len(dim_grid)} dims x {n_splits} "
+                  f"{'folds' if RECON_VALIDATION == 'kfold' else 'halves'} on "
                   f"{len(idx_recon)} samples", flush=True)
             t_cv = time.perf_counter()
             for dim_i, k in enumerate(dim_grid, start=1):
@@ -592,8 +681,7 @@ for rec_i, (_, rec) in enumerate(recordings.iterrows(), start=1):
                 # for this k, so it can be cut into minutes below
                 X_hat = (np.full_like(X_recon, np.nan)
                          if is_example and k <= HEATMAP_MAX_DIMS else None)
-                for fold, (train_idx, test_idx) in enumerate(
-                        KFold(n_splits=CV_FOLDS).split(X_recon)):
+                for fold, (train_idx, test_idx) in enumerate(splits):
                     X_rec = lle_reconstruct(Y_recon[train_idx, :k],
                                             X_recon[train_idx],
                                             Y_recon[test_idx, :k])
@@ -684,6 +772,17 @@ print(f"\nsweep finished in {(time.perf_counter() - sweep_started) / 60:.1f} min
 if skipped:
     print("skipped:")
     print(pd.DataFrame(skipped).to_string(index=False))
+
+if SAVE_RESULTS:
+    # the frames alongside the embeddings, so a finished sweep survives the
+    # kernel and the plotting cells can be re-run from disk
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for name, frame in (("scores", scores), ("spectra", spectra),
+                        ("timepoints", timepoints), ("minutes", minutes)):
+        if len(frame):
+            out = CACHE_DIR / f"results_{name}.csv"
+            frame.to_csv(out, index=False)
+            print(f"wrote {out} ({len(frame)} rows)")
 
 by_k = (scores.groupby(["file", "subject", "date", "bin_size_s", "method",
                         "n_units", "k", "frac_components"], as_index=False)
