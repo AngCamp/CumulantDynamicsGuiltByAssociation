@@ -86,7 +86,12 @@ DOWNLOAD_DIR = Path("/storage/dandi_downloads").resolve()
 # directory first and reuses whatever is already there, so a killed sweep does
 # not refit what it already finished — which matters most for Laplacian
 # eigenmaps, where the fit alone is several minutes.
-CACHE_DIR = Path("/storage/manifold_embeddings")
+#
+# The folder name carries the scaling the embeddings were fit under, because a
+# shape check cannot tell two scalings apart. Change RATE_TRANSFORM below and
+# this name changes with it, so the new run pours a fresh cache instead of
+# reusing embeddings fit on a differently scaled matrix.
+CACHE_DIR = Path("/storage/manifold_embeddings_zscoreddata")
 USE_CACHE = True                  # read existing embeddings and skip the fit
 SAVE_CACHE = True                 # write embeddings as they are computed
 SAVE_RESULTS = True               # write the score frames at the end of cell 1
@@ -112,8 +117,17 @@ MAX_RECORDINGS = None             # cap for a smoke test
 EPOCH = "maze"                    # "maze" (position-tracked span) | "full"
 
 BIN_SIZES_S = (0.050,)            # swept
-RATE_TRANSFORM = "none"           # "none" (raw Hz) | "sqrt" | "zscore"
-MIN_RATE_HZ = 0.0
+
+# How the binned matrix is scaled before anything is fit. "zscore" centres and
+# scales each unit by its own mean and SD across bins, so every neuron enters
+# the geometry with equal weight. Without it the Euclidean distances that
+# Laplacian eigenmaps and the LLE reconstruction both depend on are dominated
+# by whichever units happen to fire fastest, and the RMSE axis reads in a unit
+# (counts / bin width) that says more about a recording's mean rate than about
+# how well its manifold holds. "none" reproduces the reference notebook, which
+# reconstructs the unscaled matrix.
+RATE_TRANSFORM = "zscore"         # "zscore" | "none" (as binned) | "sqrt"
+MIN_RATE_HZ = 0.0                 # units at exactly 0 are dropped regardless
 
 # --- their parameters --------------------------------------------------------
 K_LLE = 10                        # neighbours for the LLE reconstruction
@@ -304,13 +318,31 @@ def get_session(row, bin_size_s):
 
 
 def transform_rates(rates, how=RATE_TRANSFORM):
+    """Scale the binned matrix (n_bins x n_units) before it is embedded.
+
+    "zscore" works down axis 0, so each unit is centred and scaled by its own
+    mean and SD taken over the bins of this epoch — one mean and one SD per
+    neuron, computed after binning, never pooled across units. A unit that
+    never varies would divide by zero, so its numerator is zero too and the
+    guard leaves the column flat rather than blowing it up.
+    """
     if how == "none":
         return rates
     if how == "sqrt":
         return np.sqrt(rates)
     if how == "zscore":
-        return (rates - rates.mean(axis=0)) / (rates.std(axis=0) + 1e-9)
+        mu = rates.mean(axis=0, keepdims=True)
+        sd = rates.std(axis=0, keepdims=True)
+        return np.divide(rates - mu, sd, out=np.zeros_like(rates, dtype=np.float64),
+                         where=sd > 1e-12)
     raise ValueError(f"unknown RATE_TRANSFORM: {how}")
+
+
+# What the reconstruction error is measured in, for axis labels. Under "zscore"
+# the matrix is unitless and the error is in SDs of each unit's own activity,
+# which is the only setting where RMSE is comparable across recordings.
+RMSE_UNITS = {"zscore": "SD", "sqrt": r"$\sqrt{\mathrm{Hz}}$",
+              "none": "Hz"}[RATE_TRANSFORM]
 
 
 # =============================================================================
@@ -485,7 +517,12 @@ def population_moments(X_true, X_rec, groups):
 
 
 def cache_path(row, bin_size_s, method_name):
-    """Where the embedding for one recording x bin x method lives."""
+    """Where the embedding for one recording x bin x method lives.
+
+    The scaling is not in the filename — it is in CACHE_DIR, which is named for
+    it. Changing RATE_TRANSFORM means pointing CACHE_DIR at a new folder and
+    letting it fill, since a shape check alone cannot tell two scalings apart.
+    """
     stem = Path(row["file"]).stem
     return CACHE_DIR / f"{stem}__{bin_size_s * 1e3:.0f}ms__{method_name}.npz"
 
@@ -838,7 +875,7 @@ for bin_size_s, frame in by_k.groupby("bin_size_s"):
                     f"activity reconstruction — {label}")
     two_axis_figure(frame, "var_explained_cv", "variance explained (CV $R^2$)",
                     f"cross-validated variance explained — {label}", hline=0.0)
-    two_axis_figure(frame, "rec_rmse", "reconstruction RMSE (Hz)",
+    two_axis_figure(frame, "rec_rmse", f"reconstruction RMSE ({RMSE_UNITS})",
                     f"reconstruction RMSE — {label}")
 
 
@@ -967,7 +1004,8 @@ if len(timepoints):
 
         fig, axes = plt.subplots(len(files), 1, figsize=(13, 2.0 * len(files)),
                                  squeeze=False)
-        fig.suptitle(f"held-out reconstruction error over time — {label}")
+        fig.suptitle(f"held-out reconstruction error ({RMSE_UNITS}) "
+                     f"over time — {label}")
         for r, file in enumerate(files):
             ax = axes[r, 0]
             sub = frame[frame["file"] == file]
@@ -1014,7 +1052,7 @@ if len(timepoints):
 # all the way down the rows, no number of dimensions describes that minute, and
 # a single global embedding is the wrong object for this recording.
 
-HEATMAP_PANELS = (("rmse", "held-out RMSE", "magma", None),
+HEATMAP_PANELS = (("rmse", f"held-out RMSE ({RMSE_UNITS})", "magma", None),
                   ("var_ratio", "variance rebuilt / real", "RdBu_r", 1.0),
                   ("skew_diff", "skew rebuilt - real", "RdBu_r", 0.0),
                   ("kurt_diff", "kurtosis rebuilt - real", "RdBu_r", 0.0))
@@ -1080,7 +1118,7 @@ if len(minutes):
         ax.plot(grid.columns.values, grid.loc[row_k].values, "o-", ms=3,
                 color=METHOD_COLORS.get(method, "0.4"), label=f"{method} (k={row_k})")
     ax.set_xlabel("minute of recording")
-    ax.set_ylabel("held-out RMSE")
+    ax.set_ylabel(f"held-out RMSE ({RMSE_UNITS})")
     ax.legend(fontsize=8)
     fig.tight_layout()
     plt.show()
