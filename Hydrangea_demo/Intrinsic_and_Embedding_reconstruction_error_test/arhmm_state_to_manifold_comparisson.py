@@ -60,6 +60,13 @@ Cost. An iteration goes as samples x L x (n_lags * d + 1)^2, quadratic in the
 AR order and the number of observations — that is what separates this from a
 plain HMM. OBS_SPEC sets lag_span_s and n_lags; their ratio is the sampling
 step everything is built on.
+
+Citations:
+Fox, E. B., & Jordan, M. I. (2019). Mixed membership models for time series. In Handbook of mixed membership models and their applications (pp. 451-474). Chapman and Hall/CRC.
+- describes AR-HMM
+
+Fox, E., Sudderth, E. B., Jordan, M. I., & Willsky, A. S. (2011). Bayesian nonparametric inference of switching dynamic linear models. IEEE Transactions on signal processing, 59(4), 1569-1585.
+- described HDP the heiarchical dirhchel process, to make the AR-HMM sticky
 """
 
 # %% ===========================================================================
@@ -171,7 +178,7 @@ LFP_REGION_HINT = "ca1"
 # At 1250 Hz an AR order of 1 is a 0.8 ms lag, which is a very local question;
 # raise ARHMM_NLAGS to let the model see further back, at linear cost in the
 # design matrix.
-ARHMM_MINUTES = 10.0      # total data to fit; None = the whole epoch
+ARHMM_MINUTES = None      # None = the whole epoch; a number = that many minutes
 ARHMM_SEGMENT_S = 60.0    # length of each randomly placed segment
 ARHMM_SEGMENT_SEED = 0    # which random placement
 ARHMM_START_S = None      # a number = one contiguous window there instead
@@ -208,6 +215,21 @@ MAP_METHODS = ("PCA", "KernelPCA", "Laplacian")  # which get the 3d figures
 MAP_MAX_POINTS = 12000                           # scatter subsample
 
 ELBOW_DIMS = 40           # x-limit of the scree and reconstruction elbows
+
+# --- what the states look like ------------------------------------------------
+AR_MAP_LAGS = 5           # lags shown in the AR coefficient heatmaps
+SEQUENCE_LENGTHS = (2, 3, 4)   # sequence lengths counted, runs collapsed
+SEQUENCE_TOP = 12         # how many of each length to show
+
+# --- the subspace statistics --------------------------------------------------
+# T^2 is inside the retained subspace, Q the residual outside it. The null
+# shifts the state labels by up to Q_JITTER_S and re-reads them at the same
+# bins, which keeps both series' autocorrelation and breaks only the alignment.
+Q_DIMS = 10               # components retained for both statistics
+Q_MAX_SAMPLES = 4000
+Q_BOOT = 1000
+Q_JITTER_S = 1.0
+Q_SEED = 0
 
 EXAMPLE_WINDOW_S = 8.0
 SUGGEST_N = 6             # how many recordings to list as candidates
@@ -758,7 +780,9 @@ def load_scores(cache_dir=CACHE_DIR):
             f"{path} is missing — run reconstruction_error_test.py first, or "
             f"point CACHE_DIR at the folder its sweep filled")
     t0 = time.perf_counter()
-    scores = pd.read_csv(path, usecols=["file", "method", "k", "rec_corr"])
+    scores = pd.read_csv(path,
+                         usecols=["file", "method", "k", "rec_corr", "rec_rmse"])
+    scores["rec_mse"] = scores["rec_rmse"] ** 2
     print(f"read {len(scores)} scored folds from {path.name} "
           f"({time.perf_counter() - t0:.1f}s)")
     return scores
@@ -1502,12 +1526,16 @@ def _smooth_label(spec):
     return f"{spec.get('kind', 'gaussian')} {spec['sigma_s'] * 1e3:.0f}ms"
 
 
-def plot_observations(session, obs, seconds=4.0, start_s=None):
+def plot_observations(session, obs, seconds=4.0, start_s=None, fit=None):
     """What the AR-HMM is about to be trained on, as traces and as a matrix.
 
     Worth looking at before the sampler runs: a trace that is flat, clipped or
-    dominated by one excursion will make states that are about that, and it
-    takes an hour to find out the expensive way.
+    dominated by one excursion will make states that are about that. Speed is
+    drawn alongside although it is not an input, because the traces are easier
+    to read against what the animal was doing.
+
+    Passing `fit` shades the window by the inferred state, which is what to do
+    when re-running this after a fit rather than before one.
     """
     Y, names, kinds, t = obs["Y"], obs["names"], obs["kinds"], obs["t"]
     rate = obs["rate"]
@@ -1531,19 +1559,46 @@ def plot_observations(session, obs, seconds=4.0, start_s=None):
                  f"({len(names)} traces @ {rate:.0f} Hz)")
 
     ax = axes[0]
-    offset = 0.0
+    t_win = t[seg] - t[seg][0]
+    # Speed is not an input to the model. It is drawn here so the traces can
+    # be read against what the animal was doing, which is the thing the states
+    # are meant to be compared against later.
+    bins_win = np.arange(
+        max(int(np.searchsorted(session["edges"], t[seg[0]], "right") - 1), 0),
+        min(int(np.searchsorted(session["edges"], t[seg[-1]], "right")),
+            session["n_bins"]))
+    ax.plot(session["centers"][bins_win] - t[seg[0]],
+            zscore(session["speed"][bins_win]), lw=1.6, color="0.25",
+            label="speed (z)")
+    ax.legend(fontsize=7, loc="upper right")
+
+    offset = -6.0
     for j, (name, kind) in enumerate(zip(names, kinds)):
-        trace = Y[seg, j]
-        ax.plot(t[seg] - t[seg][0], trace + offset, lw=0.9,
+        ax.plot(t_win, Y[seg, j] + offset, lw=0.9,
                 color=observation_colour(name, kind))
-        ax.text(-0.01, offset, name.replace(f"MUA_", ""), fontsize=7,
+        ax.text(-0.01, offset, name.replace("MUA_", ""), fontsize=7,
                 ha="right", va="center", transform=ax.get_yaxis_transform(),
                 color=observation_colour(name, kind))
         offset -= 6.0
+    ax.text(-0.01, 0.0, "speed", fontsize=7, ha="right", va="center",
+            transform=ax.get_yaxis_transform(), color="0.25")
     ax.set_yticks([])
     ax.set_xlabel("time in window (s)")
     ax.set_title(f"{seconds:.1f} s from {t[first] - session['t_start']:.1f}s "
                  f"into the epoch (z, offset)", fontsize=9)
+
+    # state shading, when this is called after a fit rather than before one
+    if fit is not None:
+        in_window = (fit["state_index"] >= seg[0]) & (fit["state_index"] <= seg[-1])
+        if in_window.any():
+            labels = fit["states_obs"][in_window]
+            times = fit["t_states"][in_window] - t[seg[0]]
+            run_s, run_i, run_n = run_lengths(labels)
+            for s, i0, n in zip(run_s, run_i, run_n):
+                if s < 0:
+                    continue
+                ax.axvspan(times[i0], times[min(i0 + n, len(times) - 1)],
+                           color=fit["cmap"](s), alpha=0.18, lw=0, zorder=0)
 
     ax = axes[1]
     corr = np.corrcoef(Y.T)
@@ -1666,11 +1721,15 @@ def choose_segments(n_samples, rate, minutes, segment_s, start_s=None, seed=0):
     span the session, so a model fit on ten minutes is not ten minutes from
     one corner of it.
 
-    minutes=None takes the whole recording as a single segment. A number in
-    start_s overrides everything and takes one contiguous window there, which
-    is what to use when chasing a particular event.
+    minutes=None takes the whole recording as a single segment, which is the
+    only setting that cannot drop an event into a gap. A number in start_s
+    takes one contiguous window there instead, for chasing a particular event.
     """
     if minutes is None:
+        if start_s is not None:
+            raise ValueError(
+                "minutes=None fits the whole recording, so start_s has "
+                "nothing to place. Set one or the other.")
         return [np.arange(n_samples)]
     span = int(round(segment_s * rate))
     if span >= n_samples:
@@ -1722,10 +1781,12 @@ def fit_states(session, obs, minutes=ARHMM_MINUTES,
     print(f"    {len(segments)} segment(s), {total} samples at {rate:.0f} Hz "
           f"({total / rate / 60:.1f} min, "
           f"{100 * total / len(Y_all):.1f}% of the epoch)")
-    print(f"    placed at "
-          + ", ".join(f"{t_all[s[0]] - session['t_start']:.0f}s"
-                      for s in segments[:8])
-          + (" ..." if len(segments) > 8 else ""))
+    if len(segments) > 1:
+        print(f"    placed at "
+              + ", ".join(f"{t_all[s[0]] - session['t_start']:.0f}s"
+                          for s in segments[:8])
+              + (" ..." if len(segments) > 8 else "")
+              + " — events falling between them get no state label")
     print(f"    AR order {nlags} = {nlags / rate * 1e3:.0f} ms of lag | "
           f"p = nlags*d+1 = {p} | L={L}, kappa={kappa}, "
           f"<={max_iter} iterations")
@@ -1875,20 +1936,88 @@ def state_characterization(session, fit, verbose=True):
                           "oscillatory", "speed_bins", "speed_median"]]
                    .set_index("state").round(2))
         # observations down the rows, states across: with a dozen observations
-        # the other way round is far wider than a page
+        # the other way round is far wider than a page. The distributions
+        # behind these numbers are in plot_observation_distributions.
         print("\nthe observations by state (standardized; states across)")
         show_table(observation_by_state(table, names).round(2))
     return table
 
 
-def observation_by_state(state_table, names):
-    """Observations as rows, states as columns, mean and median side by side."""
+def plot_observation_distributions(session, fit, ncols=4):
+    """Each observation's distribution under each state, as violins.
+
+    The table of means and medians says where the centres sit; this says how
+    much of the spread is behind them. A state whose median is high because a
+    few samples are extreme looks different here from one that is shifted
+    throughout, and the two are the same number in a table.
+
+    Line is the median, diamond the mean. Speed is included although it is not
+    an input to the model, on the 50 ms grid rather than the observation grid.
+    """
+    z, n_states, cmap = fit["states_obs"], fit["n_states"], fit["cmap"]
+    names, kinds = fit["obs_names"], fit["obs_kinds"]
+    Y = fit["arhmm"]["Y"]
+
+    panels = [(n.replace("MUA_", ""), Y[:, j], observation_colour(n, k), z)
+              for j, (n, k) in enumerate(zip(names, kinds))]
+    panels.append(("speed (cm/s)", session["speed"], "0.25", fit["states"]))
+
+    nrows = int(np.ceil(len(panels) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 2.7 * nrows),
+                             squeeze=False)
+    fig.suptitle(f"{session['label']} — what each observation does in each "
+                 f"state (line = median, diamond = mean)")
+    for i, (title, values, colour, labels) in enumerate(panels):
+        ax = axes[i // ncols, i % ncols]
+        groups, positions = [], []
+        for s in range(n_states):
+            sel = (labels == s) & np.isfinite(values)
+            if sel.sum() > 1:
+                groups.append(values[sel])
+                positions.append(s)
+        if groups:
+            parts = ax.violinplot(groups, positions=positions, widths=0.8,
+                                  showmedians=True, showextrema=False)
+            for s, body in zip(positions, parts["bodies"]):
+                body.set_facecolor(cmap(s))
+                body.set_alpha(0.75)
+            parts["cmedians"].set_color("0.15")
+            parts["cmedians"].set_linewidth(1.4)
+            ax.plot(positions, [g.mean() for g in groups], "D", ms=5,
+                    color="0.15", zorder=3)
+        ax.axhline(0, color="k", lw=0.6, ls=":")
+        label_axis(ax, range(n_states), axis="x", fontsize=7)
+        ax.set_title(title, fontsize=9, color=colour)
+        ax.tick_params(labelsize=7)
+        if i // ncols == nrows - 1:
+            ax.set_xlabel("state", fontsize=8)
+    for i in range(len(panels), nrows * ncols):
+        axes[i // ncols, i % ncols].axis("off")
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
+def observation_by_state(state_table, names, extra=("speed_median",)):
+    """Observations as rows, states as columns, mean and median side by side.
+
+    `extra` names columns of state_table to append as further rows. Speed is
+    there by default: it is not an input to the model, so lining it up against
+    the states it never saw is the point.
+    """
+    rows = [n.replace("MUA_", "") for n in names] + list(extra)
+
+    def value(s, name, stat):
+        row = state_table[state_table["state"] == s]
+        if name in extra:
+            return row[name].iloc[0]
+        return row[f"{name}_{stat}"].iloc[0]
+
     frame = pd.DataFrame(
         {(f"state {int(s)}", stat):
-         [state_table.loc[state_table["state"] == s, f"{n}_{stat}"].iloc[0]
-          for n in names]
+         [value(s, n, stat) for n in list(names) + list(extra)]
          for s in state_table["state"] for stat in ("mean", "median")},
-        index=[n.replace("MUA_", "") for n in names])
+        index=rows)
     frame.index.name = "observation"
     return frame
 
@@ -1907,7 +2036,7 @@ def plot_arhmm(session, fit, state_table):
     t_rel = fit["t_states"] - session["t_start"]
     run_state, _, run_len = run_lengths(z, fit["segment_starts"])
 
-    fig, axes = plt.subplots(3, 2, figsize=(15, 10))
+    fig, axes = plt.subplots(4, 2, figsize=(15, 17), constrained_layout=True)
     fig.suptitle(f"{session['label']} — sticky HDP-AR-HMM on "
                  f"{len(names)} observations @ {fit['rate']:.0f} Hz "
                  f"({session['lfp_key']})")
@@ -1959,18 +2088,26 @@ def plot_arhmm(session, fit, state_table):
                  f"{100 * (z < 0).mean():.1f}% unlabelled)", fontsize=10)
 
     ax = axes[1, 1]
-    for s in range(n_states):
-        runs = run_len[run_state == s] * step_ms
-        if len(runs) < 2:
-            continue
-        ax.hist(runs, bins=np.logspace(np.log10(step_ms),
-                                       np.log10(max(runs.max(), 10 * step_ms)), 30),
-                histtype="step", lw=1.4, label=f"state {s}", color=cmap(s))
-    ax.set_xscale("log")
-    ax.set_xlabel("dwell time (ms)")
-    ax.set_ylabel("runs")
+    # Violins on log dwell time. The distributions span two decades and are
+    # heavily skewed, so a linear axis puts every state in the same bin.
+    dwell = [np.log10(run_len[run_state == s] * step_ms) for s in range(n_states)]
+    parts = ax.violinplot(dwell, positions=np.arange(n_states),
+                          showmedians=True, widths=0.8)
+    for s, body in enumerate(parts["bodies"]):
+        body.set_facecolor(cmap(s))
+        body.set_alpha(0.7)
+    for key in ("cmedians", "cbars", "cmins", "cmaxes"):
+        if key in parts:
+            parts[key].set_color("0.2")
+            parts[key].set_linewidth(1.0)
+    decades = np.arange(np.floor(min(v.min() for v in dwell)),
+                        np.ceil(max(v.max() for v in dwell)) + 1)
+    ax.set_yticks(decades)
+    ax.set_yticklabels([f"{10 ** e:g}" for e in decades], fontsize=8)
+    label_axis(ax, range(n_states), axis="x")
+    ax.set_xlabel("state")
+    ax.set_ylabel("dwell time (ms, log)")
     ax.set_title("how long each state lasts", fontsize=10)
-    ax.legend(fontsize=7, ncol=2)
 
     ax = axes[2, 0]
     width = 0.8 / max(n_states, 1)
@@ -1988,23 +2125,215 @@ def plot_arhmm(session, fit, state_table):
     ax.legend(fontsize=7, ncol=2, title="state", title_fontsize=7)
 
     ax = axes[2, 1]
-    trans = np.zeros((n_states, n_states))
-    pairs = (z[:-1] >= 0) & (z[1:] >= 0)
-    np.add.at(trans, (z[:-1][pairs], z[1:][pairs]), 1)
-    np.fill_diagonal(trans, 0)
-    trans = trans / np.maximum(trans.sum(axis=1, keepdims=True), 1)
-    im = ax.imshow(trans, cmap="magma", vmin=0, vmax=1, aspect="auto")
-    bar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    bar.set_label("P(next | leaving)", fontsize=8)
-    bar.ax.tick_params(labelsize=7)
+    trans = leaving_matrix(z, n_states)
+    # Sequential map over the range the off-diagonal actually occupies, with
+    # the numbers written in. At four states a matrix is a table, and reading
+    # a probability off a colour bar is worse than reading the digits.
+    im = ax.imshow(trans, cmap="Blues", vmin=0, vmax=float(trans.max()),
+                   aspect="auto")
+    for i in range(n_states):
+        for j in range(n_states):
+            if i == j:
+                continue
+            ax.text(j, i, f"{trans[i, j]:.2f}", ha="center", va="center",
+                    fontsize=8,
+                    color="white" if trans[i, j] > 0.6 * trans.max() else "0.2")
     label_axis(ax, range(n_states), axis="x")
     label_axis(ax, range(n_states), axis="y")
     ax.set_xlabel("to state")
     ax.set_ylabel("from state")
-    ax.set_title("where a state goes when it leaves", fontsize=10)
+    ax.set_title("where a state goes when it leaves (diagonal excluded)",
+                 fontsize=10)
+
+    # --- P(state), and the same transitions as a graph -----------------------
+    # The bar is the posterior median across the retained Gibbs draws and the
+    # whisker its 5-95%. The diamond is the one representative draw every
+    # other panel is built from, which is a sample and so need not sit at the
+    # median — seeing where it falls in the posterior is the point.
+    ax = axes[3, 0]
+    draws = np.array([[(zs == s).mean() for s in range(n_states)]
+                      for zs in _relabelled_draws(fit)])
+    representative = np.array([(z == s).mean() for s in range(n_states)])
+    centre = np.median(draws, axis=0)
+    ax.bar(np.arange(n_states), centre,
+           color=[cmap(s) for s in range(n_states)])
+    if len(draws) > 1:
+        lo, hi = np.percentile(draws, [5, 95], axis=0)
+        ax.errorbar(np.arange(n_states), centre,
+                    yerr=[centre - lo, hi - centre], fmt="none",
+                    ecolor="0.2", capsize=4, lw=1.2)
+    ax.plot(np.arange(n_states), representative, "D", ms=6, color="0.15",
+            zorder=3, label="representative draw")
+    for s, value in enumerate(centre):
+        ax.text(s, value, f"{value:.3f}", ha="center", va="bottom", fontsize=8)
+    label_axis(ax, range(n_states), axis="x")
+    ax.set_xlabel("state")
+    ax.set_ylabel("P(state)")
+    ax.set_ylim(0, min(1.0, max(centre.max(), representative.max()) * 1.3))
+    ax.legend(fontsize=7, loc="upper right")
+    ax.set_title("marginal state probability (median and 5-95% over draws)",
+                 fontsize=10)
+
+    plot_state_graph(axes[3, 1], trans, centre, cmap)
+    plt.show()
+    plt.close(fig)
+
+
+def plot_state_dynamics(session, fit, max_lags=AR_MAP_LAGS):
+    """The AR coefficient matrices that define each state, lag by lag.
+
+    A_k is d x (r*d + 1): columns [l*d : (l+1)*d] are the matrix carrying
+    y_{t-l-1} into y_t, and the last column is the intercept. Cell (i, j) of
+    the panel for state k and lag l is how observation j, l steps back,
+    contributes to observation i now. That is what distinguishes the states —
+    they share the same observations and differ in how those observations
+    predict each other.
+    """
+    names, d = fit["obs_names"], len(fit["obs_names"])
+    n_states, step_ms = fit["n_states"], 1e3 / fit["rate"]
+    lags = min(max_lags, fit["nlags"])
+    short = [n.replace("MUA_", "") for n in names]
+
+    blocks = np.array([
+        [fit["arhmm"]["As"][np.flatnonzero(fit["relabel"] == s)[0]]
+         [:, l * d:(l + 1) * d] for l in range(lags)]
+        for s in range(n_states)])                    # (states, lags, d, d)
+    limit = float(np.percentile(np.abs(blocks), 99))
+
+    fig, axes = plt.subplots(n_states, lags,
+                             figsize=(2.2 * lags + 2.5, 2.2 * n_states + 1),
+                             squeeze=False)
+    fig.suptitle(f"{session['label']} — AR coefficients by state and lag: "
+                 f"how each observation predicts the others")
+    for s in range(n_states):
+        for l in range(lags):
+            ax = axes[s, l]
+            im = ax.imshow(blocks[s, l], cmap="RdBu_r", vmin=-limit, vmax=limit)
+            if s == 0:
+                ax.set_title(f"lag {l + 1} ({(l + 1) * step_ms:.0f} ms)",
+                             fontsize=9)
+            if l == 0:
+                label_axis(ax, short, axis="y", fontsize=6)
+                ax.set_ylabel(f"state {s}", fontsize=9, labelpad=44,
+                              color=fit["cmap"](s))
+            else:
+                ax.set_yticks([])
+            if s == n_states - 1:
+                label_axis(ax, short, axis="x", rotation=90, fontsize=6)
+            else:
+                ax.set_xticks([])
+    bar = fig.colorbar(im, ax=axes, fraction=0.015, pad=0.02)
+    bar.set_label("coefficient (row = predicted, column = predictor)",
+                  fontsize=8)
+    bar.ax.tick_params(labelsize=7)
+    plt.show()
+    plt.close(fig)
+
+
+def state_sequences(fit, length=3):
+    """Counts of every run-collapsed state sequence of `length`.
+
+    Runs are collapsed first, so 0,0,0,1,1,2 counts as 0->1->2 once rather
+    than as a hundred repeats of 0->0. Sequences are taken within a segment
+    and broken at unlabelled samples, since neither gap is a transition.
+    """
+    z, bounds = fit["states_obs"], np.append(fit["segment_starts"],
+                                             len(fit["states_obs"]))
+    counts = {}
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        labels, _, _ = run_lengths(z[lo:hi])
+        # split on unlabelled runs: they are not a state the chain passed through
+        for piece in np.split(labels, np.flatnonzero(labels < 0)):
+            piece = piece[piece >= 0]
+            for i in range(len(piece) - length + 1):
+                key = tuple(int(v) for v in piece[i:i + length])
+                counts[key] = counts.get(key, 0) + 1
+    frame = pd.DataFrame({"sequence": [" → ".join(map(str, k))
+                                       for k in counts],
+                          "count": list(counts.values())})
+    return frame.sort_values("count", ascending=False).reset_index(drop=True)
+
+
+def plot_state_sequences(session, fit, lengths=SEQUENCE_LENGTHS,
+                         top=SEQUENCE_TOP):
+    """The most common run-collapsed state sequences, at a few lengths."""
+    fig, axes = plt.subplots(1, len(lengths), figsize=(5.0 * len(lengths), 4.4),
+                             squeeze=False)
+    fig.suptitle(f"{session['label']} — most common state sequences "
+                 f"(runs collapsed, so each arrow is one transition)")
+    for c, length in enumerate(lengths):
+        frame = state_sequences(fit, length).head(top)
+        ax = axes[0, c]
+        y = np.arange(len(frame))[::-1]
+        # colour each bar by the state it starts from
+        starts = [int(s.split(" ")[0]) for s in frame["sequence"]]
+        ax.barh(y, frame["count"], color=[fit["cmap"](s) for s in starts])
+        ax.set_yticks(y)
+        ax.set_yticklabels(frame["sequence"], fontsize=8)
+        ax.set_xlabel("times observed")
+        ax.set_title(f"length {length}", fontsize=10)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
+
+
+def leaving_matrix(z, n_states):
+    """P(next state | leaving), rows summing to one, diagonal zeroed.
+
+    kappa makes the self-transition dominate so completely that nothing else
+    is visible beside it, and the question the off-diagonal answers is where a
+    state goes once it does leave.
+    """
+    trans = np.zeros((n_states, n_states))
+    pairs = (z[:-1] >= 0) & (z[1:] >= 0)
+    np.add.at(trans, (z[:-1][pairs], z[1:][pairs]), 1)
+    np.fill_diagonal(trans, 0)
+    return trans / np.maximum(trans.sum(axis=1, keepdims=True), 1)
+
+
+def _relabelled_draws(fit):
+    """The retained state sequences, under the same labels as fit['states_obs']."""
+    relabel = fit["relabel"]
+    return [relabel[draw] for draw in fit["arhmm"]["z_samples"]]
+
+
+def plot_state_graph(ax, trans, occupancy, cmap, min_p=0.02):
+    """States on a circle, arrows for the transitions between them.
+
+    Node area is P(state) and arrow width is P(next | leaving). Curved so the
+    two directions of a pair do not overlap; edges below min_p are dropped to
+    keep the picture readable.
+    """
+    n = len(occupancy)
+    angles = np.linspace(np.pi / 2, np.pi / 2 - 2 * np.pi, n, endpoint=False)
+    xy = np.column_stack([np.cos(angles), np.sin(angles)])
+
+    widest = trans.max() if trans.max() > 0 else 1.0
+    for i in range(n):
+        for j in range(n):
+            if i == j or trans[i, j] < min_p:
+                continue
+            ax.annotate(
+                "", xy=xy[j], xytext=xy[i],
+                arrowprops=dict(arrowstyle="-|>",
+                                connectionstyle="arc3,rad=0.18",
+                                color=cmap(i), alpha=0.75,
+                                shrinkA=18, shrinkB=18,
+                                lw=0.6 + 4.0 * trans[i, j] / widest))
+    sizes = 600 + 2400 * occupancy / max(occupancy.max(), 1e-9)
+    ax.scatter(xy[:, 0], xy[:, 1], s=sizes,
+               color=[cmap(s) for s in range(n)], zorder=3,
+               edgecolors="0.2", linewidths=1.0)
+    for s in range(n):
+        ax.text(xy[s, 0], xy[s, 1], str(s), ha="center", va="center",
+                fontsize=10, zorder=4,
+                color="white" if occupancy[s] > 0.4 else "0.1")
+    ax.set_xlim(-1.5, 1.5)
+    ax.set_ylim(-1.5, 1.5)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title("transition graph — node area P(state), arrow width "
+                 "P(next | leaving)", fontsize=10)
 
 
 # -----------------------------------------------------------------------------
@@ -2043,15 +2372,15 @@ def plot_elbows(session, embeddings, scores, max_dims=ELBOW_DIMS):
     in ascending graph-Laplacian order, so the curve is not expected to decay
     and a flat one is information rather than a bug.
 
-    Right: this recording's own reconstruction curve from the sweep, which is
-    the elbow that matters for how many dimensions to keep.
+    Right: this recording's held-out reconstruction MSE from the sweep, which
+    is the elbow that matters for how many dimensions to keep.
     """
     methods = list(embeddings)
     mine = scores[scores["file"] == session["file"]]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
-    fig.suptitle(f"{session['label']} — elbows: embedding spectrum, and "
-                 f"reconstruction against dimensions")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.6))
+    fig.suptitle(f"{session['label']} — embedding spectrum, and "
+                 f"reconstruction MSE against dimensions")
 
     ax = axes[0]
     twin = ax.twinx()
@@ -2088,7 +2417,7 @@ def plot_elbows(session, embeddings, scores, max_dims=ELBOW_DIMS):
     ax = axes[1]
     for method in methods:
         sub = (mine[mine["method"] == method]
-               .groupby("k", as_index=False)["rec_corr"].mean()
+               .groupby("k", as_index=False)["rec_mse"].mean()
                .sort_values("k"))
         if not len(sub):
             raise ValueError(
@@ -2096,19 +2425,18 @@ def plot_elbows(session, embeddings, scores, max_dims=ELBOW_DIMS):
                 f"although its embedding loaded. The sweep and the cache "
                 f"disagree about what was scored.")
         colour = METHOD_COLORS[method]
-        ax.plot(sub["k"], sub["rec_corr"], color=colour, lw=1.8, label=method)
+        ax.plot(sub["k"], sub["rec_mse"], color=colour, lw=1.8, label=method)
         cut = sub[sub["k"] <= max_dims]
-        knee = knee_point(cut["k"].values, cut["rec_corr"].values)
+        knee = knee_point(cut["k"].values, cut["rec_mse"].values)
         kk = cut["k"].values[knee]
         ax.axvline(kk, color=colour, ls=":", lw=1.0)
-        ax.annotate(f"k={kk}", (kk, cut["rec_corr"].values[knee]),
+        ax.annotate(f"k={kk}", (kk, cut["rec_mse"].values[knee]),
                     textcoords="offset points", xytext=(5, -10),
                     fontsize=7, color=colour)
     ax.set_xlim(1, max_dims)
     ax.set_xlabel("number of dimensions kept")
-    ax.set_ylabel("corr(real, rebuilt) on held-out bins [$r$]")
-    ax.set_title("how well k dimensions rebuild the activity", fontsize=9)
-    ax.legend(fontsize=8, loc="lower right")
+    ax.set_ylabel("held-out reconstruction MSE")
+    ax.legend(fontsize=8, loc="upper right")
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -2156,7 +2484,7 @@ def cv_mse(Y_sub, X, splits):
 
 RANK_SCORE_LABEL = {
     "variance": "share of embedding variance",
-    "drop_one_mse": "increase in held-out MSE when dropped",
+    "drop_one_mse": "reconstruction loss when dropped ($\\Delta$MSE)",
 }
 
 
@@ -2166,43 +2494,48 @@ def component_variance(embeddings, method, dims):
     return (var / var.sum())[:int(min(dims, len(var)))]
 
 
-def rank_components(session, embeddings, by="variance", methods=METHODS,
+def rank_components(session, embeddings, by, methods=METHODS,
                     dims=RANK_DIMS, folds=RANK_FOLDS,
                     max_samples=RANK_MAX_SAMPLES, seed=RANK_SEED, top_n=TOP_N,
                     verbose=True):
     """Order each method's components by a score, biggest first.
 
-    by="variance" scores each component by its share of the embedding's
-    variance. For PCA and kernel PCA that is the eigenvalue spectrum and the
-    ranking simply confirms the method's own order; for Laplacian eigenmaps,
-    whose components come out in ascending graph-Laplacian order, it does not.
-    Cheap — no model is fit.
+    `by` is one criterion for every method, or a dict naming one per method.
 
-    by="drop_one_mse" reconstructs from the first `dims` components, then
-    again with one removed, and scores each by the increase in held-out MSE.
-    It answers a different question — what a component is worth to the
-    reconstruction rather than how much of the embedding it spans — and costs
-    (dims + 1) x folds LLE solves per method, which is minutes.
+    "variance" scores each component by its share of the embedding's variance.
+    For PCA that is the eigenvalue spectrum, which is the natural order for
+    it. Free — no model is fit.
+
+    "drop_one_mse" reconstructs from the first `dims` components, then again
+    with one removed, and scores each by the increase in held-out MSE. This is
+    the criterion for kernel PCA and Laplacian eigenmaps, whose components do
+    not come out in an order that means anything for reconstruction — the
+    Laplacian's are in ascending graph-Laplacian order, which is smoothness.
+    Costs (dims + 1) x folds LLE solves per method.
 
     Returns {method: component order} and a long frame with one row per
-    component carrying `score` and `rank`.
+    component carrying `score`, `rank` and the `criterion` used.
     """
     missing = [m for m in methods if m not in embeddings]
     if missing:
         raise KeyError(f"no embedding loaded for {missing} — pass the methods "
                        f"you have, which are {list(embeddings)}")
-    if by not in RANK_SCORE_LABEL:
-        raise ValueError(f"by must be one of {list(RANK_SCORE_LABEL)}, "
-                         f"got {by!r}")
+    criteria = ({m: by for m in methods} if isinstance(by, str)
+                else {m: by[m] for m in methods})
+    bad = {m: c for m, c in criteria.items() if c not in RANK_SCORE_LABEL}
+    if bad:
+        raise ValueError(f"criteria must be one of {list(RANK_SCORE_LABEL)}, "
+                         f"got {bad}")
     if verbose:
-        detail = (f"{dims} dims, {folds} folds, <= {max_samples} samples"
-                  if by == "drop_one_mse" else f"{dims} dims")
-        print(f"\nranking components by {by} ({detail})")
+        print("\nranking components: "
+              + ", ".join(f"{m} by {c}" for m, c in criteria.items())
+              + f" (first {dims} components)")
 
     ranking, frames = {}, []
     for method in methods:
+        criterion = criteria[method]
         t0 = time.perf_counter()
-        if by == "variance":
+        if criterion == "variance":
             score = component_variance(embeddings, method, dims)
         else:
             idx = embeddings[method]["idx"]
@@ -2221,8 +2554,9 @@ def rank_components(session, embeddings, by="variance", methods=METHODS,
 
         order = np.argsort(-score)
         frames.append(pd.DataFrame({
-            "method": method, "component": np.arange(len(score)),
-            "score": score, "rank": np.argsort(np.argsort(-score))}))
+            "method": method, "criterion": criterion,
+            "component": np.arange(len(score)), "score": score,
+            "rank": np.argsort(np.argsort(-score))}))
         ranking[method] = order
         if verbose:
             print(f"    {method:10s} top {top_n}: "
@@ -2234,51 +2568,176 @@ def rank_components(session, embeddings, by="variance", methods=METHODS,
     return ranking, table
 
 
-def plot_ranking(session, rank_table, dims=RANK_DIMS, top_n=TOP_N):
-    """The component score, in the method's own order and in ranked order.
+def monitoring_statistics(session, embeddings, method, dims=Q_DIMS,
+                          folds=RANK_FOLDS, max_samples=Q_MAX_SAMPLES,
+                          seed=RANK_SEED):
+    """The two standard subspace-monitoring statistics, per sample.
 
-    Top row is the score against the index the method returned, so a method
-    whose order already matches the ranking shows a monotone decay and one
-    that does not shows a scramble. Bottom row is the same numbers sorted,
-    which is the elbow: how quickly the components stop being worth anything.
+    T^2 is Hotelling's, inside the retained subspace: the sum over the kept
+    components of the squared score divided by that component's variance, so
+    it measures how far a sample sits from the centre along directions the
+    embedding does keep.
+
+    Q is the squared prediction error, outside it: the squared norm of the
+    held-out reconstruction residual, so it measures what the embedding does
+    not account for at all. Cross-validated, since the LLE map would otherwise
+    rebuild each point from itself.
+
+    Returns (bin indices, T2, Q) on the manifold's 50 ms grid.
     """
-    by = rank_table.attrs.get("by", "variance")
-    ylabel = RANK_SCORE_LABEL[by]
-    methods = list(dict.fromkeys(rank_table["method"]))
-    fig, axes = plt.subplots(2, len(methods), figsize=(5.2 * len(methods), 7.5),
+    idx = embeddings[method]["idx"]
+    take = np.arange(len(idx))
+    if len(take) > max_samples:
+        take = np.unique(np.linspace(0, len(idx) - 1, max_samples).astype(int))
+    k = int(min(dims, embeddings[method]["scaled"].shape[1]))
+    Y = embeddings[method]["scaled"][np.ix_(take, np.arange(k))]
+    X = session["X"][idx[take]]
+
+    t2 = ((Y - Y.mean(axis=0)) ** 2 / (Y.var(axis=0) + 1e-12)).sum(axis=1)
+    q = np.full(len(X), np.nan)
+    for train, test in KFold(n_splits=folds, shuffle=True,
+                             random_state=seed).split(X):
+        resid = X[test] - lle_reconstruct(Y[train], X[train], Y[test])
+        q[test] = (resid ** 2).sum(axis=1)
+    return idx[take], t2, q
+
+
+def state_statistic_null(states_full, bins, values, n_states,
+                         n_boot=Q_BOOT, jitter_s=Q_JITTER_S,
+                         bin_size_s=BIN_SIZE_S, seed=Q_SEED):
+    """Per-state means of `values`, against a circularly shifted null.
+
+    The null shifts the whole state sequence by a random offset of up to
+    jitter_s and re-reads the labels at the same bins. That keeps the dwell
+    structure and the local autocorrelation of both series intact and breaks
+    only their alignment, so a state that stands out did so because of which
+    samples it holds rather than because states are long and Q is smooth.
+
+    Returns the observed means, the (n_boot x n_states) null, and the
+    one-sided p for observing a mean at least this high.
+    """
+    rng = np.random.default_rng(seed)
+    max_shift = max(int(round(jitter_s / bin_size_s)), 1)
+    ok = np.isfinite(values)
+
+    def means(labels):
+        out = np.full(n_states, np.nan)
+        for s in range(n_states):
+            sel = ok & (labels == s)
+            if sel.any():
+                out[s] = values[sel].mean()
+        return out
+
+    observed = means(states_full[bins])
+    null = np.empty((n_boot, n_states))
+    for b in range(n_boot):
+        shift = int(rng.integers(1, max_shift + 1))
+        if rng.random() < 0.5:
+            shift = -shift
+        null[b] = means(np.roll(states_full, shift)[bins])
+    p = np.array([np.nanmean(null[:, s] >= observed[s]) if np.isfinite(observed[s])
+                  else np.nan for s in range(n_states)])
+    return observed, null, p
+
+
+def plot_state_monitoring(session, embeddings, fit, methods=MAP_METHODS,
+                          dims=Q_DIMS, n_boot=Q_BOOT, jitter_s=Q_JITTER_S,
+                          verbose=True):
+    """T^2 and Q per state, each against its circular-shift null.
+
+    Two rows per method is too many panels, so T^2 is the top row and Q the
+    bottom, one column per method. The violin is the null, the marker the
+    observed mean, and the p is the fraction of shifted label sets reaching
+    that mean or higher.
+    """
+    n_states, cmap = fit["n_states"], fit["cmap"]
+    fig, axes = plt.subplots(2, len(methods), figsize=(4.8 * len(methods), 8),
                              squeeze=False)
-    fig.suptitle(f"{session['label']} — component ranking by {by} "
-                 f"(first {dims} components)")
+    fig.suptitle(f"{session['label']} — subspace statistics by state, against "
+                 f"{n_boot} label shifts of up to {jitter_s:.0f} s "
+                 f"({dims} components)")
+
+    rows = []
     for c, method in enumerate(methods):
-        sub = rank_table[rank_table["method"] == method]
+        bins, t2, q = monitoring_statistics(session, embeddings, method, dims)
+        for r, (values, label) in enumerate(((t2, "Hotelling $T^2$"),
+                                             (q, "Q (squared residual)"))):
+            observed, null, p = state_statistic_null(
+                fit["states"], bins, values, n_states, n_boot, jitter_s,
+                session["bin_size_s"])
+            ax = axes[r, c]
+            keep = [s for s in range(n_states) if np.isfinite(observed[s])
+                    and np.isfinite(null[:, s]).all()]
+            if keep:
+                parts = ax.violinplot([null[:, s] for s in keep],
+                                      positions=keep, widths=0.8,
+                                      showextrema=False)
+                for body in parts["bodies"]:
+                    body.set_facecolor("0.75")
+                    body.set_alpha(0.8)
+            for s in range(n_states):
+                if not np.isfinite(observed[s]):
+                    continue
+                ax.plot(s, observed[s], "D", ms=9, color=cmap(s),
+                        mec="0.2", mew=1.0, zorder=3)
+                ax.annotate(f"p={p[s]:.3f}", (s, observed[s]),
+                            textcoords="offset points", xytext=(0, 11),
+                            ha="center", fontsize=7)
+            label_axis(ax, range(n_states), axis="x")
+            ax.set_xlabel("state")
+            ax.set_ylabel(label, fontsize=9)
+            if r == 0:
+                ax.set_title(method, fontsize=10)
+            rows += [{"method": method, "statistic": label.split(" ")[0],
+                      "state": s, "observed": observed[s],
+                      "null_mean": float(np.nanmean(null[:, s])),
+                      "p": p[s]} for s in range(n_states)]
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+    table = pd.DataFrame(rows)
+    if verbose:
+        print("\nsubspace statistics by state (p = share of shifted label "
+              "sets reaching the observed mean or higher)")
+        show_table(table.set_index(["method", "statistic", "state"]).round(4))
+    return table
+
+
+def plot_ranking(session, rank_table, dims=RANK_DIMS, top_n=TOP_N):
+    """Each method's components in ranked order, with the elbow marked.
+
+    One panel per method, sorted descending by that method's own criterion.
+    The x axis is rank, so the component index each rank belongs to is
+    annotated above the first `top_n` points. The dotted line is the elbow.
+    """
+    methods = list(dict.fromkeys(rank_table["method"]))
+    fig, axes = plt.subplots(1, len(methods), figsize=(5.0 * len(methods), 4.2),
+                             squeeze=False)
+    fig.suptitle(f"{session['label']} — components ranked, first {dims}")
+    for c, method in enumerate(methods):
+        sub = rank_table[rank_table["method"] == method].sort_values("rank")
+        criterion = sub["criterion"].iloc[0]
         colour = METHOD_COLORS[method]
 
         ax = axes[0, c]
-        colours = ["#d62728" if r < top_n else colour for r in sub["rank"]]
-        ax.bar(sub["component"], sub["score"], color=colours)
+        values = sub["score"].values
+        rank_x = np.arange(1, len(values) + 1)
+        ax.plot(rank_x, values, "o-", ms=4, color=colour)
         ax.axhline(0, color="k", lw=0.8)
-        # component index is a label, not a measurement — one tick each
-        label_axis(ax, sub["component"].tolist(), axis="x", fontsize=7)
-        ax.set_xlabel("component (as the method returns it)")
-        if c == 0:
-            ax.set_ylabel(ylabel)
-        ax.set_title(f"{method} — top {top_n} in red", fontsize=10)
-
-        ax = axes[1, c]
-        sorted_values = np.sort(sub["score"].values)[::-1]
-        rank_x = np.arange(1, len(sorted_values) + 1)
-        ax.plot(rank_x, sorted_values, "o-", ms=4, color=colour)
-        ax.axhline(0, color="k", lw=0.8)
-        knee = knee_point(rank_x, sorted_values)
-        ax.axvline(rank_x[knee], color=colour, ls=":", lw=1.2)
-        ax.annotate(f"elbow at {rank_x[knee]}",
-                    (rank_x[knee], sorted_values[knee]),
-                    textcoords="offset points", xytext=(6, 6), fontsize=8,
-                    color=colour)
+        knee = knee_point(rank_x, values)
+        ax.axvline(rank_x[knee], color="k", ls=":", lw=1.2)
+        ax.annotate(f"elbow at {rank_x[knee]}", (rank_x[knee], values[knee]),
+                    textcoords="offset points", xytext=(6, 8), fontsize=8)
+        # which component each of the leading ranks actually is
+        for r in range(min(top_n, len(values))):
+            ax.annotate(f"#{sub['component'].iloc[r]}",
+                        (rank_x[r], values[r]), textcoords="offset points",
+                        xytext=(0, 9), ha="center", fontsize=7, color=colour)
         label_axis(ax, rank_x.tolist(), axis="x", fontsize=7)
-        ax.set_xlabel("component, ranked")
-        if c == 0:
-            ax.set_ylabel(ylabel)
+        ax.set_xlabel("rank")
+        ax.set_ylabel(RANK_SCORE_LABEL[criterion], fontsize=9)
+        ax.set_title(f"{method} — by {criterion}", fontsize=10)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -2449,23 +2908,32 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
     span = int(round(window_s * fit["rate"]))
 
     if start_s is None:
-        # The window must sit inside one segment: the samples either side of a
-        # join are minutes apart, so a window spanning one would draw a jump
-        # in time as a jump in the data.
+        # The window showing the most distinct states, with the number of
+        # state changes breaking ties — a window covering every state is more
+        # use than one that switches often between two of them. It must sit
+        # inside one segment: the samples either side of a join are minutes
+        # apart, so a window spanning one would draw a jump in time as a jump
+        # in the data.
         bounds = np.append(fit["segment_starts"], len(z))
         changes = np.concatenate(([0.0], (np.diff(z) != 0).astype(float)))
         changes[fit["segment_starts"][1:]] = 0.0
-        best, first = -1.0, 0
+        best, first = (-1, -1.0), 0
         for lo, hi in zip(bounds[:-1], bounds[1:]):
             if hi - lo < span:
                 continue
             density = np.convolve(changes[lo:hi], np.ones(span), mode="valid")
-            j = int(np.argmax(density))
-            if density[j] > best:
-                best, first = float(density[j]), int(lo + j)
-        print(f"\nstart_s is None — busiest window in any segment: "
-              f"{best:.0f} state changes starting "
-              f"{t_states[first] - t0:.1f}s into the epoch")
+            # one-hot per state, boxcar-summed, counts each state's presence
+            present = np.stack([
+                np.convolve((z[lo:hi] == s).astype(float), np.ones(span),
+                            mode="valid") > 0
+                for s in range(fit["n_states"])]).sum(axis=0)
+            for j in range(len(density)):
+                score = (int(present[j]), float(density[j]))
+                if score > best:
+                    best, first = score, int(lo + j)
+        print(f"\nstart_s is None — window covering the most states: "
+              f"{best[0]} of {fit['n_states']} states, {best[1]:.0f} changes, "
+              f"starting {t_states[first] - t0:.1f}s into the epoch")
     else:
         first = int(np.clip(np.searchsorted(t_states - t0, start_s),
                             0, max(len(z) - span, 0)))
@@ -2496,6 +2964,12 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
                 continue
             ax.axvspan(t_win[i0], t_win[min(i0 + n, len(t_win) - 1)],
                        color=cmap(s), alpha=0.18, lw=0)
+    # a key for the shading, above the figure rather than inside any panel
+    present_states = sorted({int(s) for s in z[seg] if s >= 0})
+    fig.legend(handles=[Patch(facecolor=cmap(s), alpha=0.5, label=f"state {s}")
+                        for s in present_states],
+               loc="upper right", ncol=len(present_states) or 1, fontsize=8,
+               frameon=False, bbox_to_anchor=(0.995, 0.985))
 
     t_bins = session["centers"][bins_win] - win_t0
     ax = axes[0]
@@ -2646,15 +3120,15 @@ OBS_SPEC = {
         # CA1 interneurons is a matter of deleting the line. None here means
         # every pair the recording has. A pair it lacks is an error.
         "groups": [
-            ("CA1", "Pyramidal Cell"),
-            ("CA1", "Narrow Interneuron"),
-            ("CA1", "Wide Interneuron"),
+            #("CA1", "Pyramidal Cell"),
+            #("CA1", "Narrow Interneuron"),
+            #("CA1", "Wide Interneuron"),
             ("CA3", "Pyramidal Cell"),
             ("CA3", "Narrow Interneuron"),
-            ("CA3", "Wide Interneuron"),
+            #("CA3", "Wide Interneuron"),
             ("RSC", "Pyramidal Cell"),
             ("RSC", "Narrow Interneuron"),
-            ("RSC", "Wide Interneuron"),
+            #("RSC", "Wide Interneuron"),
         ],
         "min_units": 3,          # smaller pairs are reported, not used
         # counts in each bin divided by that population's own spike total, so
@@ -2667,10 +3141,15 @@ OBS_SPEC = {
     },
 }
 
-# Segments are placed one per equal block of the recording at a random offset,
-# so this is 10 min from across the session, not 10 min of one corner.
-# RUN_START_S as a number takes a single contiguous window there instead.
-RUN_MINUTES = 10.0
+# How much data, and from where.
+#   None          the whole recording, one segment. The only setting that
+#                 cannot drop an event into a gap between segments.
+#   a number      that many minutes, as RUN_SEGMENT_S windows placed one per
+#                 equal block of the recording at a random offset, so it
+#                 spans the session rather than one corner of it.
+# RUN_START_S as a number takes a single contiguous window there instead, and
+# is not combinable with RUN_MINUTES=None.
+RUN_MINUTES = None
 RUN_SEGMENT_S = 60.0
 RUN_SEGMENT_SEED = 0
 RUN_START_S = None
@@ -2690,16 +3169,31 @@ RUN_GEWEKE_TOL = 2.0          # |z| below this counts as stationary
 RUN_KAPPA = 50.0              # sticky bias: bigger = longer dwell times
 RUN_L = 20                    # truncation; raise it if K_hat lands on L-1
 RUN_WINDOW_S = 8.0
-RUN_WINDOW_START_S = None     # None = the busiest window in the segment
+RUN_WINDOW_START_S = None     # None = the window covering the most states
 RUN_METHODS = ("PCA", "KernelPCA", "Laplacian")
 
-# How components are ordered, and so which three the manifold figures draw.
-#   "variance"      each component's share of the embedding's variance. For
-#                   PCA and kernel PCA this is the eigenvalue spectrum. Free.
-#   "drop_one_mse"  the increase in held-out reconstruction MSE when that
-#                   component is removed. A different question, and minutes
-#                   per method rather than instant.
-RUN_RANK_BY = "variance"
+# What the states look like as dynamics, and the order they come in.
+RUN_AR_MAP_LAGS = 5           # lags shown in the AR coefficient heatmaps
+RUN_SEQUENCE_LENGTHS = (2, 3, 4)
+
+# T^2 (inside the retained subspace) and Q (the residual outside it) per
+# state, each against a null that shifts the state labels by up to
+# RUN_Q_JITTER_S. A low p means the manifold treats that state differently
+# from a set of labels with the same dwell structure placed elsewhere.
+RUN_Q_DIMS = 10
+RUN_Q_BOOT = 1000
+RUN_Q_JITTER_S = 1.0
+
+# How each method's components are ordered, and so which three the manifold
+# figures draw. PCA by its eigenvalues, which is its own natural order; the
+# other two by what dropping a component costs the reconstruction, since
+# neither returns components in an order that means anything for rebuilding
+# the activity. "drop_one_mse" costs (RANK_DIMS + 1) x RANK_FOLDS LLE solves.
+RUN_RANK_BY = {
+    "PCA": "variance",
+    "KernelPCA": "drop_one_mse",
+    "Laplacian": "drop_one_mse",
+}
 
 print("=" * 78)
 print("HDP-AR-HMM states against the cached manifold embeddings")
@@ -2734,10 +3228,21 @@ fit = fit_states(session, obs, minutes=RUN_MINUTES, segment_s=RUN_SEGMENT_S,
                  kappa=RUN_KAPPA, L=RUN_L)
 state_table = state_characterization(session, fit)
 plot_arhmm(session, fit, state_table)
+plot_observation_distributions(session, fit)
+plot_observations(session, obs, fit=fit)   # again, now shaded by state
+
+# 6b. what the states are as dynamics, and the order they come in
+plot_state_dynamics(session, fit, max_lags=RUN_AR_MAP_LAGS)
+plot_state_sequences(session, fit, lengths=RUN_SEQUENCE_LENGTHS)
 
 # 7. order the components, and take the top three into the figures below
 ranking, rank_table = rank_components(session, embeddings, by=RUN_RANK_BY)
 plot_ranking(session, rank_table)
+
+# 7b. is any state harder for the manifold than the label shuffle expects?
+q_table = plot_state_monitoring(session, embeddings, fit, methods=RUN_METHODS,
+                                dims=RUN_Q_DIMS, n_boot=RUN_Q_BOOT,
+                                jitter_s=RUN_Q_JITTER_S)
 
 # 8. the manifolds and the components, against behaviour and band power
 for method in RUN_METHODS:
