@@ -1,25 +1,37 @@
 """Sticky HDP-AR-HMM states of the CA1 LFP, against the manifold embeddings.
 
-Two cells. CELL 1 is definitions only — config, the sampler, the loaders, the
-scoring and the figures — and runs nothing, so it is the thing that becomes a
-module once this settles. CELL 2 is the run: pick a recording, load it, fit,
-rank, plot. Testing one recording at a time for now; the sweep over all
-sixteen comes later and will call the same functions.
+Three cells.
+
+CELL 1  definitions only — config, the sampler, the loaders, the scoring and
+        the figures. Runs nothing, so it is the thing that becomes a module
+        once this settles.
+CELL 2  surveys the recordings: units per region and cell type, and how
+        typical each one's reconstruction is.
+CELL 3  takes a recording name and does the work. OBS_SPEC lives here — what
+        the AR-HMM is trained on, how each input is smoothed, whether it is
+        z-scored. That is the thing being tinkered with, so it sits with the
+        run: change it, re-run the cell, look at the observation plot, repeat.
+
+The states are defined on the CA1 LFP's band power together with the
+multi-unit activity of each region's cell-type populations, at the LFP's own
+sampling rate rather than the 50 ms manifold grid — a state boundary is a
+physical event, and binning it to 50 ms before looking for it throws away the
+thing being measured. OBS_SPEC decides exactly which traces go in.
 
 The embeddings are not refit here. They are read back from the cache that
 reconstruction_error_test.py wrote, so this is fast and the geometry it plots
-is exactly the geometry that was scored there.
+is exactly the geometry that was scored there. Those were fit on every unit in
+the recording, which is why the MUA covers every region too: the manifold is
+not a CA1 object even when the LFP is.
 
-What CELL 2 does
-    1. suggest a recording: the one whose activity-reconstruction curve sits
-       closest to the average across the sixteen, so the example is typical
-       rather than an outlier. RECORDING overrides the suggestion.
-    2. rebuild that session's 50 ms bin grid exactly as the sweep did, and
+What CELL 3 does
+    1. rebuild the session's 50 ms bin grid exactly as the sweep did, and
        check it against the cached embeddings before using them
-    3. band power on the CA1 LFP (low theta, high theta, gamma, ripple),
-       Hilbert envelope, binned to the same 50 ms grid
-    4. fit the sticky HDP-AR-HMM to those four band traces at AR order 1, so
-       one lag is one 50 ms bin and the number of states is inferred
+    2. build the observation traces from OBS_SPEC and show them, so the inputs
+       can be looked at before an hour is spent sampling
+    3. fit the sticky HDP-AR-HMM, with the number of states inferred
+    4. elbow plots: the eigenvalue spectrum of each embedding, and this
+       recording's own reconstruction curve against dimensions
     5. rank each method's components by what dropping one does to held-out
        reconstruction MSE — not by eigenvalue order, which is a smoothness
        ordering for Laplacian eigenmaps and means nothing for reconstruction
@@ -29,12 +41,20 @@ What CELL 2 does
 
 Nothing is written to disk. Everything is print() and plt.show().
 
-A note on resolution. PCA was fit on every bin, kernel PCA and Laplacian
-eigenmaps on every tenth (they build an n x n matrix and cannot take 50k bins).
-So the Laplacian embedding exists at 500 ms and the PCA one at 50 ms. Anything
-that compares them is evaluated on the coarse grid, and the example window
-shows the Laplacian as markers to keep that visible rather than hiding it
-behind interpolation.
+Two things to keep in mind.
+
+Resolution. PCA was fit on every bin, kernel PCA and Laplacian eigenmaps on
+every tenth (they build an n x n matrix and cannot take 50k bins). So the
+Laplacian embedding exists at 500 ms and the PCA one at 50 ms. The example
+window draws anything coarser than one bin as markers, to keep that visible
+rather than hiding it behind interpolation.
+
+Coverage. The sampler's state step is a Python loop over time, so fitting at
+1250 Hz means fitting a segment, not a session: a minute of LFP is already 75k
+samples. Only the bins inside that segment carry a state label, and the
+manifold figures draw the rest in grey so the gap is visible. RUN_SECONDS is
+the knob, and OBS_SPEC["decimate"] trades resolution for coverage if you want
+the whole session instead.
 """
 
 # %% ===========================================================================
@@ -45,6 +65,7 @@ behind interpolation.
 import gc
 import re
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -76,6 +97,11 @@ RATE_TRANSFORM = "zscore"
 MIN_RATE_HZ = 0.0
 EPOCH = "maze"
 
+# --- where things live in the unit metadata -----------------------------------
+REGION_FIELD = "cell_area"
+CELL_TYPE_FIELD = "cell_type"
+FOCUS_REGION = "CA1"        # whose LFP is used; the MUA covers every region
+
 # --- LFP bands ----------------------------------------------------------------
 # Same as UMAP_EDA/umap_power.py: the only clear peak on this channel is theta,
 # sitting high, so it is split into a low and a high half.
@@ -85,31 +111,56 @@ BANDS = {
     "gamma": (30.0, 90.0),
     "ripple": (120.0, 200.0),
 }
-BAND_COLORS = {"low_theta": "#2ca02c", "high_theta": "#1f77b4",
-               "gamma": "#ff7f0e", "ripple": "#c2338f"}
-# Prefer a CA1 channel if the file names one; otherwise take the only LFP there
-# is and say which it was.
+BAND_COLORS = {
+    "low_theta": "#2ca02c",
+    "high_theta": "#1f77b4",
+    "gamma": "#ff7f0e",
+    "ripple": "#c2338f",
+}
+# Regions and cell types get fixed colours so they read the same in every
+# figure and across recordings. Anything unlisted falls back to grey.
+REGION_COLORS = {
+    "CA1": "#d62728",
+    "CA3": "#1f77b4",
+    "RSC": "#2ca02c",
+    "unknown": "0.6",
+    "all": "0.4",
+}
+CELL_TYPE_COLORS = {
+    "pyramidal": "#8c564b", "pyr": "#8c564b", "excitatory": "#8c564b",
+    "exc": "#8c564b", "wide": "#8c564b",
+    "interneuron": "#17becf", "int": "#17becf", "inhibitory": "#17becf",
+    "inh": "#17becf", "narrow": "#17becf",
+    "unknown": "0.6",
+}
+# Cosmetic only. A region or cell type nobody assigned a colour still gets
+# drawn, in grey — this is the one place a default is right, because the
+# alternative is a figure that refuses to render over a palette entry.
+FALLBACK_COLOR = "0.5"
+
+# Which LFP series to take. pick_lfp_key raises rather than settling for a
+# different region, since every figure here says CA1.
 LFP_REGION_HINT = "ca1"
 
+# What the AR-HMM is trained on lives in CELL 3, next to the rest of the run
+# knobs — it is the thing being tinkered with, so it sits with the run and not
+# here. build_observations() documents the keys.
+
 # --- the AR-HMM ---------------------------------------------------------------
-# nlags=1 on 50 ms bins is the 50 ms lag asked for: one step of the AR process
-# is one manifold bin. L is the weak-limit truncation, not the answer — the
-# number of occupied states is what the model infers.
-ARHMM_INPUT = "log_power"         # "log_power" | "z_power"
+# At 1250 Hz an AR order of 1 is a 0.8 ms lag, which is a very local question;
+# raise ARHMM_NLAGS to let the model see further back, at linear cost in the
+# design matrix.
+ARHMM_SECONDS = 60.0      # length of the segment to fit; None = whole epoch
+ARHMM_START_S = None      # None = the most variable stretch of the epoch
 ARHMM_NLAGS = 1
-ARHMM_L = 20                      # truncation level; raise if K_hat hits it
+ARHMM_L = 20              # truncation level; raise if K_hat hits it
 ARHMM_ITER = 400
 ARHMM_BURN_IN = 200
 ARHMM_ALPHA = 1.0
-ARHMM_KAPPA = 50.0                # sticky bias: bigger = longer dwell times
+ARHMM_KAPPA = 50.0        # sticky bias: bigger = longer dwell times
 ARHMM_GAMMA = 1.0
-ARHMM_MIN_FRAC = 0.01             # a state is "used" if it holds >= 1% of bins
+ARHMM_MIN_FRAC = 0.01     # a state is "used" if it holds >= 1% of samples
 ARHMM_SEED = 0
-# The Gibbs sampler's state step is a Python loop over time, so cost is linear
-# in bins and iterations. None fits the whole epoch; an integer takes that many
-# bins from the start, kept contiguous because subsampling would break the
-# meaning of one lag.
-ARHMM_MAX_BINS = None
 
 # --- component ranking --------------------------------------------------------
 # Rank by what dropping a component does to held-out reconstruction MSE, which
@@ -118,20 +169,38 @@ ARHMM_MAX_BINS = None
 # ascending graph-Laplacian order, which is smoothness, not importance.
 K_LLE = 10
 LAMBDA = 1.0
-RANK_DIMS = 15                    # the working set a component is dropped from
+RANK_DIMS = 15            # the working set a component is dropped from
 RANK_FOLDS = 5
 RANK_MAX_SAMPLES = 4000
 RANK_SEED = 0
-TOP_N = 3                         # components carried into the figures
+TOP_N = 3                 # components carried into the figures
 
 METHODS = ("PCA", "KernelPCA", "Laplacian")
 METHOD_COLORS = {"PCA": "#1f77b4", "KernelPCA": "#d62728",
                  "Laplacian": "#9467bd"}
-MAP_METHODS = ("PCA", "Laplacian")   # which get the 3d manifold figures
-MAP_MAX_POINTS = 12000               # scatter subsample, for render speed
+MAP_METHODS = ("PCA", "KernelPCA", "Laplacian")  # which get the 3d figures
+MAP_MAX_POINTS = 12000                           # scatter subsample
+
+ELBOW_DIMS = 40           # x-limit of the scree and reconstruction elbows
 
 EXAMPLE_WINDOW_S = 8.0
-SUGGEST_N = 6                     # how many recordings to list as candidates
+SUGGEST_N = 6             # how many recordings to list as candidates
+
+
+def region_colour(name):
+    return REGION_COLORS.get(str(name), FALLBACK_COLOR)
+
+
+def cell_type_colour(name):
+    return CELL_TYPE_COLORS.get(str(name).strip().lower(), FALLBACK_COLOR)
+
+
+def observation_colour(name, kind):
+    """One colour rule for every observation trace, wherever it is drawn."""
+    if kind == "band":
+        return BAND_COLORS.get(name, FALLBACK_COLOR)
+    parts = name.split("_")
+    return cell_type_colour(parts[-1]) if len(parts) >= 3 else FALLBACK_COLOR
 
 
 # -----------------------------------------------------------------------------
@@ -350,7 +419,7 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
 
 
 # -----------------------------------------------------------------------------
-# WHICH RECORDING
+# SURVEYING THE RECORDINGS
 # -----------------------------------------------------------------------------
 
 
@@ -371,6 +440,51 @@ def recording_table(root=DOWNLOAD_DIR):
         })
     return (pd.DataFrame(rows).sort_values(["subject", "session"])
             .reset_index(drop=True))
+
+
+def unit_metadata(spike_group):
+    """Region and cell type per unit, as a frame, with the gaps named."""
+    meta = spike_group.metadata
+    frame = pd.DataFrame(index=range(len(spike_group.index)))
+    for field in (REGION_FIELD, CELL_TYPE_FIELD):
+        if field not in meta.columns:
+            raise KeyError(
+                f"unit metadata has no {field!r} column — found "
+                f"{list(meta.columns)}. Every region and cell type in this "
+                f"script is read from that column, so there is nothing "
+                f"sensible to proceed with.")
+        frame[field] = meta[field].astype(str).values
+    return frame
+
+
+def unit_inventory(row, root=DOWNLOAD_DIR):
+    """Units per region and cell type for one file, without binning anything."""
+    path = (Path(root) / row["file"]).resolve()
+    nwb = nap.load_file(str(path))
+    meta = unit_metadata(nwb["units"])
+    counts = (meta.groupby([REGION_FIELD, CELL_TYPE_FIELD])
+              .size().rename("n").reset_index())
+    counts.insert(0, "file", row["file"])
+    counts.insert(0, "date", row["date"])
+    counts.insert(0, "subject", row["subject"])
+    del nwb
+    gc.collect()
+    return counts
+
+
+def survey_units(recordings, root=DOWNLOAD_DIR, verbose=True):
+    """Region x cell-type counts for every recording, long and wide."""
+    frames = []
+    for i, (_, row) in enumerate(recordings.iterrows(), start=1):
+        if verbose:
+            print(f"    [{i}/{len(recordings)}] {row['file']}", flush=True)
+        frames.append(unit_inventory(row, root))
+    long = pd.concat(frames, ignore_index=True)
+    wide = (long.pivot_table(index=["subject", "date", "file"],
+                             columns=[REGION_FIELD, CELL_TYPE_FIELD],
+                             values="n", aggfunc="sum", fill_value=0)
+            .reset_index())
+    return long, wide
 
 
 def load_scores(cache_dir=CACHE_DIR):
@@ -407,48 +521,101 @@ def typicality(scores, max_k=30):
             .sort_values("distance_from_mean").reset_index(drop=True))
 
 
-def suggest_recordings(scores, recordings, n=SUGGEST_N, require_behavior=True):
-    """Rank recordings by how typical their reconstruction is, and print them.
+def suggest_recordings(scores, recordings, units_long, n=SUGGEST_N,
+                       require_behavior=True, focus=FOCUS_REGION, verbose=True):
+    """Rank recordings by how typical their reconstruction is, with cell counts.
 
     Position and speed are needed throughout, so the ecephys-only files cannot
-    be the example however typical their reconstruction looks.
+    be the example however typical their reconstruction looks. The focus
+    region's unit count is printed alongside, because a session with four CA1
+    cells has no CA1 MUA to speak of whatever its reconstruction curve does.
     """
     ranked = typicality(scores)
     ranked["has_behavior"] = ranked["file"].isin(
         set(recordings.loc[recordings["has_behavior"], "file"]))
     ranked = ranked.merge(recordings[["file", "subject", "date"]],
                           on="file", how="left")
+
+    totals = units_long.groupby("file")["n"].sum().rename("units")
+    focus_n = (units_long[units_long[REGION_FIELD] == focus]
+               .groupby("file")["n"].sum().rename(f"{focus}_units"))
+    groups = (units_long[units_long["n"] >= 3].groupby("file").size()
+              .rename("mua_groups"))
+    ranked = (ranked.merge(totals, on="file", how="left")
+              .merge(focus_n, on="file", how="left")
+              .merge(groups, on="file", how="left")
+              .fillna({f"{focus}_units": 0, "mua_groups": 0}))
+
     eligible = (ranked[ranked["has_behavior"]] if require_behavior
                 else ranked).reset_index(drop=True)
-
-    print("\nrecordings closest to the mean reconstruction curve "
-          "(k <= 30, averaged over methods and folds):")
-    print(eligible.head(n)[["subject", "date", "distance_from_mean",
-                            "mean_rec_corr", "file"]]
-          .to_string(index=False, float_format=lambda v: f"{v:.4f}"))
-    dropped = ranked[~ranked["has_behavior"]]
-    if require_behavior and len(dropped):
-        print(f"excluded (no behaviour, so no position or speed): "
-              f"{', '.join(dropped['file'])}")
+    if verbose:
+        print("\nrecordings closest to the mean reconstruction curve "
+              "(k <= 30, averaged over methods and folds).")
+        print("mua_groups counts region x cell-type populations with >= 3 units.")
+        print(eligible.head(n)[["subject", "date", "distance_from_mean",
+                                "mean_rec_corr", "units", f"{focus}_units",
+                                "mua_groups", "file"]]
+              .to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+        dropped = ranked[~ranked["has_behavior"]]
+        if require_behavior and len(dropped):
+            print(f"excluded (no behaviour, so no position or speed): "
+                  f"{', '.join(dropped['file'])}")
     return eligible
 
 
-def resolve_recording(recordings, eligible, pattern=None):
-    """The row for `pattern`, or the most typical recording when it is None."""
-    if pattern is None:
-        chosen = eligible["file"].iloc[0]
-        print(f"\nRECORDING is None — taking the suggestion: {chosen}")
-    else:
-        matches = [f for f in recordings["file"] if pattern in f]
-        if not matches:
-            raise ValueError(f"RECORDING={pattern!r} matched none of the files")
-        chosen = matches[0]
-        print(f"\nRECORDING={pattern!r} -> {chosen}")
-    return recordings[recordings["file"] == chosen].iloc[0]
+def plot_unit_survey(units_long, focus=FOCUS_REGION):
+    """Units per region and per cell type, one stacked bar per recording."""
+    units_long = units_long.copy()
+    units_long["name"] = units_long["subject"] + " " + units_long["date"]
+    names = list(dict.fromkeys(units_long["name"]))
+    x = np.arange(len(names))
+
+    fig, axes = plt.subplots(2, 1, figsize=(max(9, 0.8 * len(names)), 8),
+                             sharex=True)
+    fig.suptitle("units per recording, by region and by cell type")
+
+    for ax, field, colour in ((axes[0], REGION_FIELD, region_colour),
+                              (axes[1], CELL_TYPE_FIELD, cell_type_colour)):
+        table = (units_long.pivot_table(index="name", columns=field,
+                                        values="n", aggfunc="sum", fill_value=0)
+                 .reindex(names))
+        bottom = np.zeros(len(names))
+        for key in table.columns:
+            values = table[key].values
+            ax.bar(x, values, bottom=bottom, color=colour(key), label=str(key))
+            bottom += values
+        ax.set_ylabel(f"units by {field}")
+        ax.legend(fontsize=8, ncol=4)
+        if field == REGION_FIELD:
+            focus_counts = (units_long[units_long[REGION_FIELD] == focus]
+                            .groupby("name")["n"].sum().reindex(names).fillna(0))
+            for xi, value in zip(x, focus_counts.values):
+                ax.text(xi, bottom[xi] + 4, f"{int(value)}", ha="center",
+                        fontsize=7, color=region_colour(focus))
+            ax.set_title(f"the number above each bar is the {focus} count",
+                         fontsize=9)
+
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(names, rotation=60, ha="right", fontsize=8)
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
+def resolve_recording(recordings, pattern):
+    """The row for `pattern`. Ambiguous or missing patterns are an error."""
+    matches = [f for f in recordings["file"] if pattern in f]
+    if not matches:
+        raise ValueError(f"RECORDING={pattern!r} matched none of the files")
+    if len(matches) > 1:
+        raise ValueError(f"RECORDING={pattern!r} matched {len(matches)}: "
+                         + ", ".join(matches))
+    print(f"RECORDING={pattern!r} -> {matches[0]}")
+    return recordings[recordings["file"] == matches[0]].iloc[0]
 
 
 # -----------------------------------------------------------------------------
-# THE SESSION, ON THE SWEEP'S OWN BIN GRID
+# THE SESSION
 # -----------------------------------------------------------------------------
 
 
@@ -467,7 +634,11 @@ def transform_rates(rates, how=RATE_TRANSFORM):
 
 
 def bandpass_sos(values, fs, lo, hi, order=4):
-    """Zero-phase Butterworth bandpass in SOS form."""
+    """Zero-phase Butterworth bandpass in SOS form.
+
+    SOS rather than b/a because the low bands sit at a fraction of a percent of
+    Nyquist, where transfer-function coefficients are numerically fragile.
+    """
     sos = sps.butter(order, [lo, hi], btype="band", fs=fs, output="sos")
     return sps.sosfiltfilt(sos, values)
 
@@ -495,42 +666,65 @@ def zscore(values):
     return (values - np.nanmean(values)) / (np.nanstd(values) + 1e-12)
 
 
-def pick_lfp_key(nwb, hint=LFP_REGION_HINT):
-    """The CA1 LFP if the file names one, else whatever LFP it has."""
+def pick_lfp_key(nwb, hint=LFP_REGION_HINT, require_hint=True):
+    """The LFP series whose name contains `hint`.
+
+    require_hint=True because this analysis says "the CA1 LFP" everywhere, and
+    falling back to whichever other channel happens to be first would make
+    every figure a claim about a region nobody chose. Pass require_hint=False
+    to take the only LFP there is, deliberately.
+    """
     lfp_keys = [k for k in nwb.keys() if "lfp" in k.lower()]
     if not lfp_keys:
         raise KeyError("no LFP series in this file")
     preferred = [k for k in lfp_keys if hint in k.lower()]
-    return (preferred[0] if preferred else lfp_keys[0]), lfp_keys
+    if preferred:
+        return preferred[0], lfp_keys
+    if require_hint:
+        raise KeyError(
+            f"no LFP series names {hint!r} — found {lfp_keys}. Set "
+            f"LFP_REGION_HINT to one of those, or call with "
+            f"require_hint=False to accept {lfp_keys[0]!r} as the channel.")
+    return lfp_keys[0], lfp_keys
 
 
 def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
-                 transform=RATE_TRANSFORM, bands=BANDS, verbose=True):
-    """The sweep's binned matrix, plus behaviour, LFP band power and metadata.
+                 transform=RATE_TRANSFORM, bands=BANDS, focus=FOCUS_REGION,
+                 verbose=True):
+    """Everything one recording needs, on two grids, before any spec is applied.
 
-    The bin grid is rebuilt exactly as reconstruction_error_test.load_session
+    The 50 ms grid is rebuilt exactly as reconstruction_error_test.load_session
     built it — same epoch, same edges, same unit filter — because the cached
-    embeddings are indexed into this grid and nothing downstream would notice a
-    quiet disagreement.
+    embeddings are indexed into it and nothing downstream would notice a quiet
+    disagreement. That grid carries the activity matrix and the behaviour.
+
+    The LFP grid carries the raw band envelopes and the filtered traces, plus
+    the pooled spike times of every region x cell-type population. Those are
+    the ingredients, not the observations: build_observations turns them into
+    model inputs, so OBS_SPEC can be changed and re-run without touching the
+    file again.
     """
     path = (DOWNLOAD_DIR / row["file"]).resolve()
     t0 = time.perf_counter()
     nwb = nap.load_file(str(path))
     spikes_all = nwb["units"]
+    meta = unit_metadata(spikes_all)
 
-    epoch, epoch_kind = None, "full"
+    # "maze" is the position-tracked span, "full" the whole recording. A file
+    # with no Position cannot supply a maze epoch, and quietly widening to the
+    # full recording would change what every later number is about, so it is an
+    # error: pass epoch_mode="full" if that is what you meant.
     if epoch_mode == "maze":
-        try:
-            position_all = nwb["Position"]
-            epoch = nap.IntervalSet(start=float(position_all.index[0]),
-                                    end=float(position_all.index[-1]))
-            epoch_kind = "maze"
-        except Exception:
-            epoch = None
-    if epoch is None:
+        position_all = nwb["Position"]
+        epoch = nap.IntervalSet(start=float(position_all.index[0]),
+                                end=float(position_all.index[-1]))
+    elif epoch_mode == "full":
         starts = [spikes_all[u].index[0] for u in spikes_all.index if len(spikes_all[u])]
         ends = [spikes_all[u].index[-1] for u in spikes_all.index if len(spikes_all[u])]
         epoch = nap.IntervalSet(start=float(min(starts)), end=float(max(ends)))
+    else:
+        raise ValueError(f"epoch_mode must be 'maze' or 'full', got {epoch_mode!r}")
+    epoch_kind = epoch_mode
 
     spikes = spikes_all.restrict(epoch)
     t_start, t_end = float(epoch.start[0]), float(epoch.end[0])
@@ -546,24 +740,19 @@ def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
     keep = rates.mean(axis=0) > MIN_RATE_HZ
     rates = rates[:, keep]
 
-    meta = getattr(spikes_all, "metadata", None)
-    if isinstance(meta, pd.DataFrame) and "cell_area" in meta.columns:
-        regions = meta["cell_area"].astype(str).values[keep]
-    else:
-        regions = np.array(["all"] * int(keep.sum()))
+    regions = meta[REGION_FIELD].values[keep]
+    cell_types = meta[CELL_TYPE_FIELD].values[keep]
+    kept_times = [st for st, k in zip(spike_times, keep) if k]
 
     X = np.asarray(transform_rates(rates, transform), dtype=np.float64)
-    del rates, counts
+    del rates, counts, spike_times
     gc.collect()
 
-    # --- behaviour -----------------------------------------------------------
+    # --- behaviour, on the 50 ms grid ----------------------------------------
     position = nwb["Position"].restrict(epoch)
     pos_t = np.asarray(position.index.values, dtype=float)
     pos_x = np.asarray(position["x"].values, dtype=float)
-    try:
-        pos_y = np.asarray(position["y"].values, dtype=float)
-    except Exception:
-        pos_y = np.full_like(pos_x, np.nan)
+    pos_y = np.asarray(position["y"].values, dtype=float)
     speed_obj = nwb["Speed"].restrict(epoch)
     speed_t = np.asarray(speed_obj.index.values, dtype=float)
     speed_v = np.asarray(speed_obj.values, dtype=float).ravel()
@@ -572,53 +761,406 @@ def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
     track_y = bin_mean(pos_t, pos_y, edges)
     speed = bin_mean(speed_t, speed_v, edges)
 
-    # --- LFP and band power --------------------------------------------------
+    # --- LFP, at its own sampling rate ---------------------------------------
     lfp_key, lfp_keys = pick_lfp_key(nwb)
     lfp_obj = nwb[lfp_key].restrict(epoch)
-    lfp_t = np.asarray(lfp_obj.index.values, dtype=float)
-    lfp_v = np.asarray(lfp_obj.values, dtype=float).ravel()
+    lfp_t = np.asarray(lfp_obj.index.values, dtype=np.float64)
+    lfp_v = np.asarray(lfp_obj.values, dtype=np.float64).ravel()
     fs = float(1.0 / np.median(np.diff(lfp_t)))
 
-    power, power_z, raw_rows = {}, {}, []
+    band_env, band_filt, raw_rows = {}, {}, []
     for name, (lo, hi) in bands.items():
-        env = analytic_envelope(bandpass_sos(lfp_v, fs, lo, hi))
-        binned = bin_mean(lfp_t, env, edges)
-        power[name] = binned
-        power_z[name] = zscore(binned)
+        filt = bandpass_sos(lfp_v, fs, lo, hi)
+        env = analytic_envelope(filt)
+        band_env[name] = env.astype(np.float32)
+        band_filt[name] = filt.astype(np.float32)
         raw_rows.append({"band": name, "range_hz": f"{lo:.0f}-{hi:.0f}",
-                         "median": np.nanmedian(binned), "mean": np.nanmean(binned),
-                         "p95": np.nanpercentile(binned, 95), "sd": np.nanstd(binned)})
-        del env
+                         "median": float(np.median(env)),
+                         "mean": float(env.mean()),
+                         "p95": float(np.percentile(env, 95)),
+                         "sd": float(env.std())})
+        del filt, env
         gc.collect()
 
+    # --- pooled spike times per region x cell type ---------------------------
+    mua_groups, mua_units = {}, {}
+    for region in sorted(set(regions)):
+        for cell_type in sorted(set(cell_types[regions == region])):
+            sel = (regions == region) & (cell_types == cell_type)
+            key = f"MUA_{region}_{cell_type}"
+            mua_groups[key] = np.sort(np.concatenate(
+                [st for st, s in zip(kept_times, sel) if s]))
+            mua_units[key] = int(sel.sum())
+
+    # band power on the 50 ms grid, z-scored, for the covariate scatters. Not a
+    # model input — the model reads the LFP grid — just something to plot
+    # against, so it is fixed regardless of what OBS_SPEC says.
+    power_z_bins = {name: zscore(bin_mean(lfp_t, env.astype(np.float64), edges))
+                    for name, env in band_env.items()}
+
+    half = 0.5 / fs
     session = {
         "label": f"{row['subject']} {row['date']}", "file": row["file"],
         "epoch_kind": epoch_kind, "t_start": t_start, "t_end": t_end,
         "bin_size_s": bin_size_s, "edges": edges, "centers": centers,
-        "X": X, "regions": regions, "n_units": X.shape[1], "n_bins": X.shape[0],
+        "X": X, "regions": regions, "cell_types": cell_types,
+        "n_units": X.shape[1], "n_bins": X.shape[0],
         "track_x": track_x, "track_y": track_y, "speed": speed,
-        "bands": list(bands), "power": power, "power_z": power_z,
+        "bands": list(bands), "band_env": band_env, "band_filt": band_filt,
+        "power_z_bins": power_z_bins,
+        "mua_groups": mua_groups, "mua_units": mua_units, "focus": focus,
         "power_summary": pd.DataFrame(raw_rows),
-        "lfp_key": lfp_key, "lfp_keys": lfp_keys, "fs": fs,
+        "lfp_t": lfp_t, "lfp_edges": np.concatenate((lfp_t - half,
+                                                     [lfp_t[-1] + half])),
+        "fs": fs, "lfp_key": lfp_key, "lfp_keys": lfp_keys,
         "rate_transform": transform,
     }
-    del spikes, spikes_all, spike_times, nwb, lfp_v, lfp_t
+    del spikes, spikes_all, nwb, lfp_v, kept_times
     gc.collect()
 
     if verbose:
         print(f"loaded {row['file']} in {time.perf_counter() - t0:.1f}s")
         print(f"    {epoch_kind} epoch {(t_end - t_start) / 60:.1f} min | "
-              f"{session['n_units']} units | {session['n_bins']} bins | regions: "
-              + ", ".join(f"{r} ({(regions == r).sum()})" for r in sorted(set(regions))))
-        print(f"    LFP: {lfp_key} @ {fs:.0f} Hz"
+              f"{session['n_units']} units | {session['n_bins']} bins at "
+              f"{bin_size_s * 1e3:.0f} ms | {len(lfp_t)} LFP samples at "
+              f"{fs:.0f} Hz")
+        inventory = (pd.DataFrame({REGION_FIELD: regions,
+                                   CELL_TYPE_FIELD: cell_types})
+                     .groupby([REGION_FIELD, CELL_TYPE_FIELD]).size()
+                     .rename("units").reset_index())
+        print("\nunits kept, by region and cell type")
+        print(inventory.to_string(index=False))
+        print(f"\nLFP: {lfp_key} @ {fs:.0f} Hz"
               + (f"  (of {len(lfp_keys)}: {', '.join(lfp_keys)})"
                  if len(lfp_keys) > 1 else "")
               + ("" if LFP_REGION_HINT in lfp_key.lower()
-                 else f"  [no '{LFP_REGION_HINT}' in the name — check this is CA1]"))
-        print("\nband power on the analysis bins (raw envelope, before z-scoring)")
+                 else f"  [no '{LFP_REGION_HINT}' in the name — check this is "
+                      f"{focus}]"))
+        print("band envelopes (raw amplitude, before any spec is applied)")
         print(session["power_summary"].to_string(
             index=False, float_format=lambda v: f"{v:.3f}"))
     return session
+
+
+# -----------------------------------------------------------------------------
+# BUILDING THE OBSERVATIONS THE AR-HMM SEES
+# -----------------------------------------------------------------------------
+
+
+def smoothing_kernel(spec, fs):
+    """The kernel a smoothing spec asks for, normalized to sum to one.
+
+    "gaussian"      symmetric, centred: averages equally over before and after
+    "half_gaussian" causal: the right half only, so the value at t depends on
+                    t and earlier and nothing later. A state boundary is not
+                    smeared backwards before the model has a chance to find it.
+    "boxcar"        flat, causal, sigma_s wide
+
+    spec=None means no smoothing, which is a choice rather than a gap, so it
+    is the one case that returns without a kernel.
+    """
+    if spec is None:
+        return None
+    kind = spec.get("kind", "gaussian")
+    sigma = float(spec["sigma_s"]) * fs
+    if sigma <= 0:
+        raise ValueError(f"sigma_s={spec['sigma_s']} gives {sigma} samples at "
+                         f"{fs:.0f} Hz — use smooth=None for no smoothing "
+                         f"rather than a zero-width kernel")
+    if kind == "boxcar":
+        width = max(int(round(sigma)), 1)
+        return np.ones(width, dtype=np.float64) / width
+    radius = max(int(round(4 * sigma)), 1)
+    if kind == "gaussian":
+        offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    elif kind == "half_gaussian":
+        offsets = np.arange(0, radius + 1, dtype=np.float64)
+    else:
+        raise ValueError(f"unknown smoothing kind: {kind!r}")
+    kernel = np.exp(-0.5 * (offsets / sigma) ** 2)
+    return kernel / kernel.sum()
+
+
+def smooth_trace(values, fs, spec):
+    """Apply a smoothing spec, keeping the length and the time alignment."""
+    kernel = smoothing_kernel(spec, fs)
+    values = np.asarray(values, dtype=np.float64)
+    if kernel is None:
+        return values
+    if spec.get("kind", "gaussian") == "gaussian":
+        # symmetric kernel: centred, so the output at i uses both sides of i
+        return np.convolve(values, kernel, mode="same")
+    # causal kernels: the output at i uses i and earlier only. Edge-pad with
+    # the first sample so the opening of the trace is not pulled toward zero.
+    padded = np.concatenate((np.full(len(kernel) - 1, values[0]), values))
+    return np.convolve(padded, kernel, mode="valid")[:len(values)]
+
+
+def resample_trace(values, source_t, target_edges, method="mean"):
+    """Aggregate a densely sampled trace into the target bins."""
+    idx = np.searchsorted(target_edges, source_t, side="right") - 1
+    n = len(target_edges) - 1
+    ok = (idx >= 0) & (idx < n) & np.isfinite(values)
+    idx, vals = idx[ok], np.asarray(values, dtype=np.float64)[ok]
+    if method == "sum":
+        return np.bincount(idx, weights=vals, minlength=n)
+    if method == "max":
+        out = np.full(n, -np.inf)
+        np.maximum.at(out, idx, vals)
+        out[~np.isfinite(out)] = np.nan
+        return out
+    total = np.bincount(idx, weights=vals, minlength=n)
+    count = np.bincount(idx, minlength=n)
+    out = np.full(n, np.nan)
+    hit = count > 0
+    out[hit] = total[hit] / count[hit]
+    return out
+
+
+def finish_trace(name, values, log, do_zscore):
+    """The last two steps every observation goes through, in that order.
+
+    log=True on a trace that reaches zero or below has no answer — a filtered
+    LFP is signed, and a smoothed spike count can be exactly zero — so it says
+    so rather than clamping to a floor and returning a number that looks fine.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if log:
+        if not (values > 0).all():
+            raise ValueError(
+                f"{name}: log=True but {(values <= 0).sum()} of {len(values)} "
+                f"samples are <= 0 (min {values.min():.4g}). Either this "
+                f"measure is signed, in which case log is the wrong request, "
+                f"or the trace has empty stretches that need a wider kernel.")
+        values = np.log10(values)
+    return zscore(values) if do_zscore else values
+
+
+def build_observations(session, spec, verbose=True):
+    """Turn the session's raw ingredients into the matrix the AR-HMM sees.
+
+    Each trace goes: source -> measure -> smooth -> (resample) -> log ->
+    z-score. The order matters. Smoothing happens on the native grid so the
+    kernel is in real time rather than in bins, and z-scoring happens last so
+    every column enters the model on equal terms whatever its physical units.
+
+    The spec (OBS_SPEC in CELL 3):
+        rate        "lfp" keeps the LFP sampling rate; a number resamples to
+                    that many Hz using bin_method. decimate then takes every
+                    nth sample of whatever grid results.
+        bands
+          measure   "envelope" is the Hilbert amplitude — the band's power
+                    trace, and already a smoothing of the band. "power"
+                    squares it. "filtered" passes the oscillation itself,
+                    which is a different question entirely.
+          smooth    None, or {"kind": "gaussian"|"half_gaussian"|"boxcar",
+                    "sigma_s": seconds}. half_gaussian is causal: it averages
+                    over what just happened and never over what is about to,
+                    so a state boundary is not smeared backwards before the
+                    model looks for it.
+          log       log10 before z-scoring. Raises on a trace that reaches
+                    zero, so "filtered" and log are not combinable.
+          zscore    per trace, over the whole epoch, last.
+        mua
+          regions,  None = every one present. An explicit list that matches
+          cell_types  nothing raises rather than quietly fitting on bands.
+          min_units populations smaller than this are reported and not used.
+          smooth    not really optional: spikes on the LFP grid are a
+                    near-binary train, and this kernel is what makes a rate.
+    """
+    spec = deepcopy(spec)
+    fs = session["fs"]
+    lfp_t = session["lfp_t"]
+
+    # --- the target grid ------------------------------------------------------
+    rate_spec = spec.get("rate", "lfp")
+    if rate_spec == "lfp":
+        target_t, target_edges, native = lfp_t, None, True
+    else:
+        target_rate = float(rate_spec)
+        step = 1.0 / target_rate
+        target_edges = np.arange(session["t_start"], session["t_end"], step)
+        target_t = target_edges[:-1] + step / 2
+        native = False
+
+    columns, names, kinds, notes = [], [], [], []
+
+    band_spec = spec.get("bands", {})
+    if band_spec.get("use", True):
+        measure = band_spec.get("measure", "envelope")
+        for name in band_spec.get("bands", session["bands"]):
+            if name not in session["band_env"]:
+                raise KeyError(
+                    f"OBS_SPEC asks for band {name!r}, which was not filtered "
+                    f"at load time — the session has {list(session['band_env'])}. "
+                    f"Add it to BANDS and reload the session.")
+            if measure == "envelope":
+                raw = session["band_env"][name].astype(np.float64)
+            elif measure == "power":
+                raw = session["band_env"][name].astype(np.float64) ** 2
+            elif measure == "filtered":
+                raw = session["band_filt"][name].astype(np.float64)
+            else:
+                raise ValueError(f"unknown band measure: {measure!r}")
+            trace = smooth_trace(raw, fs, band_spec.get("smooth"))
+            if not native:
+                trace = resample_trace(trace, lfp_t, target_edges,
+                                       spec.get("bin_method", "mean"))
+            columns.append(finish_trace(name, trace,
+                                        band_spec.get("log", False),
+                                        band_spec.get("zscore", True)))
+            names.append(name)
+            kinds.append("band")
+            notes.append(f"{measure}, smooth="
+                         f"{_smooth_label(band_spec.get('smooth'))}")
+            del raw, trace
+            gc.collect()
+
+    mua_spec = spec.get("mua", {})
+    if mua_spec.get("use", True):
+        want_regions = mua_spec.get("regions")
+        want_types = mua_spec.get("cell_types")
+        min_units = int(mua_spec.get("min_units", 3))
+        edges_for_counts = (session["lfp_edges"] if native else target_edges)
+        selected, too_small = [], []
+        for key in session["mua_groups"]:
+            _, region, cell_type = key.split("_", 2)
+            if want_regions is not None and region not in want_regions:
+                continue
+            if want_types is not None and cell_type not in want_types:
+                continue
+            (selected if session["mua_units"][key] >= min_units
+             else too_small).append(key)
+        if too_small and verbose:
+            print("    below min_units, not used as observations: "
+                  + ", ".join(f"{k} ({session['mua_units'][k]})"
+                              for k in too_small))
+        if want_regions is not None or want_types is not None:
+            # an explicit request that matches nothing is a typo, not an empty
+            # set: say so rather than quietly fitting on the bands alone
+            if not selected:
+                raise ValueError(
+                    f"OBS_SPEC['mua'] asks for regions={want_regions}, "
+                    f"cell_types={want_types} with min_units={min_units} and "
+                    f"matched no population. This session has: "
+                    + ", ".join(f"{k} ({v} units)"
+                                for k, v in session["mua_units"].items()))
+        for key in selected:
+            times = session["mua_groups"][key]
+            counts = np.diff(np.searchsorted(times, edges_for_counts)).astype(np.float64)
+            grid_rate = fs if native else float(rate_spec)
+            trace = smooth_trace(counts * grid_rate, grid_rate,
+                                 mua_spec.get("smooth"))
+            columns.append(finish_trace(key, trace, mua_spec.get("log", False),
+                                        mua_spec.get("zscore", True)))
+            names.append(key)
+            kinds.append("mua")
+            notes.append(f"{session['mua_units'][key]} units, smooth="
+                         f"{_smooth_label(mua_spec.get('smooth'))}")
+            del counts, trace
+            gc.collect()
+
+    if not columns:
+        raise RuntimeError(
+            "OBS_SPEC selected no observations — both 'bands' and 'mua' are "
+            "off, or every population fell below min_units")
+
+    decimate = int(spec.get("decimate", 1))
+    Y = np.column_stack(columns)
+    t = target_t
+    if decimate > 1:
+        Y, t = Y[::decimate], t[::decimate]
+    rate = (fs if native else float(rate_spec)) / decimate
+
+    # A constant or non-finite column carries nothing and makes Sigma
+    # singular, so the sampler would fail later with a Cholesky error naming
+    # no column. Name it here instead of dropping it: an observation that
+    # turned out flat is a fact about the spec, and the spec is the thing to
+    # change.
+    bad = ~(np.isfinite(Y).all(axis=0) & (Y.std(axis=0) > 1e-9))
+    if bad.any():
+        raise ValueError(
+            "these observations are constant or non-finite, which makes the "
+            "AR covariance singular: "
+            + ", ".join(f"{names[j]} (sd {Y[:, j].std():.3g}, "
+                        f"{int((~np.isfinite(Y[:, j])).sum())} non-finite)"
+                        for j in np.flatnonzero(bad))
+            + ". Widen the smoothing kernel, drop them from OBS_SPEC, or "
+              "raise min_units.")
+
+    table = pd.DataFrame({"observation": names, "kind": kinds, "detail": notes,
+                          "mean": Y.mean(axis=0), "sd": Y.std(axis=0),
+                          "min": Y.min(axis=0), "max": Y.max(axis=0)})
+    if verbose:
+        print(f"\nobservations: {Y.shape[1]} traces x {Y.shape[0]} samples at "
+              f"{rate:.0f} Hz")
+        print(table.to_string(index=False, float_format=lambda v: f"{v:+.2f}"))
+    return {"Y": Y, "names": names, "kinds": kinds, "t": t, "rate": rate,
+            "table": table, "spec": spec}
+
+
+def _smooth_label(spec):
+    if spec is None:
+        return "none"
+    return f"{spec.get('kind', 'gaussian')} {spec['sigma_s'] * 1e3:.0f}ms"
+
+
+def plot_observations(session, obs, seconds=4.0, start_s=None):
+    """What the AR-HMM is about to be trained on, as traces and as a matrix.
+
+    Worth looking at before the sampler runs: a trace that is flat, clipped or
+    dominated by one excursion will make states that are about that, and it
+    takes an hour to find out the expensive way.
+    """
+    Y, names, kinds, t = obs["Y"], obs["names"], obs["kinds"], obs["t"]
+    rate = obs["rate"]
+    span = int(round(seconds * rate))
+    if start_s is None:
+        activity = np.abs(np.diff(Y, axis=0)).sum(axis=1)
+        cumulative = np.concatenate(([0.0], np.cumsum(activity)))
+        step = max(span // 4, 1)
+        starts = np.arange(0, max(len(Y) - span, 1), step)
+        first = int(starts[np.argmax(cumulative[np.minimum(starts + span - 1,
+                                                           len(cumulative) - 1)]
+                                     - cumulative[starts])])
+    else:
+        first = int(np.clip(np.searchsorted(t - session["t_start"], start_s),
+                            0, max(len(Y) - span, 0)))
+    seg = np.arange(first, min(first + span, len(Y)))
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 0.55 * len(names) + 3),
+                             gridspec_kw={"width_ratios": [2, 1]})
+    fig.suptitle(f"{session['label']} — AR-HMM observations "
+                 f"({len(names)} traces @ {rate:.0f} Hz)")
+
+    ax = axes[0]
+    offset = 0.0
+    for j, (name, kind) in enumerate(zip(names, kinds)):
+        trace = Y[seg, j]
+        ax.plot(t[seg] - t[seg][0], trace + offset, lw=0.9,
+                color=observation_colour(name, kind))
+        ax.text(-0.01, offset, name.replace(f"MUA_", ""), fontsize=7,
+                ha="right", va="center", transform=ax.get_yaxis_transform(),
+                color=observation_colour(name, kind))
+        offset -= 6.0
+    ax.set_yticks([])
+    ax.set_xlabel("time in window (s)")
+    ax.set_title(f"{seconds:.1f} s from {t[first] - session['t_start']:.1f}s "
+                 f"into the epoch (z, offset)", fontsize=9)
+
+    ax = axes[1]
+    corr = np.corrcoef(Y.T)
+    im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1)
+    fig.colorbar(im, ax=ax, shrink=0.8).set_label("correlation", fontsize=8)
+    ax.set_xticks(range(len(names)))
+    ax.set_yticks(range(len(names)))
+    short = [n.replace("MUA_", "") for n in names]
+    ax.set_xticklabels(short, rotation=90, fontsize=6)
+    ax.set_yticklabels(short, fontsize=6)
+    ax.set_title("how much the inputs already say the same thing", fontsize=9)
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
@@ -637,41 +1179,55 @@ def scale_embedding(Y, X):
     rad_y = np.percentile(Yc, 95)
     rad_x = np.percentile(X - np.mean(X), 95)
     if not np.isfinite(rad_y) or abs(rad_y) < 1e-12:
-        return Yc
+        raise ValueError(
+            f"the embedding's 95th-percentile radius is {rad_y!r}, so it "
+            f"cannot be rescaled to the data. The embedding is degenerate — "
+            f"refit it rather than reconstructing from it.")
     return (rad_x / rad_y) * Yc
 
 
 def load_embedding(session, method, cache_dir=CACHE_DIR):
     """One cached embedding, checked against the session that was just rebuilt.
 
-    A mismatch is refused rather than reconciled: an embedding fit on a
-    different unit filter, bin size or scaling has rows that mean something
-    else, and nothing downstream would notice.
+    A mismatch raises. An embedding fit on a different unit filter, bin size
+    or scaling has rows that mean something else, and there is no version of
+    "carry on without it" that leaves the figures meaning what they say.
     """
     stem = Path(session["file"]).stem
     path = Path(cache_dir) / (f"{stem}__{session['bin_size_s'] * 1e3:.0f}ms"
                               f"__{method}.npz")
     if not path.exists():
-        return None, None, f"no cache file ({path.name})"
+        raise FileNotFoundError(
+            f"{path} — the sweep has not computed {method} for this recording "
+            f"at {session['bin_size_s'] * 1e3:.0f} ms bins")
     with np.load(path, allow_pickle=False) as stored:
         Y = np.asarray(stored["embedding"], dtype=np.float64)
         idx = np.asarray(stored["idx_embed"], dtype=np.int64)
         n_units = int(stored["n_units"])
-        transform = (str(stored["rate_transform"])
-                     if "rate_transform" in stored else "?")
+        transform = str(stored["rate_transform"])
     if n_units != session["n_units"]:
-        return None, None, (f"cache has {n_units} units, this session rebuilt "
-                            f"{session['n_units']} — grids disagree, not using it")
+        raise ValueError(
+            f"{path.name}: cached under {n_units} units, this session rebuilt "
+            f"{session['n_units']}. The unit filter or the epoch has changed "
+            f"since the sweep, so the embedding's rows are not these bins.")
     if idx.max() >= session["n_bins"]:
-        return None, None, (f"cache indexes bin {idx.max()} of "
-                            f"{session['n_bins']} — epoch or bin size differs")
-    if transform not in ("?", session["rate_transform"]):
-        return None, None, f"cache was fit under transform {transform!r}"
+        raise ValueError(
+            f"{path.name}: indexes bin {idx.max()} of {session['n_bins']}. "
+            f"The bin size or the epoch differs from the sweep.")
+    if transform != session["rate_transform"]:
+        raise ValueError(
+            f"{path.name}: fit under rate transform {transform!r}, this "
+            f"session used {session['rate_transform']!r}. Point CACHE_DIR at "
+            f"the matching cache.")
     return Y, idx, f"{Y.shape[0]} x {Y.shape[1]}, stride {int(np.median(np.diff(idx)))}"
 
 
 def load_embeddings(session, methods=METHODS, cache_dir=CACHE_DIR, verbose=True):
-    """Every usable cached embedding for this session, already scaled."""
+    """Every cached embedding for this session, already scaled.
+
+    Every method in `methods` must be present and must match. Pass a shorter
+    `methods` to work with fewer, deliberately.
+    """
     if verbose:
         print(f"\nembeddings from {cache_dir}")
     out = {}
@@ -679,11 +1235,9 @@ def load_embeddings(session, methods=METHODS, cache_dir=CACHE_DIR, verbose=True)
         Y, idx, note = load_embedding(session, method, cache_dir)
         if verbose:
             print(f"    {method:10s} {note}")
-        if Y is not None:
-            out[method] = {"Y": Y, "idx": idx,
-                           "scaled": scale_embedding(Y, session["X"][idx])}
-    if not out:
-        raise RuntimeError("no usable cached embeddings for this recording")
+        out[method] = {"Y": Y, "idx": idx,
+                       "stride": int(np.median(np.diff(idx))),
+                       "scaled": scale_embedding(Y, session["X"][idx])}
 
     # The coarse grid every method has in common. Kernel PCA and Laplacian
     # eigenmaps were fit on every tenth bin, so this is where they can be
@@ -699,63 +1253,66 @@ def load_embeddings(session, methods=METHODS, cache_dir=CACHE_DIR, verbose=True)
 
 
 # -----------------------------------------------------------------------------
-# THE AR-HMM ON THE BAND POWER
+# FITTING THE STATES
 # -----------------------------------------------------------------------------
 
 
-def arhmm_observations(session, how=ARHMM_INPUT):
-    """The band traces the AR-HMM sees, one column per band.
+def choose_segment(Y, rate, seconds, start_s=None):
+    """Which stretch to fit, as indices into the observation grid.
 
-    The log envelope rather than the z-scored one by default: envelopes are
-    close to log-normal and the model's observation noise is Gaussian. The
-    sampler standardizes whatever it is handed either way.
-
-    Bins where the LFP gave nothing are filled from the nearest finite bin
-    rather than dropped — the AR model reads consecutive rows as consecutive in
-    time, so deleting one would silently glue two distant moments together.
+    start_s=None looks for the most variable window rather than the first one:
+    the opening minute of a session is often the animal sitting still, which
+    teaches the model about one state and nothing about switching.
     """
-    if how == "log_power":
-        Y = np.column_stack([np.log10(np.maximum(session["power"][b], 1e-12))
-                             for b in session["bands"]])
-    elif how == "z_power":
-        Y = np.column_stack([session["power_z"][b] for b in session["bands"]])
-    else:
-        raise ValueError(f"unknown ARHMM_INPUT: {how}")
+    n = len(Y)
+    if seconds is None:
+        return np.arange(n)
+    span = int(round(seconds * rate))
+    if span >= n:
+        return np.arange(n)
+    if start_s is not None:
+        first = int(np.clip(round(start_s * rate), 0, n - span))
+        return np.arange(first, first + span)
+    step = max(span // 4, 1)
+    activity = np.abs(np.diff(Y, axis=0)).sum(axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(activity)))
+    starts = np.arange(0, n - span, step)
+    scores = cumulative[starts + span - 1] - cumulative[starts]
+    first = int(starts[np.argmax(scores)])
+    return np.arange(first, first + span)
 
-    finite = np.isfinite(Y).all(axis=1)
-    if not finite.all():
-        print(f"{(~finite).sum()} of {len(Y)} bins had no LFP samples — filled "
-              f"from the nearest finite bin to keep the lag structure intact")
-        good = np.flatnonzero(finite)
-        nearest = good[np.clip(np.searchsorted(good, np.arange(len(Y))),
-                               0, len(good) - 1)]
-        Y = Y[nearest]
-    return Y
 
-
-def fit_states(session, how=ARHMM_INPUT, max_bins=ARHMM_MAX_BINS,
+def fit_states(session, obs, seconds=ARHMM_SECONDS, start_s=ARHMM_START_S,
                nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
                burn_in=ARHMM_BURN_IN, kappa=ARHMM_KAPPA, alpha=ARHMM_ALPHA,
                gamma=ARHMM_GAMMA, min_frac=ARHMM_MIN_FRAC, seed=ARHMM_SEED):
-    """Fit the AR-HMM and map its states back onto the session's bin grid.
+    """Fit the AR-HMM on the observation grid and map its states onto both grids.
 
-    The AR design drops the first `nlags` bins, so state i belongs to bin
-    i+nlags. The occupied states are relabelled by how much time they hold, so
-    state 0 is the most common one and the numbering carries meaning across
-    every figure below.
+    The AR design drops the first `nlags` samples, so state i belongs to sample
+    i+nlags of the segment. The occupied states are relabelled by how much time
+    they hold, so state 0 is the most common one and the numbering carries
+    meaning across every figure below.
+
+    Two state arrays come back. `states_obs` is the sequence on the
+    observation grid, which is what the example window draws. `states` is the
+    modal state within each 50 ms manifold bin, which is what colours the
+    manifold; bins outside the fitted segment are -1.
     """
-    Y_full = arhmm_observations(session, how)
-    n_bins = session["n_bins"]
-    hmm_bins = np.arange(n_bins if max_bins is None else min(max_bins, n_bins))
-    Y = Y_full[hmm_bins]
+    Y_all, rate, t_all = obs["Y"], obs["rate"], obs["t"]
+    segment = choose_segment(Y_all, rate, seconds, start_s)
+    Y = Y_all[segment]
 
-    print(f"\nfitting the sticky HDP-AR-HMM: {len(Y)} bins x {Y.shape[1]} bands, "
-          f"AR order {nlags} ({nlags * session['bin_size_s'] * 1e3:.0f} ms lag), "
-          f"L={L}, kappa={kappa}, {n_iter} iterations")
-    print(f"    input: {how} of {', '.join(session['bands'])}")
-    if max_bins is not None and max_bins < n_bins:
-        print(f"    capped at {max_bins} of {n_bins} bins, contiguous from the "
-              f"start — subsampling would break what one lag means")
+    print(f"\nfitting the sticky HDP-AR-HMM")
+    print(f"    observations: {len(obs['names'])} traces — "
+          f"{', '.join(obs['names'])}")
+    print(f"    segment: {len(Y)} samples at {rate:.0f} Hz "
+          f"({len(Y) / rate:.1f} s), starting "
+          f"{t_all[segment[0]] - session['t_start']:.1f}s into the epoch")
+    print(f"    AR order {nlags} ({nlags / rate * 1e3:.2f} ms lag), L={L}, "
+          f"kappa={kappa}, {n_iter} iterations")
+    if len(segment) < len(Y_all):
+        print(f"    this is {100 * len(segment) / len(Y_all):.1f}% of the "
+              f"epoch — the rest gets no state label")
     print("    the state step is a Python loop over time, so this is the slow "
           "part", flush=True)
 
@@ -766,23 +1323,41 @@ def fit_states(session, how=ARHMM_INPUT, max_bins=ARHMM_MAX_BINS,
     print(f"    fitted in {(time.perf_counter() - t0) / 60:.1f} min")
     if arhmm["K_hat"] >= L - 1:
         print(f"    WARNING: K_hat={arhmm['K_hat']} is at the truncation level "
-              f"L={L}. Raise ARHMM_L — the model wanted more states than it was "
+              f"L={L}. Raise L — the model wanted more states than it was "
               f"allowed.")
 
     z_raw = arhmm["z"]
-    state_bins = hmm_bins[nlags:]
     occupancy = np.bincount(z_raw, minlength=L)
     order = np.argsort(-occupancy)
     relabel = np.full(len(occupancy), -1)
     relabel[order[occupancy[order] > 0]] = np.arange(int((occupancy > 0).sum()))
-    states = np.full(n_bins, -1, dtype=int)
-    states[state_bins] = relabel[z_raw]
-    n_states = int(states.max()) + 1
+    z = relabel[z_raw]
+    n_states = int(z.max()) + 1
 
-    print(f"    {n_states} occupied states over {len(state_bins)} labelled bins "
-          f"({(states < 0).sum()} bins unlabelled)")
-    return {"arhmm": arhmm, "states": states, "state_bins": state_bins,
-            "relabel": relabel, "n_states": n_states, "burn_in": burn_in,
+    state_index = segment[nlags:]            # row of obs["t"] for each state
+    t_states = t_all[state_index]
+
+    # modal state per 50 ms bin, via a 2d bincount rather than a groupby loop
+    bin_of = np.searchsorted(session["edges"], t_states, side="right") - 1
+    inside = (bin_of >= 0) & (bin_of < session["n_bins"])
+    states = np.full(session["n_bins"], -1, dtype=int)
+    if inside.any():
+        b, s = bin_of[inside], z[inside]
+        lo, hi = int(b.min()), int(b.max())
+        width = hi - lo + 1
+        tally = np.bincount((b - lo) * n_states + s,
+                            minlength=width * n_states).reshape(width, n_states)
+        covered = tally.sum(axis=1) > 0
+        modal = tally.argmax(axis=1)
+        states[lo:hi + 1][covered] = modal[covered]
+
+    print(f"    {n_states} occupied states over {len(z)} samples | "
+          f"{(states >= 0).sum()} of {session['n_bins']} manifold bins labelled")
+    return {"arhmm": arhmm, "obs": obs, "obs_names": obs["names"],
+            "obs_kinds": obs["kinds"], "segment": segment, "rate": rate,
+            "nlags": nlags, "states_obs": z, "state_index": state_index,
+            "t_states": t_states, "states": states, "relabel": relabel,
+            "n_states": n_states, "burn_in": burn_in,
             "cmap": ListedColormap(
                 plt.get_cmap("tab20")(np.linspace(0, 1, 20))[:n_states])}
 
@@ -796,28 +1371,45 @@ def run_lengths(labels):
 
 
 def state_characterization(session, fit, verbose=True):
-    """What each state is: occupancy, dwell time, band power, AR dynamics."""
-    states, n_states = fit["states"], fit["n_states"]
-    bands = session["bands"]
-    run_state, _, run_len = run_lengths(states[fit["state_bins"]])
-    bin_ms = session["bin_size_s"] * 1e3
+    """What each state is: occupancy, dwell time, observations, AR dynamics.
+
+    The observation columns are summarized on the samples the state actually
+    holds, not on the 50 ms bins, so a 20 ms state is described by what it was
+    rather than by the bin it landed in.
+    """
+    z, n_states = fit["states_obs"], fit["n_states"]
+    names = fit["obs_names"]
+    Y = fit["arhmm"]["Y"][fit["nlags"]:]          # standardized observations
+    run_state, _, run_len = run_lengths(z)
+    step_ms = 1e3 / fit["rate"]
 
     rows = []
     for s in range(n_states):
-        sel = states == s
+        sel = z == s
         runs = run_len[run_state == s]
-        entry = {"state": s, "bins": int(sel.sum()),
-                 "occupancy_%": 100 * sel.sum() / max((states >= 0).sum(), 1),
+        # every state in range(n_states) was relabelled from an occupied one,
+        # so it has at least one run; an empty one means the relabelling broke
+        if not len(runs):
+            raise AssertionError(f"state {s} is in the label set but holds no "
+                                 f"samples — the relabelling is wrong")
+        entry = {"state": s, "samples": int(sel.sum()),
+                 "occupancy_%": 100 * sel.sum() / len(z),
                  "n_runs": int(len(runs)),
-                 "median_dwell_ms": float(np.median(runs) * bin_ms) if len(runs) else np.nan,
-                 "p90_dwell_ms": float(np.percentile(runs, 90) * bin_ms) if len(runs) else np.nan}
-        for band in bands:
-            entry[f"{band}_mean_z"] = float(np.nanmean(session["power_z"][band][sel]))
-            entry[f"{band}_median_z"] = float(np.nanmedian(session["power_z"][band][sel]))
-        entry["speed_median"] = float(np.nanmedian(session["speed"][sel]))
+                 "median_dwell_ms": float(np.median(runs) * step_ms),
+                 "p90_dwell_ms": float(np.percentile(runs, 90) * step_ms)}
+        for j, name in enumerate(names):
+            entry[f"{name}_mean"] = float(Y[sel, j].mean())
+            entry[f"{name}_median"] = float(np.median(Y[sel, j]))
+        # A state can hold samples without owning a whole 50 ms bin, so it can
+        # genuinely have no speed. That is reported as a count, not papered
+        # over with a number.
+        bins_here = fit["states"] == s
+        entry["speed_bins"] = int(bins_here.sum())
+        entry["speed_median"] = (float(np.nanmedian(session["speed"][bins_here]))
+                                 if bins_here.any() else np.nan)
         # Eigenvalues of the AR matrix say what the dynamics do: modulus near 1
         # is slow decay, a complex pair is an oscillation.
-        A_k = fit["arhmm"]["As"][np.flatnonzero(fit["relabel"] == s)[0]][:, :len(bands)]
+        A_k = fit["arhmm"]["As"][np.flatnonzero(fit["relabel"] == s)[0]][:, :len(names)]
         eig = np.linalg.eigvals(A_k)
         entry["max_|eig|"] = float(np.max(np.abs(eig)))
         entry["oscillatory"] = bool(np.any(np.abs(eig.imag) > 1e-6))
@@ -826,26 +1418,207 @@ def state_characterization(session, fit, verbose=True):
 
     if verbose:
         print("\nwhat each state is — occupancy, dwell time, AR dynamics, speed")
-        print(table[["state", "bins", "occupancy_%", "n_runs", "median_dwell_ms",
-                     "p90_dwell_ms", "max_|eig|", "oscillatory", "speed_median"]]
+        print(table[["state", "samples", "occupancy_%", "n_runs",
+                     "median_dwell_ms", "p90_dwell_ms", "max_|eig|",
+                     "oscillatory", "speed_bins", "speed_median"]]
               .to_string(index=False, float_format=lambda v: f"{v:.2f}"))
-        print("\nmean band power by state (z, over the whole epoch)")
-        print(table[["state"] + [f"{b}_mean_z" for b in bands]]
+        print("\nmean of each observation by state (standardized units)")
+        print(table[["state"] + [f"{n}_mean" for n in names]]
               .to_string(index=False, float_format=lambda v: f"{v:+.2f}"))
-        print("\nmedian band power by state (z)")
-        print(table[["state"] + [f"{b}_median_z" for b in bands]]
+        print("\nmedian of each observation by state")
+        print(table[["state"] + [f"{n}_median" for n in names]]
               .to_string(index=False, float_format=lambda v: f"{v:+.2f}"))
     return table
 
 
+def plot_arhmm(session, fit, state_table):
+    """Sampler traces, the state sequence, dwell times, observations, transitions.
+
+    The transition matrix has its diagonal zeroed: kappa makes self-transitions
+    dominate so completely that nothing else would be visible on the same
+    colour scale, and the interesting question is where a state goes when it
+    does leave.
+    """
+    z, n_states, cmap = fit["states_obs"], fit["n_states"], fit["cmap"]
+    arhmm, names, kinds = fit["arhmm"], fit["obs_names"], fit["obs_kinds"]
+    step_ms = 1e3 / fit["rate"]
+    t_rel = fit["t_states"] - session["t_start"]
+    run_state, _, run_len = run_lengths(z)
+
+    fig, axes = plt.subplots(3, 2, figsize=(15, 10))
+    fig.suptitle(f"{session['label']} — sticky HDP-AR-HMM on "
+                 f"{len(names)} observations @ {fit['rate']:.0f} Hz "
+                 f"({session['lfp_key']})")
+
+    ax = axes[0, 0]
+    ax.plot(arhmm["trace_K"], lw=1, color="0.3")
+    ax.axvline(fit["burn_in"], color="k", ls="--", lw=0.9, label="burn-in")
+    ax.set_xlabel("Gibbs iteration")
+    ax.set_ylabel("used states")
+    ax.set_title(f"states per iteration (estimate: {arhmm['K_hat']})", fontsize=10)
+    ax.legend(fontsize=8)
+
+    ax = axes[0, 1]
+    ax.plot(arhmm["trace_ll"], lw=1, color="0.3")
+    ax.axvline(fit["burn_in"], color="k", ls="--", lw=0.9)
+    ax.set_xlabel("Gibbs iteration")
+    ax.set_ylabel("log-likelihood")
+    ax.set_title("log-likelihood", fontsize=10)
+
+    ax = axes[1, 0]
+    ax.imshow(z[None, :], aspect="auto", interpolation="nearest", cmap=cmap,
+              vmin=-0.5, vmax=n_states - 0.5,
+              extent=[t_rel[0], t_rel[-1], 0, 1])
+    ax.set_yticks([])
+    ax.set_xlabel("time into epoch (s)")
+    ax.set_title("inferred state sequence, over the fitted segment", fontsize=10)
+
+    ax = axes[1, 1]
+    for s in range(n_states):
+        runs = run_len[run_state == s] * step_ms
+        if len(runs) < 2:
+            continue
+        ax.hist(runs, bins=np.logspace(np.log10(step_ms),
+                                       np.log10(max(runs.max(), 10 * step_ms)), 30),
+                histtype="step", lw=1.4, label=f"state {s}", color=cmap(s))
+    ax.set_xscale("log")
+    ax.set_xlabel("dwell time (ms)")
+    ax.set_ylabel("runs")
+    ax.set_title("how long each state lasts", fontsize=10)
+    ax.legend(fontsize=7, ncol=2)
+
+    ax = axes[2, 0]
+    width = 0.8 / max(n_states, 1)
+    for s in range(n_states):
+        vals = [state_table.loc[s, f"{n}_median"] for n in names]
+        ax.bar(np.arange(len(names)) + s * width - 0.4 + width / 2, vals,
+               width=width, color=cmap(s), label=f"{s}")
+    ax.axhline(0, color="k", lw=0.8)
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels([n.replace("MUA_", "") for n in names],
+                       rotation=30, ha="right", fontsize=7)
+    for tick, name, kind in zip(ax.get_xticklabels(), names, kinds):
+        tick.set_color(observation_colour(name, kind))
+    ax.set_ylabel("median (standardized)")
+    ax.set_title("what characterizes each state", fontsize=10)
+    ax.legend(fontsize=7, ncol=2, title="state", title_fontsize=7)
+
+    ax = axes[2, 1]
+    trans = np.zeros((n_states, n_states))
+    np.add.at(trans, (z[:-1], z[1:]), 1)
+    np.fill_diagonal(trans, 0)
+    trans = trans / np.maximum(trans.sum(axis=1, keepdims=True), 1)
+    im = ax.imshow(trans, cmap="magma", vmin=0)
+    fig.colorbar(im, ax=ax, shrink=0.8).set_label("P(next | leaving)", fontsize=8)
+    ax.set_xlabel("to state")
+    ax.set_ylabel("from state")
+    ax.set_title("where a state goes when it leaves", fontsize=10)
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
 # -----------------------------------------------------------------------------
-# RANKING THE COMPONENTS BY DROP-ONE RECONSTRUCTION MSE
+# ELBOWS AND THE COMPONENT RANKING
 # -----------------------------------------------------------------------------
-# What each component is worth to the reconstruction, which is not the same as
-# the order the method returns them in. For PCA and kernel PCA that order is by
-# eigenvalue and the ranking mostly confirms it. For Laplacian eigenmaps it is
-# ascending graph-Laplacian eigenvalue — a smoothness ordering — and there is
-# no reason its first component should be its most useful.
+
+
+def knee_point(x, y):
+    """Index of the point furthest from the chord joining the two endpoints.
+
+    The plain geometric elbow. It is a description of the curve's shape, not a
+    dimensionality estimate, and it is marked on the figures for orientation.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(x) < 3:
+        raise ValueError(f"a knee needs at least 3 points, got {len(x)}")
+    if np.ptp(x) < 1e-12 or np.ptp(y) < 1e-12:
+        raise ValueError("this curve is flat in x or in y, so it has no knee")
+    xs = (x - x.min()) / np.ptp(x)
+    ys = (y - y.min()) / np.ptp(y)
+    dx, dy = xs[-1] - xs[0], ys[-1] - ys[0]
+    norm = np.hypot(dx, dy)
+    if norm < 1e-12:
+        raise ValueError("the curve's endpoints coincide, so it has no chord "
+                         "to measure a knee against")
+    return int(np.argmax(np.abs(dy * (xs - xs[0]) - dx * (ys - ys[0])) / norm))
+
+
+def plot_elbows(session, embeddings, scores, max_dims=ELBOW_DIMS):
+    """Two elbows per method: the embedding's spectrum, and its own recovery.
+
+    Left: variance held by each component of the embedding, and the cumulative
+    share. For PCA this is the eigenvalue spectrum; for kernel PCA it is the
+    kernel's. For Laplacian eigenmaps it is neither — the components come out
+    in ascending graph-Laplacian order, so the curve is not expected to decay
+    and a flat one is information rather than a bug.
+
+    Right: this recording's own reconstruction curve from the sweep, which is
+    the elbow that matters for how many dimensions to keep.
+    """
+    methods = list(embeddings)
+    mine = scores[scores["file"] == session["file"]]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
+    fig.suptitle(f"{session['label']} — elbows: embedding spectrum, and "
+                 f"reconstruction against dimensions")
+
+    ax = axes[0]
+    twin = ax.twinx()
+    for method in methods:
+        var = embeddings[method]["scaled"].var(axis=0)
+        share = var / max(var.sum(), 1e-12)
+        k = np.arange(1, len(share) + 1)
+        colour = METHOD_COLORS[method]
+        ax.plot(k, share, color=colour, lw=1.6, label=method)
+        twin.plot(k, np.cumsum(share), color=colour, lw=1.0, ls="--", alpha=0.7)
+        cut = min(max_dims, len(share))
+        knee = knee_point(k[:cut], share[:cut])
+        ax.plot(k[knee], share[knee], "o", ms=7, mfc="none", mec=colour, mew=1.8)
+        ax.annotate(f"{method} knee k={k[knee]}", (k[knee], share[knee]),
+                    textcoords="offset points", xytext=(6, 6), fontsize=7,
+                    color=colour)
+    ax.set_yscale("log")
+    ax.set_xlim(1, max_dims)
+    ax.set_xlabel("component")
+    ax.set_ylabel("share of embedding variance (log)")
+    twin.set_ylabel("cumulative share (dashed)")
+    twin.set_ylim(0, 1.02)
+    ax.legend(fontsize=8, loc="upper right")
+
+    if not len(mine):
+        raise ValueError(
+            f"{session['file']} has no rows in the score frame, so there is no "
+            f"reconstruction curve to draw. The sweep either skipped it or "
+            f"wrote a different CACHE_DIR.")
+
+    ax = axes[1]
+    for method in methods:
+        sub = (mine[mine["method"] == method]
+               .groupby("k", as_index=False)["rec_corr"].mean()
+               .sort_values("k"))
+        if not len(sub):
+            raise ValueError(
+                f"{session['file']}: the score frame has no {method} rows, "
+                f"although its embedding loaded. The sweep and the cache "
+                f"disagree about what was scored.")
+        colour = METHOD_COLORS[method]
+        ax.plot(sub["k"], sub["rec_corr"], color=colour, lw=1.8, label=method)
+        cut = sub[sub["k"] <= max_dims]
+        knee = knee_point(cut["k"].values, cut["rec_corr"].values)
+        kk = cut["k"].values[knee]
+        ax.axvline(kk, color=colour, ls=":", lw=1.0)
+        ax.annotate(f"k={kk}", (kk, cut["rec_corr"].values[knee]),
+                    textcoords="offset points", xytext=(5, -10),
+                    fontsize=7, color=colour)
+    ax.set_xlim(1, max_dims)
+    ax.set_xlabel("number of dimensions")
+    ax.set_ylabel("reconstruction similarity [$r$]")
+    ax.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
 
 
 def lle_reconstruct(Y_train, X_train, Y_test, k_lle=K_LLE, lam=LAMBDA):
@@ -900,10 +1673,12 @@ def rank_components(session, embeddings, methods=METHODS, dims=RANK_DIMS,
     if verbose:
         print(f"\nranking components by drop-one held-out MSE ({dims} dims, "
               f"{folds} folds, <= {max_samples} samples)")
+    missing = [m for m in methods if m not in embeddings]
+    if missing:
+        raise KeyError(f"no embedding loaded for {missing} — pass the methods "
+                       f"you have, which are {list(embeddings)}")
     ranking, frames = {}, []
     for method in methods:
-        if method not in embeddings:
-            continue
         idx = embeddings[method]["idx"]
         take = np.arange(len(idx))
         if len(take) > max_samples:
@@ -935,21 +1710,71 @@ def rank_components(session, embeddings, methods=METHODS, dims=RANK_DIMS,
     return ranking, pd.concat(frames, ignore_index=True)
 
 
+def plot_ranking(session, rank_table, dims=RANK_DIMS, top_n=TOP_N):
+    """Drop-one MSE cost per component, as returned and sorted.
+
+    The sorted panel is the elbow of the ranking: how quickly the components
+    stop being worth anything, which is the reconstruction's own answer to how
+    many dimensions there are.
+    """
+    methods = list(dict.fromkeys(rank_table["method"]))
+    fig, axes = plt.subplots(2, len(methods), figsize=(5.2 * len(methods), 7.5),
+                             squeeze=False)
+    fig.suptitle(f"{session['label']} — what dropping one component costs the "
+                 f"reconstruction (from {dims} dims)")
+    for c, method in enumerate(methods):
+        sub = rank_table[rank_table["method"] == method]
+        colour = METHOD_COLORS[method]
+
+        ax = axes[0, c]
+        colours = ["#d62728" if r < top_n else colour for r in sub["rank"]]
+        ax.bar(sub["component"], sub["delta_mse"], color=colours)
+        ax.axhline(0, color="k", lw=0.8)
+        ax.set_xlabel("component (as the method returns it)")
+        if c == 0:
+            ax.set_ylabel("increase in held-out MSE when dropped")
+        ax.set_title(f"{method} — top {top_n} in red", fontsize=10)
+
+        ax = axes[1, c]
+        sorted_values = np.sort(sub["delta_mse"].values)[::-1]
+        rank_x = np.arange(1, len(sorted_values) + 1)
+        ax.plot(rank_x, sorted_values, "o-", ms=4, color=colour)
+        ax.axhline(0, color="k", lw=0.8)
+        knee = knee_point(rank_x, sorted_values)
+        ax.axvline(rank_x[knee], color=colour, ls=":", lw=1.2)
+        ax.annotate(f"elbow at {rank_x[knee]}",
+                    (rank_x[knee], sorted_values[knee]),
+                    textcoords="offset points", xytext=(6, 6), fontsize=8,
+                    color=colour)
+        ax.set_xlabel("component, ranked")
+        if c == 0:
+            ax.set_ylabel("increase in held-out MSE when dropped")
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
 # -----------------------------------------------------------------------------
-# FIGURES
+# THE MANIFOLD FIGURES
 # -----------------------------------------------------------------------------
 
 
-def colour_limits(values, lo=2, hi=98):
-    """Percentile limits that survive NaNs and constant input."""
+def colour_limits(label, values, lo=2, hi=98):
+    """Percentile colour limits, computed on the finite values.
+
+    Dropping NaNs is not imputation — they are excluded from the scale, not
+    replaced. An all-NaN or constant series has no scale to draw, and a
+    colourbar invented for it would read as though the data were there.
+    """
     finite = values[np.isfinite(values)]
     if finite.size == 0:
-        return 0.0, 1.0
+        raise ValueError(f"{label}: every value is NaN, so there is no colour "
+                         f"scale for it")
     vmin, vmax = np.percentile(finite, [lo, hi])
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax - vmin < 1e-9:
-        vmin, vmax = float(finite.min()), float(finite.max())
     if vmax - vmin < 1e-9:
-        vmin, vmax = vmin - 0.5, vmax + 0.5
+        raise ValueError(f"{label}: the {lo}th and {hi}th percentiles are both "
+                         f"{vmin:.6g} — this series is constant and a colour "
+                         f"scale would be meaningless")
     return float(vmin), float(vmax)
 
 
@@ -963,113 +1788,6 @@ def plot_points(embeddings, method, n_points=MAP_MAX_POINTS, seed=0):
     return take, idx[take]
 
 
-def plot_arhmm(session, fit, state_table):
-    """Sampler traces, the state sequence, dwell times, band power, transitions.
-
-    The transition matrix has its diagonal zeroed: kappa makes self-transitions
-    dominate so completely that nothing else would be visible on the same
-    colour scale, and the interesting question is where a state goes when it
-    does leave.
-    """
-    states, n_states, cmap = fit["states"], fit["n_states"], fit["cmap"]
-    arhmm, bands = fit["arhmm"], session["bands"]
-    centers, bin_ms = session["centers"], session["bin_size_s"] * 1e3
-    lab = states[fit["state_bins"]]
-    run_state, _, run_len = run_lengths(lab)
-
-    fig, axes = plt.subplots(3, 2, figsize=(15, 10))
-    fig.suptitle(f"{session['label']} — sticky HDP-AR-HMM on the "
-                 f"{session['lfp_key']} band power")
-
-    ax = axes[0, 0]
-    ax.plot(arhmm["trace_K"], lw=1, color="0.3")
-    ax.axvline(fit["burn_in"], color="k", ls="--", lw=0.9, label="burn-in")
-    ax.set_xlabel("Gibbs iteration")
-    ax.set_ylabel("used states")
-    ax.set_title(f"states per iteration (estimate: {arhmm['K_hat']})", fontsize=10)
-    ax.legend(fontsize=8)
-
-    ax = axes[0, 1]
-    ax.plot(arhmm["trace_ll"], lw=1, color="0.3")
-    ax.axvline(fit["burn_in"], color="k", ls="--", lw=0.9)
-    ax.set_xlabel("Gibbs iteration")
-    ax.set_ylabel("log-likelihood")
-    ax.set_title("log-likelihood", fontsize=10)
-
-    ax = axes[1, 0]
-    ax.imshow(lab[None, :], aspect="auto", interpolation="nearest", cmap=cmap,
-              vmin=-0.5, vmax=n_states - 0.5,
-              extent=[centers[fit["state_bins"]][0] - centers[0],
-                      centers[fit["state_bins"]][-1] - centers[0], 0, 1])
-    ax.set_yticks([])
-    ax.set_xlabel("time into epoch (s)")
-    ax.set_title("inferred state sequence", fontsize=10)
-
-    ax = axes[1, 1]
-    for s in range(n_states):
-        runs = run_len[run_state == s] * bin_ms
-        if len(runs) < 2:
-            continue
-        ax.hist(runs, bins=np.logspace(np.log10(bin_ms),
-                                       np.log10(max(runs.max(), 200)), 30),
-                histtype="step", lw=1.4, label=f"state {s}", color=cmap(s))
-    ax.set_xscale("log")
-    ax.set_xlabel("dwell time (ms)")
-    ax.set_ylabel("runs")
-    ax.set_title("how long each state lasts", fontsize=10)
-    ax.legend(fontsize=7, ncol=2)
-
-    ax = axes[2, 0]
-    width = 0.8 / max(n_states, 1)
-    for s in range(n_states):
-        vals = [state_table.loc[s, f"{b}_median_z"] for b in bands]
-        ax.bar(np.arange(len(bands)) + s * width - 0.4 + width / 2, vals,
-               width=width, color=cmap(s), label=f"{s}")
-    ax.axhline(0, color="k", lw=0.8)
-    ax.set_xticks(range(len(bands)))
-    ax.set_xticklabels(bands, rotation=20, fontsize=8)
-    ax.set_ylabel("median power (z)")
-    ax.set_title("band power that characterizes each state", fontsize=10)
-    ax.legend(fontsize=7, ncol=2, title="state", title_fontsize=7)
-
-    ax = axes[2, 1]
-    trans = np.zeros((n_states, n_states))
-    np.add.at(trans, (lab[:-1], lab[1:]), 1)
-    np.fill_diagonal(trans, 0)
-    trans = trans / np.maximum(trans.sum(axis=1, keepdims=True), 1)
-    im = ax.imshow(trans, cmap="magma", vmin=0)
-    fig.colorbar(im, ax=ax, shrink=0.8).set_label("P(next | leaving)", fontsize=8)
-    ax.set_xlabel("to state")
-    ax.set_ylabel("from state")
-    ax.set_title("where a state goes when it leaves", fontsize=10)
-    fig.tight_layout()
-    plt.show()
-    plt.close(fig)
-
-
-def plot_ranking(session, rank_table, dims=RANK_DIMS, top_n=TOP_N):
-    """Drop-one MSE cost per component, one panel per method."""
-    methods = list(dict.fromkeys(rank_table["method"]))
-    fig, axes = plt.subplots(1, len(methods), figsize=(5.2 * len(methods), 4),
-                             squeeze=False)
-    fig.suptitle(f"{session['label']} — what dropping one component costs the "
-                 f"reconstruction (from {dims} dims)")
-    for c, method in enumerate(methods):
-        ax = axes[0, c]
-        sub = rank_table[rank_table["method"] == method]
-        colours = ["#d62728" if r < top_n else METHOD_COLORS.get(method, "0.4")
-                   for r in sub["rank"]]
-        ax.bar(sub["component"], sub["delta_mse"], color=colours)
-        ax.axhline(0, color="k", lw=0.8)
-        ax.set_xlabel("component (as the method returns it)")
-        if c == 0:
-            ax.set_ylabel("increase in held-out MSE when dropped")
-        ax.set_title(f"{method} — top {top_n} in red", fontsize=10)
-    fig.tight_layout()
-    plt.show()
-    plt.close(fig)
-
-
 def plot_manifold(session, embeddings, fit, ranking, method,
                   n_points=MAP_MAX_POINTS):
     """The manifold in its top three components, coloured four ways.
@@ -1077,6 +1795,9 @@ def plot_manifold(session, embeddings, fit, ranking, method,
     Top three by the drop-one ranking, not components 1-3. For PCA those
     usually coincide; for Laplacian eigenmaps they generally do not, which is
     the whole reason the ranking exists.
+
+    The state panel draws the unlabelled bins in light grey underneath, since
+    the AR-HMM was fit on a segment and most of the manifold has no state.
     """
     comps = ranking[method][:3]
     take, bins_here = plot_points(embeddings, method, n_points)
@@ -1085,24 +1806,30 @@ def plot_manifold(session, embeddings, fit, ranking, method,
 
     with np.errstate(divide="ignore", invalid="ignore"):
         log_speed = np.log10(np.maximum(session["speed"][bins_here], 1e-2))
+    state_here = fit["states"][bins_here]
+    labelled = state_here >= 0
     layers = [
-        ("track position x (cm)", session["track_x"][bins_here], "cividis", None),
-        ("track position y (cm)", session["track_y"][bins_here], "cividis", None),
-        ("log10 speed (cm/s)", log_speed, "magma", None),
-        ("AR-HMM state", fit["states"][bins_here].astype(float), cmap,
-         (-0.5, n_states - 0.5)),
+        ("track position x (cm)", session["track_x"][bins_here], "cividis", None, None),
+        ("track position y (cm)", session["track_y"][bins_here], "cividis", None, None),
+        ("log10 speed (cm/s)", log_speed, "magma", None, None),
+        (f"AR-HMM state ({labelled.sum()} bins)", state_here.astype(float),
+         cmap, (-0.5, n_states - 0.5), labelled),
     ]
 
     fig = plt.figure(figsize=(5.0 * len(layers), 4.6))
     fig.suptitle(f"{session['label']} — {method} — components "
                  + ", ".join(f"#{c}" for c in comps)
                  + " (top 3 by drop-one MSE)")
-    for i, (title, values, cmap_i, limits) in enumerate(layers, start=1):
+    for i, (title, values, cmap_i, limits, mask) in enumerate(layers, start=1):
         ax = fig.add_subplot(1, len(layers), i, projection="3d")
-        vmin, vmax = limits if limits else colour_limits(values)
-        sc = ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2], c=values,
-                        cmap=cmap_i, s=2.0, alpha=0.55, vmin=vmin, vmax=vmax,
-                        linewidths=0)
+        if mask is not None and not mask.all():
+            ax.scatter(coords[~mask, 0], coords[~mask, 1], coords[~mask, 2],
+                       c="0.85", s=1.2, alpha=0.25, linewidths=0)
+        show = mask if mask is not None else np.ones(len(coords), dtype=bool)
+        vmin, vmax = limits if limits else colour_limits(title, values)
+        sc = ax.scatter(coords[show, 0], coords[show, 1], coords[show, 2],
+                        c=values[show], cmap=cmap_i, s=2.0, alpha=0.6,
+                        vmin=vmin, vmax=vmax, linewidths=0)
         cbar = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.10)
         cbar.set_label(title, fontsize=8)
         cbar.ax.tick_params(labelsize=7)
@@ -1121,12 +1848,13 @@ def plot_covariates(session, embeddings, fit, ranking, method, top_n=TOP_N,
 
     This is where a component either lines up with something measurable or does
     not: one that tracks position paints a gradient, one that only tracks state
-    paints blocks of colour.
+    paints blocks of colour. Bins outside the fitted segment are drawn grey, so
+    the colour always means something.
     """
     covariates = [("track x (cm)", session["track_x"]),
                   ("track y (cm)", session["track_y"]),
                   ("speed (cm/s)", session["speed"])]
-    covariates += [(f"{b} power (z)", session["power_z"][b])
+    covariates += [(f"{b} power (z)", session["power_z_bins"][b])
                    for b in session["bands"]]
 
     comps = ranking[method][:top_n]
@@ -1138,16 +1866,22 @@ def plot_covariates(session, embeddings, fit, ranking, method, top_n=TOP_N,
                              figsize=(2.9 * len(covariates), 2.7 * len(comps)),
                              squeeze=False)
     fig.suptitle(f"{session['label']} — {method} — top {top_n} components "
-                 f"against the covariates, coloured by AR-HMM state")
+                 f"against the covariates, coloured by AR-HMM state "
+                 f"(grey = outside the fitted segment)")
     for r, comp in enumerate(comps):
         score = coords[:, r]
         for c, (name, series) in enumerate(covariates):
             ax = axes[r, c]
             values = series[bins_here]
             ok = np.isfinite(values) & np.isfinite(score)
-            ax.scatter(values[ok], score[ok], c=state_here[ok], cmap=fit["cmap"],
-                       vmin=-0.5, vmax=fit["n_states"] - 0.5, s=1.5, alpha=0.4,
-                       linewidths=0)
+            grey = ok & (state_here < 0)
+            shown = ok & (state_here >= 0)
+            if grey.any():
+                ax.scatter(values[grey], score[grey], c="0.85", s=1.2,
+                           alpha=0.25, linewidths=0)
+            ax.scatter(values[shown], score[shown], c=state_here[shown],
+                       cmap=fit["cmap"], vmin=-0.5, vmax=fit["n_states"] - 0.5,
+                       s=2.0, alpha=0.6, linewidths=0)
             if r == len(comps) - 1:
                 ax.set_xlabel(name, fontsize=8)
             if c == 0:
@@ -1166,37 +1900,53 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
                         methods=MAP_METHODS):
     """A few seconds with everything on one time axis, shaded by state.
 
-    start_s=None takes the window holding the most state changes, so the
-    example shows switching rather than a quiet stretch. A method fit on every
-    tenth bin is drawn as markers: joining those points with a line would imply
-    a resolution it does not have.
+    start_s=None takes the window inside the fitted segment holding the most
+    state changes, so the example shows switching rather than a quiet stretch.
+    The observations are drawn on their own grid; the embeddings at whatever
+    rate they were fit on, as markers when that is coarser than one bin,
+    because joining those points would imply a resolution they lack.
     """
-    states, cmap = fit["states"], fit["cmap"]
-    centers, n_bins = session["centers"], session["n_bins"]
-    window_bins = int(round(window_s / session["bin_size_s"]))
+    missing = [m for m in methods if m not in embeddings or m not in ranking]
+    if missing:
+        raise KeyError(f"{missing} have no embedding or no ranking — drawing a "
+                       f"blank row for them would read as a flat score rather "
+                       f"than an absent one. Pass methods={list(ranking)}.")
+
+    z, cmap = fit["states_obs"], fit["cmap"]
+    t_states, t0 = fit["t_states"], session["t_start"]
+    names, kinds = fit["obs_names"], fit["obs_kinds"]
+    Y_obs = fit["obs"]["Y"]
+    span = int(round(window_s * fit["rate"]))
 
     if start_s is None:
-        labelled = states >= 0
-        changes = np.zeros(n_bins)
-        changes[1:] = ((np.diff(states) != 0) & labelled[1:]
-                       & labelled[:-1]).astype(float)
-        density = np.convolve(changes, np.ones(window_bins), mode="valid")
-        start_bin = int(np.argmax(density))
-        print(f"\nstart_s is None — taking the busiest window: "
-              f"{density[start_bin]:.0f} state changes starting "
-              f"{centers[start_bin] - centers[0]:.1f}s into the epoch")
+        changes = np.concatenate(([0.0], (np.diff(z) != 0).astype(float)))
+        density = np.convolve(changes, np.ones(min(span, len(changes))),
+                              mode="valid")
+        first = int(np.argmax(density))
+        print(f"\nstart_s is None — busiest window in the segment: "
+              f"{density[first]:.0f} state changes starting "
+              f"{t_states[first] - t0:.1f}s into the epoch")
     else:
-        start_bin = int(np.searchsorted(centers - centers[0], start_s))
-    stop_bin = min(start_bin + window_bins, n_bins)
-    win = np.arange(start_bin, stop_bin)
-    t_win = centers[win] - centers[start_bin]
+        first = int(np.clip(np.searchsorted(t_states - t0, start_s),
+                            0, max(len(z) - span, 0)))
+    last = min(first + span, len(z))
+    seg = np.arange(first, last)
+    t_win = t_states[seg] - t_states[first]
+    win_t0, win_t1 = t_states[first], t_states[last - 1]
+    obs_rows = fit["state_index"][seg]
 
-    rows = 3 + len(methods)
-    fig, axes = plt.subplots(rows, 1, figsize=(13, 2.0 * rows), sharex=True)
-    fig.suptitle(f"{session['label']} — {window_s:.0f} s from "
-                 f"{centers[start_bin] - centers[0]:.1f}s into the epoch")
+    bin_lo = int(np.searchsorted(session["edges"], win_t0, side="right") - 1)
+    bin_hi = int(np.searchsorted(session["edges"], win_t1, side="right"))
+    bins_win = np.arange(max(bin_lo, 0), min(bin_hi, session["n_bins"]))
 
-    run_s, run_i, run_n = run_lengths(states[win])
+    band_cols = [j for j, k in enumerate(kinds) if k == "band"]
+    mua_cols = [j for j, k in enumerate(kinds) if k == "mua"]
+    rows = 2 + int(bool(band_cols)) + int(bool(mua_cols)) + len(methods)
+    fig, axes = plt.subplots(rows, 1, figsize=(13, 1.9 * rows), sharex=True)
+    fig.suptitle(f"{session['label']} — {window_s:.1f} s from "
+                 f"{win_t0 - t0:.1f}s into the epoch, shaded by state")
+
+    run_s, run_i, run_n = run_lengths(z[seg])
     for ax in axes:
         for s, i0, n in zip(run_s, run_i, run_n):
             if s < 0:
@@ -1204,40 +1954,46 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
             ax.axvspan(t_win[i0], t_win[min(i0 + n, len(t_win) - 1)],
                        color=cmap(s), alpha=0.18, lw=0)
 
+    t_bins = session["centers"][bins_win] - win_t0
     ax = axes[0]
-    ax.plot(t_win, session["track_x"][win], lw=1.4, color="#1f77b4", label="x")
-    ax.plot(t_win, session["track_y"][win], lw=1.4, color="#2ca02c", label="y")
+    ax.plot(t_bins, session["track_x"][bins_win], lw=1.4, color="#1f77b4", label="x")
+    ax.plot(t_bins, session["track_y"][bins_win], lw=1.4, color="#2ca02c", label="y")
     ax.set_ylabel("position (cm)", fontsize=9)
     ax.legend(fontsize=7, ncol=2, loc="upper right")
 
     ax = axes[1]
-    ax.plot(t_win, session["speed"][win], lw=1.4, color="0.2")
+    ax.plot(t_bins, session["speed"][bins_win], lw=1.4, color="0.2")
     ax.set_ylabel("speed (cm/s)", fontsize=9)
 
-    ax = axes[2]
-    for band in session["bands"]:
-        ax.plot(t_win, session["power_z"][band][win], lw=1.2,
-                color=BAND_COLORS.get(band, "0.4"), label=band)
-    ax.axhline(0, color="k", lw=0.7, ls=":")
-    ax.set_ylabel("band power (z)", fontsize=9)
-    ax.legend(fontsize=7, ncol=len(session["bands"]), loc="upper right")
-
-    for ax, method in zip(axes[3:], methods):
-        if method not in embeddings or method not in ranking:
-            ax.set_ylabel(f"{method}\n(not available)", fontsize=9)
+    next_row = 2
+    for cols, ylabel in ((band_cols, "band power (z)"),
+                         (mua_cols, "MUA (z)")):
+        if not cols:
             continue
+        ax = axes[next_row]
+        for j in cols:
+            ax.plot(t_win, Y_obs[obs_rows, j], lw=1.0,
+                    color=observation_colour(names[j], kinds[j]),
+                    label=names[j].replace("MUA_", ""))
+        ax.axhline(0, color="k", lw=0.7, ls=":")
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.legend(fontsize=6, ncol=min(len(cols), 4), loc="upper right")
+        next_row += 1
+
+    for ax, method in zip(axes[next_row:], methods):
         idx = embeddings[method]["idx"]
-        here = (idx >= start_bin) & (idx < stop_bin)
-        t_here = centers[idx[here]] - centers[start_bin]
-        stride = int(np.median(np.diff(idx)))
+        stride = embeddings[method]["stride"]
+        here = (idx >= bins_win[0]) & (idx <= bins_win[-1])
+        t_here = session["centers"][idx[here]] - win_t0
         for j, comp in enumerate(ranking[method][:top_n]):
             shade = plt.get_cmap("viridis")(j / max(top_n - 1, 1))
+            style = dict(color=shade, label=f"#{comp}")
             if stride <= 1:
-                ax.plot(t_here, embeddings[method]["scaled"][here, comp], lw=1.2,
-                        color=shade, label=f"#{comp}")
+                ax.plot(t_here, embeddings[method]["scaled"][here, comp],
+                        lw=1.2, **style)
             else:
                 ax.plot(t_here, embeddings[method]["scaled"][here, comp], "o-",
-                        ms=4, lw=0.8, alpha=0.8, color=shade, label=f"#{comp}")
+                        ms=4, lw=0.8, alpha=0.8, **style)
         ax.set_ylabel(f"{method}\nscore"
                       + (f"\n({stride * session['bin_size_s'] * 1e3:.0f} ms)"
                          if stride > 1 else ""), fontsize=9)
@@ -1249,66 +2005,137 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
     plt.show()
     plt.close(fig)
 
-    present = sorted({int(s) for s in states[win] if s >= 0})
+    present = sorted(set(int(s) for s in z[seg]))
     print(f"states in this window: {present}")
     print(state_table[state_table["state"].isin(present)]
           [["state", "occupancy_%", "median_dwell_ms"]
-           + [f"{b}_median_z" for b in session["bands"]]]
+           + [f"{n}_median" for n in names]]
           .to_string(index=False, float_format=lambda v: f"{v:+.2f}"))
 
 
-print("definitions loaded — run CELL 2 to analyse a recording")
+print("definitions loaded — CELL 2 surveys the recordings, CELL 3 runs one")
 
 
 # %% ===========================================================================
-# CELL 2 — one recording, end to end
+# CELL 2 — survey the recordings and suggest one
 # ==============================================================================
-# The knobs that change between runs sit here; everything else is a default in
-# CELL 1. Start with RUN_MAX_BINS set low — the sampler's state step is a
-# Python loop over time, so the full 40-minute epoch at 50 ms is the expensive
-# part of this script by a wide margin.
+# Units per region and cell type for every file, and the ranking by how typical
+# each recording's reconstruction is. Reads the unit table out of every NWB,
+# which takes a few seconds per file and bins nothing.
 
-RUN_RECORDING = None          # None = the suggestion; else a substring
-RUN_MAX_BINS = 15000          # AR-HMM bins, contiguous from the start; None = all
-RUN_ITER = 400                # Gibbs iterations
+print("=" * 78)
+print("recording survey")
+print("=" * 78)
+
+recordings = recording_table()
+print(f"{len(recordings)} recordings under {DOWNLOAD_DIR}")
+units_long, units_wide = survey_units(recordings)
+
+print("\nunits per recording, by region and cell type")
+print(units_wide.to_string(index=False))
+print("\ntotals by region")
+print(units_long.groupby(REGION_FIELD)["n"].agg(["sum", "mean", "min", "max"])
+      .round(1).to_string())
+print("\ntotals by cell type")
+print(units_long.groupby(CELL_TYPE_FIELD)["n"].agg(["sum", "mean", "min", "max"])
+      .round(1).to_string())
+
+scores = load_scores()
+eligible = suggest_recordings(scores, recordings, units_long)
+plot_unit_survey(units_long)
+
+print("\npick one and put it in RECORDING in CELL 3, e.g.")
+print(f'    RECORDING = "{Path(eligible["file"].iloc[0]).stem}"')
+
+
+# %% ===========================================================================
+# CELL 3 — one recording, end to end
+# ==============================================================================
+# Everything that changes between runs is here. OBS_SPEC is what the AR-HMM is
+# trained on — change it, re-run this cell, look at plot_observations, repeat.
+# The session is loaded once and holds the raw ingredients, so rebuilding the
+# observations under a new spec costs seconds and does not re-read the file.
+# build_observations() documents every key.
+#
+# RUN_SECONDS is the one to watch. The sampler's state step is a Python loop
+# over time, so 60 s at 1250 Hz is already 75k samples per iteration. Start
+# short, settle kappa and L, then lengthen — or raise OBS_SPEC["decimate"] to
+# trade resolution for coverage.
+
+RECORDING = "sub-M03_ses-20240622"   # substring of the file, from CELL 2
+
+# As set: band envelopes, no extra smoothing (the envelope is the smoothing),
+# z-scored; plus the MUA of every region x cell-type population with >= 3
+# units, on a causal 20 ms kernel.
+OBS_SPEC = {
+    "rate": "lfp",            # "lfp", or a number in Hz
+    "bin_method": "mean",     # "mean" | "max" | "sum", when resampling
+    "decimate": 1,
+    "bands": {
+        "use": True,
+        "bands": dict(BANDS),
+        "measure": "envelope",   # "envelope" | "power" | "filtered"
+        "smooth": None,          # or {"kind": "half_gaussian", "sigma_s": 0.01}
+        "log": False,
+        "zscore": True,
+    },
+    "mua": {
+        "use": True,
+        "regions": None,         # None = every region; e.g. ("CA1", "CA3")
+        "cell_types": None,      # None = every type
+        "min_units": 3,
+        "smooth": {"kind": "half_gaussian", "sigma_s": 0.020},
+        "log": False,
+        "zscore": True,
+    },
+}
+
+RUN_SECONDS = 60.0            # segment to fit, in seconds; None = whole epoch
+RUN_START_S = None            # None = the most variable stretch
+RUN_NLAGS = 1
+RUN_ITER = 400
 RUN_BURN_IN = 200
 RUN_KAPPA = 50.0              # sticky bias: bigger = longer dwell times
 RUN_L = 20                    # truncation; raise it if K_hat lands on L-1
-RUN_WINDOW_START_S = None     # None = the busiest window in the session
-RUN_METHODS = ("PCA", "Laplacian")
+RUN_WINDOW_S = 8.0
+RUN_WINDOW_START_S = None     # None = the busiest window in the segment
+RUN_METHODS = ("PCA", "KernelPCA", "Laplacian")
 
 print("=" * 78)
 print("HDP-AR-HMM states against the cached manifold embeddings")
 print("=" * 78)
 
-# 1. which recording
-recordings = recording_table()
-scores = load_scores()
-eligible = suggest_recordings(scores, recordings)
-row = resolve_recording(recordings, eligible, RUN_RECORDING)
-
-# 2. the session on the sweep's bin grid, with behaviour and band power
+# 1. the recording, on the sweep's bin grid plus the LFP grid
+row = resolve_recording(recordings, RECORDING)
 session = load_session(row)
 
-# 3. the embeddings the sweep already computed
+# 2. the embeddings the sweep already computed
 embeddings, common_idx = load_embeddings(session)
 
-# 4. the AR-HMM on the band power
-fit = fit_states(session, max_bins=RUN_MAX_BINS, n_iter=RUN_ITER,
-                 burn_in=RUN_BURN_IN, kappa=RUN_KAPPA, L=RUN_L)
+# 3. elbows: the embedding spectra, and this recording's own recovery curve
+plot_elbows(session, embeddings, scores)
+
+# 4. build the observations from OBS_SPEC and look at them before fitting
+obs = build_observations(session, OBS_SPEC)
+plot_observations(session, obs)
+
+# 5. the AR-HMM, at the observation grid's own rate
+fit = fit_states(session, obs, seconds=RUN_SECONDS, start_s=RUN_START_S,
+                 nlags=RUN_NLAGS, n_iter=RUN_ITER, burn_in=RUN_BURN_IN,
+                 kappa=RUN_KAPPA, L=RUN_L)
 state_table = state_characterization(session, fit)
 plot_arhmm(session, fit, state_table)
 
-# 5. what each component is worth to the reconstruction
+# 6. what each component is worth to the reconstruction
 ranking, rank_table = rank_components(session, embeddings)
 plot_ranking(session, rank_table)
 
-# 6. the manifolds and the components, against behaviour and band power
+# 7. the manifolds and the components, against behaviour and band power
 for method in RUN_METHODS:
-    if method in embeddings and method in ranking:
-        plot_manifold(session, embeddings, fit, ranking, method)
-        plot_covariates(session, embeddings, fit, ranking, method)
+    plot_manifold(session, embeddings, fit, ranking, method)
+    plot_covariates(session, embeddings, fit, ranking, method)
 
-# 7. one window with everything on a shared time axis
+# 8. one window with everything on a shared time axis
 plot_example_window(session, embeddings, fit, ranking, state_table,
-                    start_s=RUN_WINDOW_START_S, methods=RUN_METHODS)
+                    start_s=RUN_WINDOW_START_S, window_s=RUN_WINDOW_S,
+                    methods=RUN_METHODS)
