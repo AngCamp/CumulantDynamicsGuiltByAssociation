@@ -228,6 +228,24 @@ def shade(colour, fraction):
             b + (1 - b) * fraction)
 
 
+def label_axis(ax, labels, axis="x", rotation=0, fontsize=7):
+    """Put one tick per category, centred on its cell.
+
+    imshow indexes cells 0..n-1, so matplotlib's automatic locator picks round
+    numbers like 2.5 and lands them between cells. Anything drawn on a
+    categorical axis has to set its ticks explicitly.
+    """
+    ticks = np.arange(len(labels))
+    text = [str(v) for v in labels]
+    if axis == "x":
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(text, rotation=rotation, fontsize=fontsize,
+                           ha="right" if rotation not in (0, 90) else "center")
+    else:
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(text, fontsize=fontsize)
+
+
 def show_table(frame, floats=None):
     """Render a frame as a notebook table, or print it outside one.
 
@@ -706,8 +724,7 @@ def plot_unit_survey(units_long, focus=FOCUS_REGION):
     ax.legend(handles=type_keys, fontsize=8, ncol=len(types),
               loc="upper left", title="cell type", title_fontsize=8)
 
-    axes[-1].set_xticks(x)
-    axes[-1].set_xticklabels(names, rotation=60, ha="right", fontsize=8)
+    label_axis(axes[-1], names, axis="x", rotation=60, fontsize=8)
     axes[-1].set_xlim(-0.6, len(names) - 0.4)
     fig.tight_layout()
     plt.show()
@@ -917,7 +934,7 @@ def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
                      .groupby([REGION_FIELD, CELL_TYPE_FIELD]).size()
                      .rename("units").reset_index())
         print("\nunits kept, by region and cell type")
-        print(inventory.to_string(index=False))
+        show_table(inventory.set_index([REGION_FIELD, CELL_TYPE_FIELD]))
         print(f"\nLFP: {lfp_key} @ {fs:.0f} Hz"
               + (f"  (of {len(lfp_keys)}: {', '.join(lfp_keys)})"
                  if len(lfp_keys) > 1 else "")
@@ -975,8 +992,7 @@ def filter_bands(session, bands, verbose=True):
         print(f"\nfiltered {len(bands)} bands in "
               f"{time.perf_counter() - t0:.1f}s "
               f"(raw envelope amplitude, before the spec's log or z-score)")
-        print(session["power_summary"].to_string(
-            index=False, float_format=lambda v: f"{v:.3f}"))
+        show_table(session["power_summary"].set_index("band").round(3))
     return session
 
 
@@ -1100,9 +1116,12 @@ def build_observations(session, spec, verbose=True):
                     zero, so "filtered" and log are not combinable.
           zscore    per trace, over the whole epoch, last.
         mua
-          regions,  None = every one present. An explicit list that matches
-          cell_types  nothing raises rather than quietly fitting on bands.
-          min_units populations smaller than this are reported and not used.
+          groups    a list of (region, cell type) pairs, one pooled trace
+                    each, so any combination can be asked for — CA1 pyramidal
+                    with CA3 interneurons and nothing else, say. None means
+                    every pair this recording has. A pair the recording lacks
+                    raises rather than being skipped.
+          min_units pairs smaller than this are reported and not used.
           smooth    not really optional: spikes on the LFP grid are a
                     near-binary train, and this kernel is what makes a rate.
     """
@@ -1157,45 +1176,45 @@ def build_observations(session, spec, verbose=True):
 
     mua_spec = spec.get("mua", {})
     if mua_spec.get("use", True):
-        want_regions = mua_spec.get("regions")
-        want_types = mua_spec.get("cell_types")
+        # `groups` is a list of (region, cell type) pairs, so CA1 pyramidal
+        # and CA3 interneurons can be asked for without dragging in CA1
+        # interneurons and CA3 pyramidal. None means every pair present.
+        wanted = mua_spec.get("groups")
         min_units = int(mua_spec.get("min_units", 3))
         edges_for_counts = (session["lfp_edges"] if native else target_edges)
-        selected, too_small = [], []
-        for key in session["mua_groups"]:
-            _, region, cell_type = key.split("_", 2)
-            if want_regions is not None and region not in want_regions:
-                continue
-            if want_types is not None and cell_type not in want_types:
-                continue
-            (selected if session["mua_units"][key] >= min_units
-             else too_small).append(key)
+        available = session["mua_groups"]
 
-        # Say what was asked for and not found. A region x cell type the spec
-        # names but this recording does not have is a fact about the
-        # recording, and it should be on the page rather than inferred from a
-        # trace count.
-        if want_regions is not None and want_types is not None:
-            asked = {f"MUA_{r}_{c}" for r in want_regions for c in want_types}
-            absent = sorted(asked - set(session["mua_groups"]))
-            if absent and verbose:
-                print("    requested but not present in this recording: "
-                      + ", ".join(a.replace("MUA_", "") for a in absent))
+        if wanted is None:
+            keys = list(available)
+        else:
+            keys, absent = [], []
+            for pair in wanted:
+                region, cell_type = pair
+                key = f"MUA_{region}_{cell_type}"
+                (keys if key in available else absent).append(key)
+            if absent:
+                raise KeyError(
+                    "OBS_SPEC['mua']['groups'] names pairs this recording does "
+                    "not have: "
+                    + ", ".join(a.replace("MUA_", "") for a in absent)
+                    + ". It has: "
+                    + ", ".join(f"{k.replace('MUA_', '')} ({v})"
+                                for k, v in available.items()))
+
+        selected = [k for k in keys if session["mua_units"][k] >= min_units]
+        too_small = [k for k in keys if session["mua_units"][k] < min_units]
         if too_small and verbose:
-            print(f"    present but under min_units={min_units}, not used: "
+            print(f"    under min_units={min_units}, not used: "
                   + ", ".join(f"{k.replace('MUA_', '')} "
                               f"({session['mua_units'][k]})"
                               for k in too_small))
-        if want_regions is not None or want_types is not None:
-            # an explicit request that matches nothing is a typo, not an empty
-            # set: say so rather than quietly fitting on the bands alone
-            if not selected:
-                raise ValueError(
-                    f"OBS_SPEC['mua'] asks for regions={want_regions}, "
-                    f"cell_types={want_types} with min_units={min_units} and "
-                    f"matched no population. This session has: "
-                    + ", ".join(f"{k} ({v} units)"
-                                for k, v in session["mua_units"].items()))
+        if wanted is not None and not selected:
+            raise ValueError(
+                f"every pair in OBS_SPEC['mua']['groups'] fell below "
+                f"min_units={min_units}. This session has: "
+                + ", ".join(f"{k.replace('MUA_', '')} ({v})"
+                            for k, v in available.items()))
+
         for key in selected:
             times = session["mua_groups"][key]
             counts = np.diff(np.searchsorted(times, edges_for_counts)).astype(np.float64)
@@ -1245,7 +1264,7 @@ def build_observations(session, spec, verbose=True):
     if verbose:
         print(f"\nobservations: {Y.shape[1]} traces x {Y.shape[0]} samples at "
               f"{rate:.0f} Hz")
-        print(table.to_string(index=False, float_format=lambda v: f"{v:+.2f}"))
+        show_table(table.set_index("observation").round(3))
     return {"Y": Y, "names": names, "kinds": kinds, "t": t, "rate": rate,
             "table": table, "spec": spec}
 
@@ -1300,15 +1319,20 @@ def plot_observations(session, obs, seconds=4.0, start_s=None):
                  f"into the epoch (z, offset)", fontsize=9)
 
     ax = axes[1]
+    # The diagonal is 1 by construction. Leaving it in sets the colour range
+    # to a number that carries no information and flattens everything else.
     corr = np.corrcoef(Y.T)
-    im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1)
-    fig.colorbar(im, ax=ax, shrink=0.8).set_label("correlation", fontsize=8)
-    ax.set_xticks(range(len(names)))
-    ax.set_yticks(range(len(names)))
+    np.fill_diagonal(corr, np.nan)
+    limit = float(np.nanmax(np.abs(corr)))
+    im = ax.imshow(corr, cmap="RdBu_r", vmin=-limit, vmax=limit, aspect="auto")
+    bar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    bar.set_label("Pearson r", fontsize=8)
+    bar.ax.tick_params(labelsize=7)
     short = [n.replace("MUA_", "") for n in names]
-    ax.set_xticklabels(short, rotation=90, fontsize=6)
-    ax.set_yticklabels(short, fontsize=6)
-    ax.set_title("how much the inputs already say the same thing", fontsize=9)
+    label_axis(ax, short, axis="x", rotation=90, fontsize=6)
+    label_axis(ax, short, axis="y", fontsize=6)
+    ax.set_title(f"observation correlation (diagonal dropped, "
+                 f"|r| <= {limit:.2f})", fontsize=9)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -1477,20 +1501,38 @@ def fit_states(session, obs, seconds=ARHMM_SECONDS, start_s=ARHMM_START_S,
               f"L={L}. Raise L — the model wanted more states than it was "
               f"allowed.")
 
+    # Keep exactly the states the model calls used — the ones holding at least
+    # min_frac of the samples, which is what K_hat counts. The truncation
+    # leaves a tail of states with a handful of samples each; carrying them
+    # into the figures put fifteen entries in a legend for a four-state fit.
+    # Those samples become -1 and are drawn grey, with the cost printed.
     z_raw = arhmm["z"]
     occupancy = np.bincount(z_raw, minlength=L)
+    used = occupancy >= min_frac * len(z_raw)
     order = np.argsort(-occupancy)
     relabel = np.full(len(occupancy), -1)
-    relabel[order[occupancy[order] > 0]] = np.arange(int((occupancy > 0).sum()))
+    relabel[order[used[order]]] = np.arange(int(used.sum()))
     z = relabel[z_raw]
-    n_states = int(z.max()) + 1
+    n_states = int(used.sum())
+
+    minor = int((z < 0).sum())
+    if minor:
+        print(f"    {int((occupancy > 0).sum()) - n_states} states below "
+              f"min_frac={min_frac:.0%} hold {minor} samples "
+              f"({100 * minor / len(z):.2f}%) — left unlabelled")
+    if n_states != arhmm["K_hat"]:
+        raise AssertionError(
+            f"kept {n_states} states but the sampler reported K_hat="
+            f"{arhmm['K_hat']} — these are the same threshold and must agree")
 
     state_index = segment[nlags:]            # row of obs["t"] for each state
     t_states = t_all[state_index]
 
-    # modal state per 50 ms bin, via a 2d bincount rather than a groupby loop
+    # modal state per 50 ms bin, via a 2d bincount rather than a groupby loop.
+    # Samples in the minor states are left out of the tally, so a bin votes on
+    # the states that survived the threshold.
     bin_of = np.searchsorted(session["edges"], t_states, side="right") - 1
-    inside = (bin_of >= 0) & (bin_of < session["n_bins"])
+    inside = (bin_of >= 0) & (bin_of < session["n_bins"]) & (z >= 0)
     states = np.full(session["n_bins"], -1, dtype=int)
     if inside.any():
         b, s = bin_of[inside], z[inside]
@@ -1502,7 +1544,7 @@ def fit_states(session, obs, seconds=ARHMM_SECONDS, start_s=ARHMM_START_S,
         modal = tally.argmax(axis=1)
         states[lo:hi + 1][covered] = modal[covered]
 
-    print(f"    {n_states} occupied states over {len(z)} samples | "
+    print(f"    {n_states} states kept over {len(z)} samples | "
           f"{(states >= 0).sum()} of {session['n_bins']} manifold bins labelled")
     return {"arhmm": arhmm, "obs": obs, "obs_names": obs["names"],
             "obs_kinds": obs["kinds"], "segment": segment, "rate": rate,
@@ -1569,17 +1611,27 @@ def state_characterization(session, fit, verbose=True):
 
     if verbose:
         print("\nwhat each state is — occupancy, dwell time, AR dynamics, speed")
-        print(table[["state", "samples", "occupancy_%", "n_runs",
-                     "median_dwell_ms", "p90_dwell_ms", "max_|eig|",
-                     "oscillatory", "speed_bins", "speed_median"]]
-              .to_string(index=False, float_format=lambda v: f"{v:.2f}"))
-        print("\nmean of each observation by state (standardized units)")
-        print(table[["state"] + [f"{n}_mean" for n in names]]
-              .to_string(index=False, float_format=lambda v: f"{v:+.2f}"))
-        print("\nmedian of each observation by state")
-        print(table[["state"] + [f"{n}_median" for n in names]]
-              .to_string(index=False, float_format=lambda v: f"{v:+.2f}"))
+        show_table(table[["state", "samples", "occupancy_%", "n_runs",
+                          "median_dwell_ms", "p90_dwell_ms", "max_|eig|",
+                          "oscillatory", "speed_bins", "speed_median"]]
+                   .set_index("state").round(2))
+        # observations down the rows, states across: with a dozen observations
+        # the other way round is far wider than a page
+        print("\nthe observations by state (standardized; states across)")
+        show_table(observation_by_state(table, names).round(2))
     return table
+
+
+def observation_by_state(state_table, names):
+    """Observations as rows, states as columns, mean and median side by side."""
+    frame = pd.DataFrame(
+        {(f"state {int(s)}", stat):
+         [state_table.loc[state_table["state"] == s, f"{n}_{stat}"].iloc[0]
+          for n in names]
+         for s in state_table["state"] for stat in ("mean", "median")},
+        index=[n.replace("MUA_", "") for n in names])
+    frame.index.name = "observation"
+    return frame
 
 
 def plot_arhmm(session, fit, state_table):
@@ -1617,12 +1669,16 @@ def plot_arhmm(session, fit, state_table):
     ax.set_title("log-likelihood", fontsize=10)
 
     ax = axes[1, 0]
-    ax.imshow(z[None, :], aspect="auto", interpolation="nearest", cmap=cmap,
+    # -1 is a sample in one of the sub-threshold states; masking keeps it from
+    # being painted as state 0
+    ax.imshow(np.ma.masked_less(z, 0)[None, :], aspect="auto",
+              interpolation="nearest", cmap=cmap,
               vmin=-0.5, vmax=n_states - 0.5,
               extent=[t_rel[0], t_rel[-1], 0, 1])
     ax.set_yticks([])
     ax.set_xlabel("time into epoch (s)")
-    ax.set_title("inferred state sequence, over the fitted segment", fontsize=10)
+    ax.set_title(f"inferred state sequence ({n_states} states, "
+                 f"{100 * (z < 0).mean():.1f}% unlabelled)", fontsize=10)
 
     ax = axes[1, 1]
     for s in range(n_states):
@@ -1645,9 +1701,8 @@ def plot_arhmm(session, fit, state_table):
         ax.bar(np.arange(len(names)) + s * width - 0.4 + width / 2, vals,
                width=width, color=cmap(s), label=f"{s}")
     ax.axhline(0, color="k", lw=0.8)
-    ax.set_xticks(range(len(names)))
-    ax.set_xticklabels([n.replace("MUA_", "") for n in names],
-                       rotation=30, ha="right", fontsize=7)
+    label_axis(ax, [n.replace("MUA_", "") for n in names], axis="x",
+               rotation=30, fontsize=7)
     for tick, name, kind in zip(ax.get_xticklabels(), names, kinds):
         tick.set_color(observation_colour(name, kind))
     ax.set_ylabel("median (standardized)")
@@ -1656,11 +1711,16 @@ def plot_arhmm(session, fit, state_table):
 
     ax = axes[2, 1]
     trans = np.zeros((n_states, n_states))
-    np.add.at(trans, (z[:-1], z[1:]), 1)
+    pairs = (z[:-1] >= 0) & (z[1:] >= 0)
+    np.add.at(trans, (z[:-1][pairs], z[1:][pairs]), 1)
     np.fill_diagonal(trans, 0)
     trans = trans / np.maximum(trans.sum(axis=1, keepdims=True), 1)
-    im = ax.imshow(trans, cmap="magma", vmin=0)
-    fig.colorbar(im, ax=ax, shrink=0.8).set_label("P(next | leaving)", fontsize=8)
+    im = ax.imshow(trans, cmap="magma", vmin=0, vmax=1, aspect="auto")
+    bar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    bar.set_label("P(next | leaving)", fontsize=8)
+    bar.ax.tick_params(labelsize=7)
+    label_axis(ax, range(n_states), axis="x")
+    label_axis(ax, range(n_states), axis="y")
     ax.set_xlabel("to state")
     ax.set_ylabel("from state")
     ax.set_title("where a state goes when it leaves", fontsize=10)
@@ -1719,7 +1779,10 @@ def plot_elbows(session, embeddings, scores, max_dims=ELBOW_DIMS):
     twin = ax.twinx()
     for method in methods:
         var = embeddings[method]["scaled"].var(axis=0)
-        share = var / max(var.sum(), 1e-12)
+        # sorted descending, always: an elbow is a statement about the ranked
+        # curve, and Laplacian eigenmaps do not return their components in
+        # anything like that order
+        share = np.sort(var / var.sum())[::-1]
         k = np.arange(1, len(share) + 1)
         colour = METHOD_COLORS[method]
         ax.plot(k, share, color=colour, lw=1.6, label=method)
@@ -1730,10 +1793,10 @@ def plot_elbows(session, embeddings, scores, max_dims=ELBOW_DIMS):
         ax.annotate(f"{method} knee k={k[knee]}", (k[knee], share[knee]),
                     textcoords="offset points", xytext=(6, 6), fontsize=7,
                     color=colour)
-    ax.set_yscale("log")
     ax.set_xlim(1, max_dims)
-    ax.set_xlabel("component")
-    ax.set_ylabel("share of embedding variance (log)")
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("component, ranked by variance")
+    ax.set_ylabel("share of embedding variance")
     twin.set_ylabel("cumulative share (dashed)")
     twin.set_ylim(0, 1.02)
     ax.legend(fontsize=8, loc="upper right")
@@ -1764,8 +1827,9 @@ def plot_elbows(session, embeddings, scores, max_dims=ELBOW_DIMS):
                     textcoords="offset points", xytext=(5, -10),
                     fontsize=7, color=colour)
     ax.set_xlim(1, max_dims)
-    ax.set_xlabel("number of dimensions")
-    ax.set_ylabel("reconstruction similarity [$r$]")
+    ax.set_xlabel("number of dimensions kept")
+    ax.set_ylabel("corr(real, rebuilt) on held-out bins [$r$]")
+    ax.set_title("how well k dimensions rebuild the activity", fontsize=9)
     ax.legend(fontsize=8, loc="lower right")
     fig.tight_layout()
     plt.show()
@@ -1812,82 +1876,118 @@ def cv_mse(Y_sub, X, splits):
     return total / count
 
 
-def rank_components(session, embeddings, methods=METHODS, dims=RANK_DIMS,
-                    folds=RANK_FOLDS, max_samples=RANK_MAX_SAMPLES,
-                    seed=RANK_SEED, top_n=TOP_N, verbose=True):
-    """Order each method's components by the MSE cost of dropping them.
+RANK_SCORE_LABEL = {
+    "variance": "share of embedding variance",
+    "drop_one_mse": "increase in held-out MSE when dropped",
+}
 
-    Reconstruct from the first `dims` components, then again from the same set
-    with one removed; the increase in held-out MSE is that component's
-    contribution. Returns {method: component order} and the long frame.
+
+def component_variance(embeddings, method, dims):
+    """Each component's share of the embedding's total variance."""
+    var = embeddings[method]["scaled"].var(axis=0)
+    return (var / var.sum())[:int(min(dims, len(var)))]
+
+
+def rank_components(session, embeddings, by="variance", methods=METHODS,
+                    dims=RANK_DIMS, folds=RANK_FOLDS,
+                    max_samples=RANK_MAX_SAMPLES, seed=RANK_SEED, top_n=TOP_N,
+                    verbose=True):
+    """Order each method's components by a score, biggest first.
+
+    by="variance" scores each component by its share of the embedding's
+    variance. For PCA and kernel PCA that is the eigenvalue spectrum and the
+    ranking simply confirms the method's own order; for Laplacian eigenmaps,
+    whose components come out in ascending graph-Laplacian order, it does not.
+    Cheap — no model is fit.
+
+    by="drop_one_mse" reconstructs from the first `dims` components, then
+    again with one removed, and scores each by the increase in held-out MSE.
+    It answers a different question — what a component is worth to the
+    reconstruction rather than how much of the embedding it spans — and costs
+    (dims + 1) x folds LLE solves per method, which is minutes.
+
+    Returns {method: component order} and a long frame with one row per
+    component carrying `score` and `rank`.
     """
-    if verbose:
-        print(f"\nranking components by drop-one held-out MSE ({dims} dims, "
-              f"{folds} folds, <= {max_samples} samples)")
     missing = [m for m in methods if m not in embeddings]
     if missing:
         raise KeyError(f"no embedding loaded for {missing} — pass the methods "
                        f"you have, which are {list(embeddings)}")
+    if by not in RANK_SCORE_LABEL:
+        raise ValueError(f"by must be one of {list(RANK_SCORE_LABEL)}, "
+                         f"got {by!r}")
+    if verbose:
+        detail = (f"{dims} dims, {folds} folds, <= {max_samples} samples"
+                  if by == "drop_one_mse" else f"{dims} dims")
+        print(f"\nranking components by {by} ({detail})")
+
     ranking, frames = {}, []
     for method in methods:
-        idx = embeddings[method]["idx"]
-        take = np.arange(len(idx))
-        if len(take) > max_samples:
-            take = np.unique(np.linspace(0, len(idx) - 1, max_samples).astype(int))
-        Y_rank = embeddings[method]["scaled"][take]
-        X_rank = session["X"][idx[take]]
-        k = int(min(dims, Y_rank.shape[1]))
-
-        splits = list(KFold(n_splits=folds, shuffle=True,
-                            random_state=seed).split(X_rank))
         t0 = time.perf_counter()
-        base = cv_mse(Y_rank[:, :k], X_rank, splits)
-        contributions = np.empty(k)
-        for j in range(k):
-            cols = [c for c in range(k) if c != j]
-            contributions[j] = cv_mse(Y_rank[:, cols], X_rank, splits) - base
-        order = np.argsort(-contributions)
+        if by == "variance":
+            score = component_variance(embeddings, method, dims)
+        else:
+            idx = embeddings[method]["idx"]
+            take = np.arange(len(idx))
+            if len(take) > max_samples:
+                take = np.unique(
+                    np.linspace(0, len(idx) - 1, max_samples).astype(int))
+            Y_rank = embeddings[method]["scaled"][take]
+            X_rank = session["X"][idx[take]]
+            k = int(min(dims, Y_rank.shape[1]))
+            splits = list(KFold(n_splits=folds, shuffle=True,
+                                random_state=seed).split(X_rank))
+            base = cv_mse(Y_rank[:, :k], X_rank, splits)
+            score = np.array([cv_mse(Y_rank[:, [c for c in range(k) if c != j]],
+                                     X_rank, splits) - base for j in range(k)])
 
+        order = np.argsort(-score)
         frames.append(pd.DataFrame({
-            "method": method, "component": np.arange(k),
-            "delta_mse": contributions,
-            "rank": np.argsort(np.argsort(-contributions))}))
+            "method": method, "component": np.arange(len(score)),
+            "score": score, "rank": np.argsort(np.argsort(-score))}))
         ranking[method] = order
         if verbose:
-            print(f"    {method:10s} base MSE {base:.4f} | top {top_n}: "
-                  + ", ".join(f"#{c} (+{contributions[c]:.4f})"
-                              for c in order[:top_n])
+            print(f"    {method:10s} top {top_n}: "
+                  + ", ".join(f"#{c} ({score[c]:.4g})" for c in order[:top_n])
                   + f" | {time.perf_counter() - t0:.0f}s", flush=True)
-    return ranking, pd.concat(frames, ignore_index=True)
+
+    table = pd.concat(frames, ignore_index=True)
+    table.attrs["by"] = by
+    return ranking, table
 
 
 def plot_ranking(session, rank_table, dims=RANK_DIMS, top_n=TOP_N):
-    """Drop-one MSE cost per component, as returned and sorted.
+    """The component score, in the method's own order and in ranked order.
 
-    The sorted panel is the elbow of the ranking: how quickly the components
-    stop being worth anything, which is the reconstruction's own answer to how
-    many dimensions there are.
+    Top row is the score against the index the method returned, so a method
+    whose order already matches the ranking shows a monotone decay and one
+    that does not shows a scramble. Bottom row is the same numbers sorted,
+    which is the elbow: how quickly the components stop being worth anything.
     """
+    by = rank_table.attrs.get("by", "variance")
+    ylabel = RANK_SCORE_LABEL[by]
     methods = list(dict.fromkeys(rank_table["method"]))
     fig, axes = plt.subplots(2, len(methods), figsize=(5.2 * len(methods), 7.5),
                              squeeze=False)
-    fig.suptitle(f"{session['label']} — what dropping one component costs the "
-                 f"reconstruction (from {dims} dims)")
+    fig.suptitle(f"{session['label']} — component ranking by {by} "
+                 f"(first {dims} components)")
     for c, method in enumerate(methods):
         sub = rank_table[rank_table["method"] == method]
         colour = METHOD_COLORS[method]
 
         ax = axes[0, c]
         colours = ["#d62728" if r < top_n else colour for r in sub["rank"]]
-        ax.bar(sub["component"], sub["delta_mse"], color=colours)
+        ax.bar(sub["component"], sub["score"], color=colours)
         ax.axhline(0, color="k", lw=0.8)
+        # component index is a label, not a measurement — one tick each
+        label_axis(ax, sub["component"].tolist(), axis="x", fontsize=7)
         ax.set_xlabel("component (as the method returns it)")
         if c == 0:
-            ax.set_ylabel("increase in held-out MSE when dropped")
+            ax.set_ylabel(ylabel)
         ax.set_title(f"{method} — top {top_n} in red", fontsize=10)
 
         ax = axes[1, c]
-        sorted_values = np.sort(sub["delta_mse"].values)[::-1]
+        sorted_values = np.sort(sub["score"].values)[::-1]
         rank_x = np.arange(1, len(sorted_values) + 1)
         ax.plot(rank_x, sorted_values, "o-", ms=4, color=colour)
         ax.axhline(0, color="k", lw=0.8)
@@ -1897,9 +1997,10 @@ def plot_ranking(session, rank_table, dims=RANK_DIMS, top_n=TOP_N):
                     (rank_x[knee], sorted_values[knee]),
                     textcoords="offset points", xytext=(6, 6), fontsize=8,
                     color=colour)
+        label_axis(ax, rank_x.tolist(), axis="x", fontsize=7)
         ax.set_xlabel("component, ranked")
         if c == 0:
-            ax.set_ylabel("increase in held-out MSE when dropped")
+            ax.set_ylabel(ylabel)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -2157,11 +2258,12 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
     plt.close(fig)
 
     present = sorted(set(int(s) for s in z[seg]))
+    here = state_table[state_table["state"].isin(present)]
     print(f"states in this window: {present}")
-    print(state_table[state_table["state"].isin(present)]
-          [["state", "occupancy_%", "median_dwell_ms"]
-           + [f"{n}_median" for n in names]]
-          .to_string(index=False, float_format=lambda v: f"{v:+.2f}"))
+    show_table(here[["state", "occupancy_%", "median_dwell_ms"]]
+               .set_index("state").round(2))
+    show_table(observation_by_state(here, names)
+               .xs("median", axis=1, level=1).round(2))
 
 
 print("definitions loaded — CELL 2 surveys the recordings, CELL 3 runs one")
@@ -2246,13 +2348,22 @@ OBS_SPEC = {
 
     "mua": {
         "use": True,
-        # One trace per region x cell type below, pooled. Delete an entry to
-        # drop it; a combination that matches no units is an error, not a
-        # silent omission. None means "every one this recording has".
-        "regions": ("CA1", "CA3", "RSC"),
-        "cell_types": ("Pyramidal Cell", "Narrow Interneuron",
-                       "Wide Interneuron"),
-        "min_units": 3,          # smaller populations are reported, not used
+        # One pooled trace per (region, cell type) pair listed. Comment out
+        # any line to drop just that pair — asking for CA1 pyramidal without
+        # CA1 interneurons is a matter of deleting the line. None here means
+        # every pair the recording has. A pair it lacks is an error.
+        "groups": [
+            ("CA1", "Pyramidal Cell"),
+            ("CA1", "Narrow Interneuron"),
+            ("CA1", "Wide Interneuron"),
+            ("CA3", "Pyramidal Cell"),
+            ("CA3", "Narrow Interneuron"),
+            ("CA3", "Wide Interneuron"),
+            ("RSC", "Pyramidal Cell"),
+            ("RSC", "Narrow Interneuron"),
+            ("RSC", "Wide Interneuron"),
+        ],
+        "min_units": 3,          # smaller pairs are reported, not used
         # Not really optional: spikes on the LFP grid are a near-binary train,
         # and this kernel is what makes them a rate. Causal, so a population's
         # rise is dated to when it happened.
@@ -2272,6 +2383,14 @@ RUN_L = 20                    # truncation; raise it if K_hat lands on L-1
 RUN_WINDOW_S = 8.0
 RUN_WINDOW_START_S = None     # None = the busiest window in the segment
 RUN_METHODS = ("PCA", "KernelPCA", "Laplacian")
+
+# How components are ordered, and so which three the manifold figures draw.
+#   "variance"      each component's share of the embedding's variance. For
+#                   PCA and kernel PCA this is the eigenvalue spectrum. Free.
+#   "drop_one_mse"  the increase in held-out reconstruction MSE when that
+#                   component is removed. A different question, and minutes
+#                   per method rather than instant.
+RUN_RANK_BY = "variance"
 
 print("=" * 78)
 print("HDP-AR-HMM states against the cached manifold embeddings")
@@ -2303,8 +2422,8 @@ fit = fit_states(session, obs, seconds=RUN_SECONDS, start_s=RUN_START_S,
 state_table = state_characterization(session, fit)
 plot_arhmm(session, fit, state_table)
 
-# 7. what each component is worth to the reconstruction
-ranking, rank_table = rank_components(session, embeddings)
+# 7. order the components, and take the top three into the figures below
+ranking, rank_table = rank_components(session, embeddings, by=RUN_RANK_BY)
 plot_ranking(session, rank_table)
 
 # 8. the manifolds and the components, against behaviour and band power
