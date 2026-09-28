@@ -68,12 +68,14 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pynapple as nap
 import scipy.signal as sps
 from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
 from scipy.fft import next_fast_len
 from scipy.linalg import solve_triangular
 from scipy.stats import invwishart
@@ -102,19 +104,19 @@ REGION_FIELD = "cell_area"
 CELL_TYPE_FIELD = "cell_type"
 FOCUS_REGION = "CA1"        # whose LFP is used; the MUA covers every region
 
-# --- LFP bands ----------------------------------------------------------------
-# Same as UMAP_EDA/umap_power.py: the only clear peak on this channel is theta,
-# sitting high, so it is split into a low and a high half.
-BANDS = {
-    "low_theta": (6.0, 10.0),
-    "high_theta": (10.0, 12.0),
-    "gamma": (30.0, 90.0),
-    "ripple": (120.0, 200.0),
-}
+# --- LFP band colours ---------------------------------------------------------
+# The bands themselves are set in OBS_SPEC in CELL 3 and passed to
+# load_session from there, so adding or moving one is a single edit in the
+# cell being run. This is only the palette; a band name not listed here draws
+# in grey, which is cosmetic and does not stop anything.
 BAND_COLORS = {
     "low_theta": "#2ca02c",
     "high_theta": "#1f77b4",
+    "theta": "#2ca02c",
+    "beta": "#8c564b",
+    "slow_gamma": "#ff7f0e",
     "gamma": "#ff7f0e",
+    "mid_gamma": "#e377c2",
     "ripple": "#c2338f",
 }
 # Regions and cell types get fixed colours so they read the same in every
@@ -126,13 +128,27 @@ REGION_COLORS = {
     "unknown": "0.6",
     "all": "0.4",
 }
+# Keyed on what this dandiset actually writes in `cell_type`, lowercased:
+# "Pyramidal Cell", "Narrow Interneuron", "Wide Interneuron", "Unknown".
+# The bare aliases are for other datasets.
 CELL_TYPE_COLORS = {
-    "pyramidal": "#8c564b", "pyr": "#8c564b", "excitatory": "#8c564b",
-    "exc": "#8c564b", "wide": "#8c564b",
+    "pyramidal cell": "#8c564b", "pyramidal": "#8c564b", "pyr": "#8c564b",
+    "excitatory": "#8c564b", "exc": "#8c564b",
+    "narrow interneuron": "#17becf", "narrow": "#17becf",
+    "wide interneuron": "#9467bd", "wide": "#9467bd",
     "interneuron": "#17becf", "int": "#17becf", "inhibitory": "#17becf",
-    "inh": "#17becf", "narrow": "#17becf",
+    "inh": "#17becf",
     "unknown": "0.6",
 }
+# Order and abbreviations for the survey figures and tables. Anything not
+# listed sorts after these, under its own name.
+CELL_TYPE_ORDER = ("Pyramidal Cell", "Narrow Interneuron", "Wide Interneuron",
+                   "Unknown")
+CELL_TYPE_SHORT = {"pyramidal cell": "Pyr", "narrow interneuron": "NarrowInt",
+                   "wide interneuron": "WideInt", "unknown": "Unk"}
+# Cell type is drawn as a shade of its region's colour plus a hatch, so the
+# two variables stay separable without needing eight distinct hues.
+CELL_TYPE_HATCH = ("", "///", "...", "xx", "\\\\", "++")
 # Cosmetic only. A region or cell type nobody assigned a colour still gets
 # drawn, in grey — this is the one place a default is right, because the
 # alternative is a figure that refuses to render over a palette entry.
@@ -193,6 +209,38 @@ def region_colour(name):
 
 def cell_type_colour(name):
     return CELL_TYPE_COLORS.get(str(name).strip().lower(), FALLBACK_COLOR)
+
+
+def cell_type_short(name):
+    return CELL_TYPE_SHORT.get(str(name).strip().lower(), str(name))
+
+
+def cell_type_sort(present):
+    """CELL_TYPE_ORDER first, then anything else alphabetically."""
+    known = [c for c in CELL_TYPE_ORDER if c in set(present)]
+    return known + sorted(set(present) - set(known))
+
+
+def shade(colour, fraction):
+    """`colour` mixed toward white. fraction 0 = unchanged, 1 = white."""
+    r, g, b = mcolors.to_rgb(colour)
+    return (r + (1 - r) * fraction, g + (1 - g) * fraction,
+            b + (1 - b) * fraction)
+
+
+def show_table(frame, floats=None):
+    """Render a frame as a notebook table, or print it outside one.
+
+    The wide survey tables are unreadable as monospace text at this width.
+    This is a check on what the runtime can render, not a fallback for missing
+    data — the frame is the same either way.
+    """
+    try:
+        from IPython.display import display
+    except ImportError:
+        print(frame.to_string(float_format=floats))
+        return
+    display(frame if floats is None else frame.style.format(floats))
 
 
 def observation_colour(name, kind):
@@ -473,17 +521,29 @@ def unit_inventory(row, root=DOWNLOAD_DIR):
 
 
 def survey_units(recordings, root=DOWNLOAD_DIR, verbose=True):
-    """Region x cell-type counts for every recording, long and wide."""
+    """Region x cell-type counts for every recording, long and wide.
+
+    The wide table is indexed by "M01 2024-03-08" and its cell-type columns
+    are abbreviated — the file path and the full type names made it several
+    hundred characters across, which no terminal renders usefully.
+    """
     frames = []
     for i, (_, row) in enumerate(recordings.iterrows(), start=1):
         if verbose:
             print(f"    [{i}/{len(recordings)}] {row['file']}", flush=True)
         frames.append(unit_inventory(row, root))
     long = pd.concat(frames, ignore_index=True)
-    wide = (long.pivot_table(index=["subject", "date", "file"],
-                             columns=[REGION_FIELD, CELL_TYPE_FIELD],
-                             values="n", aggfunc="sum", fill_value=0)
-            .reset_index())
+    long["name"] = long["subject"] + " " + long["date"]
+
+    wide = long.pivot_table(index="name",
+                            columns=[REGION_FIELD, CELL_TYPE_FIELD],
+                            values="n", aggfunc="sum", fill_value=0)
+    order = [(r, c) for r in sorted({r for r, _ in wide.columns})
+             for c in cell_type_sort([c for rr, c in wide.columns if rr == r])]
+    wide = wide[order]
+    wide.columns = pd.MultiIndex.from_tuples(
+        [(r, cell_type_short(c)) for r, c in wide.columns])
+    wide.insert(0, ("", "total"), wide.sum(axis=1))
     return long, wide
 
 
@@ -548,14 +608,15 @@ def suggest_recordings(scores, recordings, units_long, n=SUGGEST_N,
 
     eligible = (ranked[ranked["has_behavior"]] if require_behavior
                 else ranked).reset_index(drop=True)
+    eligible.insert(0, "name", eligible["subject"] + " " + eligible["date"])
     if verbose:
         print("\nrecordings closest to the mean reconstruction curve "
-              "(k <= 30, averaged over methods and folds).")
-        print("mua_groups counts region x cell-type populations with >= 3 units.")
-        print(eligible.head(n)[["subject", "date", "distance_from_mean",
-                                "mean_rec_corr", "units", f"{focus}_units",
-                                "mua_groups", "file"]]
-              .to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+              "(k <= 30, averaged over methods and folds). mua_groups counts "
+              "region x cell-type populations with >= 3 units.")
+        show_table(
+            eligible.head(n)[["name", "distance_from_mean", "mean_rec_corr",
+                              "units", f"{focus}_units", "mua_groups"]]
+            .set_index("name").round(4))
         dropped = ranked[~ranked["has_behavior"]]
         if require_behavior and len(dropped):
             print(f"excluded (no behaviour, so no position or speed): "
@@ -564,39 +625,90 @@ def suggest_recordings(scores, recordings, units_long, n=SUGGEST_N,
 
 
 def plot_unit_survey(units_long, focus=FOCUS_REGION):
-    """Units per region and per cell type, one stacked bar per recording."""
+    """Units per recording: totals stacked by region, then split per region.
+
+    Top: one bar per recording, stacked by region, so the sessions are
+    comparable in size at a glance.
+
+    Bottom: one group of bars per recording, one bar per region within it,
+    each bar stacked by cell type. Colour is the region and the shading plus
+    hatch is the cell type, which keeps the two variables separable — a single
+    stacked bar in eight colours would be unreadable, and colouring by cell
+    type alone throws the region away.
+    """
     units_long = units_long.copy()
-    units_long["name"] = units_long["subject"] + " " + units_long["date"]
+    if "name" not in units_long:
+        units_long["name"] = units_long["subject"] + " " + units_long["date"]
     names = list(dict.fromkeys(units_long["name"]))
+    regions = sorted(set(units_long[REGION_FIELD]))
+    types = cell_type_sort(units_long[CELL_TYPE_FIELD])
     x = np.arange(len(names))
 
-    fig, axes = plt.subplots(2, 1, figsize=(max(9, 0.8 * len(names)), 8),
+    fig, axes = plt.subplots(2, 1, figsize=(max(11, 1.1 * len(names)), 9),
                              sharex=True)
     fig.suptitle("units per recording, by region and by cell type")
 
-    for ax, field, colour in ((axes[0], REGION_FIELD, region_colour),
-                              (axes[1], CELL_TYPE_FIELD, cell_type_colour)):
-        table = (units_long.pivot_table(index="name", columns=field,
-                                        values="n", aggfunc="sum", fill_value=0)
-                 .reindex(names))
+    # --- top: totals, stacked by region --------------------------------------
+    ax = axes[0]
+    table = (units_long.pivot_table(index="name", columns=REGION_FIELD,
+                                    values="n", aggfunc="sum", fill_value=0)
+             .reindex(names))
+    bottom = np.zeros(len(names))
+    for region in regions:
+        values = table[region].values
+        ax.bar(x, values, bottom=bottom, color=region_colour(region),
+               label=region)
+        bottom += values
+    focus_counts = (units_long[units_long[REGION_FIELD] == focus]
+                    .groupby("name")["n"].sum().reindex(names).fillna(0))
+    for xi, value in zip(x, focus_counts.values):
+        ax.text(xi, bottom[xi] + 4, f"{int(value)}", ha="center", fontsize=7,
+                color=region_colour(focus))
+    ax.set_ylabel("units by region")
+    ax.set_title(f"the number above each bar is the {focus} count", fontsize=9)
+    ax.legend(fontsize=8, ncol=len(regions))
+
+    # --- bottom: a bar per region, stacked by cell type ----------------------
+    ax = axes[1]
+    group_width = 0.78
+    bar_width = group_width / len(regions)
+    counts = (units_long.pivot_table(index=["name", REGION_FIELD],
+                                     columns=CELL_TYPE_FIELD, values="n",
+                                     aggfunc="sum", fill_value=0)
+              .reindex(pd.MultiIndex.from_product([names, regions]),
+                       fill_value=0))
+    # shades run dark to light down CELL_TYPE_ORDER, so the commonest type
+    # (pyramidal) is the solid base of each bar
+    shades = np.linspace(0.0, 0.62, max(len(types), 1))
+    for j, region in enumerate(regions):
+        offset = (j - (len(regions) - 1) / 2) * bar_width
+        base = region_colour(region)
         bottom = np.zeros(len(names))
-        for key in table.columns:
-            values = table[key].values
-            ax.bar(x, values, bottom=bottom, color=colour(key), label=str(key))
+        for t, cell_type in enumerate(types):
+            values = np.array([counts.loc[(n, region)].get(cell_type, 0)
+                               for n in names], dtype=float)
+            ax.bar(x + offset, values, width=bar_width * 0.92, bottom=bottom,
+                   color=shade(base, shades[t]),
+                   hatch=CELL_TYPE_HATCH[t % len(CELL_TYPE_HATCH)],
+                   edgecolor="white", linewidth=0.4)
             bottom += values
-        ax.set_ylabel(f"units by {field}")
-        ax.legend(fontsize=8, ncol=4)
-        if field == REGION_FIELD:
-            focus_counts = (units_long[units_long[REGION_FIELD] == focus]
-                            .groupby("name")["n"].sum().reindex(names).fillna(0))
-            for xi, value in zip(x, focus_counts.values):
-                ax.text(xi, bottom[xi] + 4, f"{int(value)}", ha="center",
-                        fontsize=7, color=region_colour(focus))
-            ax.set_title(f"the number above each bar is the {focus} count",
-                         fontsize=9)
+    ax.set_ylabel("units by region and cell type")
+    ax.set_title("one bar per region within each recording; shading and hatch "
+                 "are cell type", fontsize=9)
+
+    region_keys = [Patch(facecolor=region_colour(r), label=r) for r in regions]
+    type_keys = [Patch(facecolor=shade("0.35", shades[t]), edgecolor="white",
+                       hatch=CELL_TYPE_HATCH[t % len(CELL_TYPE_HATCH)],
+                       label=cell_type_short(c)) for t, c in enumerate(types)]
+    first = ax.legend(handles=region_keys, fontsize=8, ncol=len(regions),
+                      loc="upper right", title="region", title_fontsize=8)
+    ax.add_artist(first)
+    ax.legend(handles=type_keys, fontsize=8, ncol=len(types),
+              loc="upper left", title="cell type", title_fontsize=8)
 
     axes[-1].set_xticks(x)
     axes[-1].set_xticklabels(names, rotation=60, ha="right", fontsize=8)
+    axes[-1].set_xlim(-0.6, len(names) - 0.4)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -689,7 +801,7 @@ def pick_lfp_key(nwb, hint=LFP_REGION_HINT, require_hint=True):
 
 
 def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
-                 transform=RATE_TRANSFORM, bands=BANDS, focus=FOCUS_REGION,
+                 transform=RATE_TRANSFORM, focus=FOCUS_REGION,
                  verbose=True):
     """Everything one recording needs, on two grids, before any spec is applied.
 
@@ -698,11 +810,10 @@ def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
     embeddings are indexed into it and nothing downstream would notice a quiet
     disagreement. That grid carries the activity matrix and the behaviour.
 
-    The LFP grid carries the raw band envelopes and the filtered traces, plus
-    the pooled spike times of every region x cell-type population. Those are
-    the ingredients, not the observations: build_observations turns them into
-    model inputs, so OBS_SPEC can be changed and re-run without touching the
-    file again.
+    The LFP grid carries the raw trace and the pooled spike times of every
+    region x cell-type population. No filtering happens here — that is
+    filter_bands(), called from CELL 3 with the ranges in OBS_SPEC, so the
+    frequencies can be changed without reloading the file.
     """
     path = (DOWNLOAD_DIR / row["file"]).resolve()
     t0 = time.perf_counter()
@@ -768,20 +879,6 @@ def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
     lfp_v = np.asarray(lfp_obj.values, dtype=np.float64).ravel()
     fs = float(1.0 / np.median(np.diff(lfp_t)))
 
-    band_env, band_filt, raw_rows = {}, {}, []
-    for name, (lo, hi) in bands.items():
-        filt = bandpass_sos(lfp_v, fs, lo, hi)
-        env = analytic_envelope(filt)
-        band_env[name] = env.astype(np.float32)
-        band_filt[name] = filt.astype(np.float32)
-        raw_rows.append({"band": name, "range_hz": f"{lo:.0f}-{hi:.0f}",
-                         "median": float(np.median(env)),
-                         "mean": float(env.mean()),
-                         "p95": float(np.percentile(env, 95)),
-                         "sd": float(env.std())})
-        del filt, env
-        gc.collect()
-
     # --- pooled spike times per region x cell type ---------------------------
     mua_groups, mua_units = {}, {}
     for region in sorted(set(regions)):
@@ -792,12 +889,6 @@ def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
                 [st for st, s in zip(kept_times, sel) if s]))
             mua_units[key] = int(sel.sum())
 
-    # band power on the 50 ms grid, z-scored, for the covariate scatters. Not a
-    # model input — the model reads the LFP grid — just something to plot
-    # against, so it is fixed regardless of what OBS_SPEC says.
-    power_z_bins = {name: zscore(bin_mean(lfp_t, env.astype(np.float64), edges))
-                    for name, env in band_env.items()}
-
     half = 0.5 / fs
     session = {
         "label": f"{row['subject']} {row['date']}", "file": row["file"],
@@ -806,16 +897,13 @@ def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
         "X": X, "regions": regions, "cell_types": cell_types,
         "n_units": X.shape[1], "n_bins": X.shape[0],
         "track_x": track_x, "track_y": track_y, "speed": speed,
-        "bands": list(bands), "band_env": band_env, "band_filt": band_filt,
-        "power_z_bins": power_z_bins,
         "mua_groups": mua_groups, "mua_units": mua_units, "focus": focus,
-        "power_summary": pd.DataFrame(raw_rows),
-        "lfp_t": lfp_t, "lfp_edges": np.concatenate((lfp_t - half,
-                                                     [lfp_t[-1] + half])),
+        "lfp_v": lfp_v, "lfp_t": lfp_t,
+        "lfp_edges": np.concatenate((lfp_t - half, [lfp_t[-1] + half])),
         "fs": fs, "lfp_key": lfp_key, "lfp_keys": lfp_keys,
         "rate_transform": transform,
     }
-    del spikes, spikes_all, nwb, lfp_v, kept_times
+    del spikes, spikes_all, nwb, kept_times
     gc.collect()
 
     if verbose:
@@ -836,7 +924,57 @@ def load_session(row, bin_size_s=BIN_SIZE_S, epoch_mode=EPOCH,
               + ("" if LFP_REGION_HINT in lfp_key.lower()
                  else f"  [no '{LFP_REGION_HINT}' in the name — check this is "
                       f"{focus}]"))
-        print("band envelopes (raw amplitude, before any spec is applied)")
+        print("raw LFP held; run filter_bands() next")
+    return session
+
+
+def filter_bands(session, bands, verbose=True):
+    """Bandpass the raw LFP and take the Hilbert envelope, band by band.
+
+    Its own step because the frequency ranges are part of what is being
+    tinkered with. Call it again with different ranges and it refilters from
+    the raw trace the session is still holding — no reload, no stale envelope
+    computed under an earlier set of numbers.
+
+    Adds to `session`: band_env (Hilbert amplitude), band_filt (the filtered
+    signal itself), bands (the names, in order), power_summary, and
+    power_z_bins — the envelopes binned to 50 ms and z-scored, which is not a
+    model input but what the covariate scatters plot against.
+    """
+    t0 = time.perf_counter()
+    lfp_v, lfp_t, fs = session["lfp_v"], session["lfp_t"], session["fs"]
+    nyquist = fs / 2
+
+    band_env, band_filt, rows = {}, {}, []
+    for name, (lo, hi) in bands.items():
+        if not 0 < lo < hi < nyquist:
+            raise ValueError(
+                f"band {name!r} = ({lo}, {hi}) Hz is not a usable range at "
+                f"{fs:.0f} Hz — need 0 < low < high < {nyquist:.0f}")
+        filt = bandpass_sos(lfp_v, fs, lo, hi)
+        env = analytic_envelope(filt)
+        band_env[name] = env.astype(np.float32)
+        band_filt[name] = filt.astype(np.float32)
+        rows.append({"band": name, "range_hz": f"{lo:g}-{hi:g}",
+                     "median": float(np.median(env)),
+                     "mean": float(env.mean()),
+                     "p95": float(np.percentile(env, 95)),
+                     "sd": float(env.std())})
+        del filt, env
+        gc.collect()
+
+    session["bands"] = list(bands)
+    session["band_env"] = band_env
+    session["band_filt"] = band_filt
+    session["power_summary"] = pd.DataFrame(rows)
+    session["power_z_bins"] = {
+        name: zscore(bin_mean(lfp_t, env.astype(np.float64), session["edges"]))
+        for name, env in band_env.items()}
+
+    if verbose:
+        print(f"\nfiltered {len(bands)} bands in "
+              f"{time.perf_counter() - t0:.1f}s "
+              f"(raw envelope amplitude, before the spec's log or z-score)")
         print(session["power_summary"].to_string(
             index=False, float_format=lambda v: f"{v:.3f}"))
     return session
@@ -993,7 +1131,8 @@ def build_observations(session, spec, verbose=True):
                 raise KeyError(
                     f"OBS_SPEC asks for band {name!r}, which was not filtered "
                     f"at load time — the session has {list(session['band_env'])}. "
-                    f"Add it to BANDS and reload the session.")
+                    f"Re-run load_session with the current "
+                    f"OBS_SPEC['bands']['bands'].")
             if measure == "envelope":
                 raw = session["band_env"][name].astype(np.float64)
             elif measure == "power":
@@ -1031,9 +1170,21 @@ def build_observations(session, spec, verbose=True):
                 continue
             (selected if session["mua_units"][key] >= min_units
              else too_small).append(key)
+
+        # Say what was asked for and not found. A region x cell type the spec
+        # names but this recording does not have is a fact about the
+        # recording, and it should be on the page rather than inferred from a
+        # trace count.
+        if want_regions is not None and want_types is not None:
+            asked = {f"MUA_{r}_{c}" for r in want_regions for c in want_types}
+            absent = sorted(asked - set(session["mua_groups"]))
+            if absent and verbose:
+                print("    requested but not present in this recording: "
+                      + ", ".join(a.replace("MUA_", "") for a in absent))
         if too_small and verbose:
-            print("    below min_units, not used as observations: "
-                  + ", ".join(f"{k} ({session['mua_units'][k]})"
+            print(f"    present but under min_units={min_units}, not used: "
+                  + ", ".join(f"{k.replace('MUA_', '')} "
+                              f"({session['mua_units'][k]})"
                               for k in too_small))
         if want_regions is not None or want_types is not None:
             # an explicit request that matches nothing is a typo, not an empty
@@ -2031,14 +2182,15 @@ recordings = recording_table()
 print(f"{len(recordings)} recordings under {DOWNLOAD_DIR}")
 units_long, units_wide = survey_units(recordings)
 
-print("\nunits per recording, by region and cell type")
-print(units_wide.to_string(index=False))
-print("\ntotals by region")
-print(units_long.groupby(REGION_FIELD)["n"].agg(["sum", "mean", "min", "max"])
-      .round(1).to_string())
-print("\ntotals by cell type")
-print(units_long.groupby(CELL_TYPE_FIELD)["n"].agg(["sum", "mean", "min", "max"])
-      .round(1).to_string())
+print("\nunits per recording, by region and cell type "
+      "(Pyr = pyramidal, NarrowInt / WideInt = interneurons)")
+show_table(units_wide)
+
+print("\ntotals across recordings")
+show_table(pd.concat([
+    units_long.groupby(REGION_FIELD)["n"].agg(["sum", "mean", "min", "max"]),
+    units_long.groupby(CELL_TYPE_FIELD)["n"].agg(["sum", "mean", "min", "max"]),
+], keys=["region", "cell type"]).round(1))
 
 scores = load_scores()
 eligible = suggest_recordings(scores, recordings, units_long)
@@ -2062,28 +2214,48 @@ print(f'    RECORDING = "{Path(eligible["file"].iloc[0]).stem}"')
 # short, settle kappa and L, then lengthen — or raise OBS_SPEC["decimate"] to
 # trade resolution for coverage.
 
-RECORDING = "sub-M03_ses-20240622"   # substring of the file, from CELL 2
+RECORDING = "sub-M03_ses-20240623T100000_behavior+ecephys"   # substring of the file, from CELL 2
 
-# As set: band envelopes, no extra smoothing (the envelope is the smoothing),
-# z-scored; plus the MUA of every region x cell-type population with >= 3
-# units, on a causal 20 ms kernel.
+# Everything the AR-HMM is trained on, written out. Edit the frequencies, add
+# or delete a band, name the regions and cell types you want, then re-run the
+# cell. Nothing here points back at CELL 1.
+#
+# As set: band envelopes with no extra smoothing (the Hilbert envelope is
+# already the smoothing of the band), z-scored; plus the MUA of every listed
+# region x cell type with at least 3 units, on a causal 20 ms kernel.
 OBS_SPEC = {
     "rate": "lfp",            # "lfp", or a number in Hz
     "bin_method": "mean",     # "mean" | "max" | "sum", when resampling
-    "decimate": 1,
+    "decimate": 1,            # >1 trades resolution for coverage
+
     "bands": {
         "use": True,
-        "bands": dict(BANDS),
+        # name: (low Hz, high Hz). The only clear peak on this channel is
+        # theta, sitting high, so it is split into a low and a high half.
+        "bands": {
+            "low_theta": (6.0, 10.0),
+            "high_theta": (10.0, 12.0),
+            "gamma": (30.0, 90.0),
+            "ripple": (120.0, 200.0),
+        },
         "measure": "envelope",   # "envelope" | "power" | "filtered"
         "smooth": None,          # or {"kind": "half_gaussian", "sigma_s": 0.01}
         "log": False,
         "zscore": True,
     },
+
     "mua": {
         "use": True,
-        "regions": None,         # None = every region; e.g. ("CA1", "CA3")
-        "cell_types": None,      # None = every type
-        "min_units": 3,
+        # One trace per region x cell type below, pooled. Delete an entry to
+        # drop it; a combination that matches no units is an error, not a
+        # silent omission. None means "every one this recording has".
+        "regions": ("CA1", "CA3", "RSC"),
+        "cell_types": ("Pyramidal Cell", "Narrow Interneuron",
+                       "Wide Interneuron"),
+        "min_units": 3,          # smaller populations are reported, not used
+        # Not really optional: spikes on the LFP grid are a near-binary train,
+        # and this kernel is what makes them a rate. Causal, so a population's
+        # rise is dated to when it happened.
         "smooth": {"kind": "half_gaussian", "sigma_s": 0.020},
         "log": False,
         "zscore": True,
@@ -2105,37 +2277,42 @@ print("=" * 78)
 print("HDP-AR-HMM states against the cached manifold embeddings")
 print("=" * 78)
 
-# 1. the recording, on the sweep's bin grid plus the LFP grid
+# 1. the recording: the sweep's 50 ms grid, the behaviour, the raw LFP and the
+#    pooled spike times. No filtering yet.
 row = resolve_recording(recordings, RECORDING)
 session = load_session(row)
 
-# 2. the embeddings the sweep already computed
+# 2. bandpass the raw LFP at the frequencies OBS_SPEC names. Re-run this after
+#    changing a range and it refilters from the raw trace — no reload.
+session = filter_bands(session, OBS_SPEC["bands"]["bands"])
+
+# 3. the embeddings the sweep already computed
 embeddings, common_idx = load_embeddings(session)
 
-# 3. elbows: the embedding spectra, and this recording's own recovery curve
+# 4. elbows: the embedding spectra, and this recording's own recovery curve
 plot_elbows(session, embeddings, scores)
 
-# 4. build the observations from OBS_SPEC and look at them before fitting
+# 5. build the observations from OBS_SPEC and look at them before fitting
 obs = build_observations(session, OBS_SPEC)
 plot_observations(session, obs)
 
-# 5. the AR-HMM, at the observation grid's own rate
+# 6. the AR-HMM, at the observation grid's own rate
 fit = fit_states(session, obs, seconds=RUN_SECONDS, start_s=RUN_START_S,
                  nlags=RUN_NLAGS, n_iter=RUN_ITER, burn_in=RUN_BURN_IN,
                  kappa=RUN_KAPPA, L=RUN_L)
 state_table = state_characterization(session, fit)
 plot_arhmm(session, fit, state_table)
 
-# 6. what each component is worth to the reconstruction
+# 7. what each component is worth to the reconstruction
 ranking, rank_table = rank_components(session, embeddings)
 plot_ranking(session, rank_table)
 
-# 7. the manifolds and the components, against behaviour and band power
+# 8. the manifolds and the components, against behaviour and band power
 for method in RUN_METHODS:
     plot_manifold(session, embeddings, fit, ranking, method)
     plot_covariates(session, embeddings, fit, ranking, method)
 
-# 8. one window with everything on a shared time axis
+# 9. one window with everything on a shared time axis
 plot_example_window(session, embeddings, fit, ranking, state_table,
                     start_s=RUN_WINDOW_START_S, window_s=RUN_WINDOW_S,
                     methods=RUN_METHODS)
