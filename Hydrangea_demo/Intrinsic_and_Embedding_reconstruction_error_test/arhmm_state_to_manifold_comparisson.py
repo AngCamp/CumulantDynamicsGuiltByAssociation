@@ -56,10 +56,10 @@ matrix and its own pass of the state sampler, and transitions are not counted
 across the joins. Bins outside the segments carry no state label and the
 manifold figures draw them grey.
 
-Cost. An iteration goes as samples x L x (nlags * d + 1)^2, quadratic in the
+Cost. An iteration goes as samples x L x (n_lags * d + 1)^2, quadratic in the
 AR order and the number of observations — that is what separates this from a
-plain HMM. OBS_SPEC["rate"] and RUN_NLAGS together set the lag span in
-milliseconds, and the rate is the cheaper of the two to change.
+plain HMM. OBS_SPEC sets lag_span_s and n_lags; their ratio is the sampling
+step everything is built on.
 """
 
 # %% ===========================================================================
@@ -177,8 +177,11 @@ ARHMM_SEGMENT_SEED = 0    # which random placement
 ARHMM_START_S = None      # a number = one contiguous window there instead
 ARHMM_NLAGS = 1
 ARHMM_L = 20              # truncation level; raise if K_hat hits it
-ARHMM_ITER = 400
-ARHMM_BURN_IN = 200
+ARHMM_MAX_ITER = 100      # ceiling; the run stops earlier once stationary
+ARHMM_BURN_IN = 25        # must be < max_iter or nothing is retained
+ARHMM_EARLY_STOP = True
+ARHMM_CHECK_EVERY = 10    # how often stationarity is tested, and reported
+ARHMM_GEWEKE_TOL = 2.0    # |z| below this counts as stationary
 ARHMM_ALPHA = 1.0
 ARHMM_KAPPA = 50.0        # sticky bias: bigger = longer dwell times
 ARHMM_GAMMA = 1.0
@@ -443,19 +446,105 @@ def sample_transitions(N, alpha, kappa, beta, rng):
     return P
 
 
-def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
+def effective_sample_size(x):
+    """Number of independent draws a correlated chain is worth.
+
+    n / tau with tau = 1 + 2 sum_k rho_k, truncated by Geyer's initial
+    positive sequence: the autocorrelations are summed in adjacent pairs and
+    the sum stops at the first pair that goes negative.
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < 8:
+        return float(n)
+    centred = x - x.mean()
+    spectrum = np.fft.rfft(centred, 2 * n)
+    acf = np.fft.irfft(spectrum * np.conj(spectrum))[:n].real
+    if acf[0] <= 0:
+        return float(n)
+    acf /= acf[0]
+    pair = acf[1:n - 1:2] + acf[2:n:2]
+    negative = np.flatnonzero(pair < 0)
+    cut = int(negative[0]) if negative.size else len(pair)
+    tau = 1.0 + 2.0 * acf[1:2 * cut + 1].sum()
+    return float(n / max(tau, 1e-6))
+
+
+def geweke_z(x, first=0.1, last=0.5):
+    """Geweke's z for the difference in mean between the head and tail.
+
+    Under stationarity the two means estimate the same quantity, so the
+    difference over its standard error is approximately N(0, 1). The standard
+    errors use the effective sample size rather than the raw length, because
+    successive Gibbs draws are correlated.
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    head = x[:max(int(first * n), 2)]
+    tail = x[-max(int(last * n), 2):]
+    se = np.sqrt(head.var(ddof=1) / effective_sample_size(head)
+                 + tail.var(ddof=1) / effective_sample_size(tail))
+    if se <= 0:
+        return 0.0
+    return float((head.mean() - tail.mean()) / se)
+
+
+def convergence_report(trace_ll, trace_K, burn_in, tol=2.0):
+    """Whether the retained part of the chain looks stationary.
+
+    Three numbers. The Geweke z compares the first tenth of the retained
+    log-likelihood against the last half. The drift is the least-squares slope
+    across the retained window, expressed as a multiple of the trace's own
+    standard deviation, so a value near zero means the chain is no longer
+    climbing. The state count is the fraction of retained iterations sitting
+    at the modal K.
+    """
+    ll = np.asarray(trace_ll[burn_in:], dtype=float)
+    kk = np.asarray(trace_K[burn_in:], dtype=int)
+    if len(ll) < 8:
+        raise ValueError(f"only {len(ll)} retained iterations — too few to "
+                         f"say anything about stationarity")
+    it = np.arange(len(ll), dtype=float)
+    slope = np.polyfit(it, ll, 1)[0]
+    drift = slope * len(ll) / (ll.std(ddof=1) + 1e-12)
+    modal = np.bincount(kk).argmax()
+    return {"geweke_z": geweke_z(ll),
+            "drift_sd": float(drift),
+            "ess": effective_sample_size(ll),
+            "K_modal": int(modal),
+            "K_stable_frac": float((kk == modal).mean()),
+            "stationary": bool(abs(geweke_z(ll)) < tol and abs(drift) < 1.0
+                               and (kk == modal).mean() > 0.9)}
+
+
+def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
                   burn_in=ARHMM_BURN_IN, alpha=ARHMM_ALPHA, kappa=ARHMM_KAPPA,
                   gamma=ARHMM_GAMMA, min_frac=ARHMM_MIN_FRAC, standardize=True,
-                  seed=ARHMM_SEED, verbose=True):
+                  seed=ARHMM_SEED, stop_when_stationary=ARHMM_EARLY_STOP,
+                  check_every=ARHMM_CHECK_EVERY, geweke_tol=ARHMM_GEWEKE_TOL,
+                  verbose=True):
     """
     Y        : (T, d) array, or a list of them — one per contiguous segment
     nlags    : AR order r
     L        : truncation level (max number of states)
+    max_iter : ceiling on Gibbs iterations; the run may stop earlier
+    burn_in  : iterations discarded before any sample is retained
     alpha    : transition concentration
     kappa    : sticky self-transition bias (bigger = longer state durations)
     gamma    : top-level DP concentration (bigger = more states a priori)
     min_frac : a state counts as "used" if it holds >= this fraction of timesteps
+
+    stop_when_stationary checks every `check_every` iterations past burn_in and
+    stops once the Geweke z on the retained log-likelihood is under
+    geweke_tol, the least-squares drift across that window is under one of its
+    standard deviations, and the used-state count has not moved in the last
+    check. Without it the run always goes to max_iter.
     """
+    if not 0 <= burn_in < max_iter:
+        raise ValueError(
+            f"burn_in={burn_in} must be at least 0 and less than "
+            f"max_iter={max_iter}; as given, no iteration would be retained "
+            f"and there would be nothing to compute a posterior from")
     rng = np.random.default_rng(seed)
     segments = [Y] if isinstance(Y, np.ndarray) else list(Y)
     segments = [np.atleast_2d(np.asarray(s, dtype=float).T).T
@@ -491,8 +580,9 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
     Sigmas = np.zeros((L, d, d))
 
     trace_K, trace_ll, z_samples = [], [], []
+    converged, stopped_early = None, False
     started = time.perf_counter()
-    for it in range(n_iter):
+    for it in range(max_iter):
         # 1. AR parameters for each state
         for k in range(L):
             idx = z == k
@@ -517,23 +607,55 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
         if it >= burn_in:
             z_samples.append(z.copy())
 
-        if verbose and (it % 25 == 0 or it == n_iter - 1):
+        if verbose and (it % check_every == 0 or it == max_iter - 1):
             spent = time.perf_counter() - started
-            left = spent / (it + 1) * (n_iter - it - 1)
-            print(f"    iter {it:4d}/{n_iter} | used states {K_used:2d} | "
+            left = spent / (it + 1) * (max_iter - it - 1)
+            print(f"    iter {it:4d}/{max_iter} | used states {K_used:2d} | "
                   f"log-lik {ll:12.1f} | {spent / 60:.1f} min spent, "
-                  f"~{left / 60:.1f} min left", flush=True)
+                  f"<={left / 60:.1f} min left", flush=True)
+
+        # Stationarity is checked on the retained part of the trace only, and
+        # not until there are two check windows of it to compare.
+        past_burn = it - burn_in + 1
+        if (stop_when_stationary and past_burn >= 2 * check_every
+                and past_burn % check_every == 0):
+            converged = convergence_report(trace_ll, trace_K, burn_in,
+                                           geweke_tol)
+            if converged["stationary"]:
+                stopped_early = True
+                if verbose:
+                    print(f"    stationary at iteration {it}: Geweke z="
+                          f"{converged['geweke_z']:+.2f}, drift="
+                          f"{converged['drift_sd']:+.2f} SD, K stable in "
+                          f"{converged['K_stable_frac']:.0%} of retained "
+                          f"iterations", flush=True)
+                break
+
+    n_run = len(trace_K)
+    if converged is None:
+        converged = convergence_report(trace_ll, trace_K, burn_in, geweke_tol)
+    if verbose and not converged["stationary"]:
+        print(f"    WARNING: not stationary after {n_run} iterations. "
+              f"Geweke z={converged['geweke_z']:+.2f} (want |z| < {geweke_tol}), "
+              f"drift={converged['drift_sd']:+.2f} SD (want |drift| < 1), "
+              f"K stable in {converged['K_stable_frac']:.0%} (want > 90%). "
+              f"Raise max_iter; the estimates below are what the chain had "
+              f"reached, not what it would settle to.")
 
     post_K = np.array(trace_K[burn_in:])
     values, freq = np.unique(post_K, return_counts=True)
     K_hat = int(values[np.argmax(freq)])
 
     # Representative sample: highest log-lik post-burn-in sample with K_hat states
-    cands = [i for i in range(burn_in, n_iter) if trace_K[i] == K_hat]
+    cands = [i for i in range(burn_in, n_run) if trace_K[i] == K_hat]
     best = max(cands, key=lambda i: trace_ll[i])
     z_best = z_samples[best - burn_in]
 
     if verbose:
+        print(f"    ran {n_run} of {max_iter} iterations"
+              + (" (stopped early)" if stopped_early else "")
+              + f" | retained {n_run - burn_in}, ESS "
+                f"{converged['ess']:.0f}")
         print("    posterior over number of used states:")
         for v, f in zip(values, freq):
             print(f"      K = {v:2d}: {f / len(post_K):.2f}")
@@ -543,7 +665,8 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
                 trace_ll=np.array(trace_ll), z_samples=z_samples,
                 As=As, Sigmas=Sigmas, beta=beta, P=P, Y=Yt,
                 segment_starts=starts, nlags=nlags, burn_in=burn_in,
-                n_lag_terms=p)
+                n_lag_terms=p, n_iterations=n_run,
+                stopped_early=stopped_early, convergence=converged)
 
 
 # -----------------------------------------------------------------------------
@@ -1146,75 +1269,89 @@ def resample_trace(values, source_t, target_edges, method="median"):
     return out
 
 
-def finish_trace(name, values, log, do_zscore):
+def finish_trace(name, values, transform, do_zscore):
     """The last two steps every observation goes through, in that order.
 
-    log=True on a trace that reaches zero or below has no answer — a filtered
-    LFP is signed, and a smoothed spike count can be exactly zero — so it says
-    so rather than clamping to a floor and returning a number that looks fine.
+    transform is None, "log1p" (needs values >= 0, and log1p(x) ~ x when
+    x << 1) or "log10" (needs values > 0). A trace that violates the domain
+    says so rather than being clamped to a floor.
     """
     values = np.asarray(values, dtype=np.float64)
-    if log:
+    if transform == "log1p":
+        if values.min() < 0:
+            raise ValueError(
+                f"{name}: log1p needs values >= 0, found {values.min():.4g}")
+        values = np.log1p(values)
+    elif transform == "log10":
         if not (values > 0).all():
             raise ValueError(
-                f"{name}: log=True but {(values <= 0).sum()} of {len(values)} "
-                f"samples are <= 0 (min {values.min():.4g}). Either this "
-                f"measure is signed, in which case log is the wrong request, "
-                f"or the trace has empty stretches that need a wider kernel.")
+                f"{name}: log10 needs values > 0, but {(values <= 0).sum()} of "
+                f"{len(values)} are not (min {values.min():.4g}). A filtered "
+                f"LFP is signed and a smoothed spike count can be zero.")
         values = np.log10(values)
+    elif transform is not None:
+        raise ValueError(f"{name}: unknown transform {transform!r} — use "
+                         f"None, 'log1p' or 'log10'")
     return zscore(values) if do_zscore else values
 
 
 def build_observations(session, spec, verbose=True):
     """Turn the session's raw ingredients into the matrix the AR-HMM sees.
 
-    Each trace goes: source -> measure -> smooth -> (resample) -> log ->
-    z-score. The order matters. Smoothing happens on the native grid so the
-    kernel is in real time rather than in bins, and z-scoring happens last so
-    every column enters the model on equal terms whatever its physical units.
+    The grid comes from the two lag settings: n_lags steps spanning
+    lag_span_s means one step is lag_span_s / n_lags, so the rate is
+    n_lags / lag_span_s. Those are what the AR-HMM is then fitted at.
+
+    Bands go: envelope -> smooth -> median within each bin -> transform ->
+    z-score. MUA goes: count in each bin -> divide by that population's total
+    spikes -> smooth -> transform -> z-score. z-scoring is last either way, so
+    every column enters the model on equal terms.
 
     The spec (OBS_SPEC in CELL 3):
-        rate        "lfp" keeps the LFP sampling rate; a number resamples
-                    to that many Hz, aggregating each bin with
-                    bin_method ("median", "mean", "max", "sum").
-                    decimate then takes every nth sample of the result.
+        lag_span_s  total time the AR lags reach back
+        n_lags      steps across that span
+        bin_method  the statistic standing for each bin, for bands
         bands
-          measure   "envelope" is the Hilbert amplitude — the band's power
-                    trace, and already a smoothing of the band. "power"
-                    squares it. "filtered" passes the oscillation itself,
-                    which is a different question entirely.
+          measure   "envelope" is the Hilbert amplitude, "power" its square,
+                    "filtered" the oscillation itself
           smooth    None, or {"kind": "gaussian"|"half_gaussian"|"boxcar",
-                    "sigma_s": seconds}. half_gaussian is causal: it averages
-                    over what just happened and never over what is about to,
-                    so a state boundary is not smeared backwards before the
-                    model looks for it.
-          log       log10 before z-scoring. Raises on a trace that reaches
-                    zero, so "filtered" and log are not combinable.
-          zscore    per trace, over the whole epoch, last.
+                    "sigma_s": seconds}. half_gaussian is causal.
+          transform None, "log1p" or "log10", applied before z-scoring
+          zscore    per trace, over the whole epoch, last
         mua
           groups    a list of (region, cell type) pairs, one pooled trace
-                    each, so any combination can be asked for — CA1 pyramidal
-                    with CA3 interneurons and nothing else, say. None means
-                    every pair this recording has. A pair the recording lacks
-                    raises rather than being skipped.
-          min_units pairs smaller than this are reported and not used.
-          smooth    not really optional: spikes on the LFP grid are a
-                    near-binary train, and this kernel is what makes a rate.
+                    each. None means every pair this recording has; a pair it
+                    lacks raises rather than being skipped.
+          min_units pairs smaller than this are reported and not used
+          normalize "total_spikes" divides each trace by that population's
+                    own spike count, so it is the share of its spikes falling
+                    in each bin and empty bins are 0
+          smooth    not optional in practice: without a kernel the counts are
+                    a near-binary train
     """
     spec = deepcopy(spec)
     fs = session["fs"]
     lfp_t = session["lfp_t"]
 
-    # --- the target grid ------------------------------------------------------
-    rate_spec = spec.get("rate", "lfp")
-    if rate_spec == "lfp":
-        target_t, target_edges, native = lfp_t, None, True
+    # --- the grid, from the lag settings -------------------------------------
+    lag_span_s = float(spec["lag_span_s"])
+    n_lags = int(spec["n_lags"])
+    if lag_span_s <= 0 or n_lags < 1:
+        raise ValueError(f"lag_span_s={lag_span_s} and n_lags={n_lags} must be "
+                         f"positive")
+    rate = n_lags / lag_span_s
+    if rate > fs:
+        raise ValueError(
+            f"{n_lags} lags across {lag_span_s * 1e3:.0f} ms needs {rate:.0f} "
+            f"Hz, above the LFP's {fs:.0f} Hz. Lengthen lag_span_s or use "
+            f"fewer lags.")
+    native = abs(rate - fs) < 1e-6
+    if native:
+        target_t, target_edges = lfp_t, None
     else:
-        target_rate = float(rate_spec)
-        step = 1.0 / target_rate
+        step = 1.0 / rate
         target_edges = np.arange(session["t_start"], session["t_end"], step)
         target_t = target_edges[:-1] + step / 2
-        native = False
 
     columns, names, kinds, notes = [], [], [], []
 
@@ -1241,12 +1378,13 @@ def build_observations(session, spec, verbose=True):
                 trace = resample_trace(trace, lfp_t, target_edges,
                                        spec.get("bin_method", "median"))
             columns.append(finish_trace(name, trace,
-                                        band_spec.get("log", False),
+                                        band_spec.get("transform"),
                                         band_spec.get("zscore", True)))
             names.append(name)
             kinds.append("band")
             notes.append(f"{measure}, smooth="
-                         f"{_smooth_label(band_spec.get('smooth'))}")
+                         f"{_smooth_label(band_spec.get('smooth'))}, "
+                         f"{spec.get('bin_method', 'median')} per bin")
             del raw, trace
             gc.collect()
 
@@ -1291,19 +1429,34 @@ def build_observations(session, spec, verbose=True):
                 + ", ".join(f"{k.replace('MUA_', '')} ({v})"
                             for k, v in available.items()))
 
+        normalize = mua_spec.get("normalize", "total_spikes")
         for key in selected:
             times = session["mua_groups"][key]
             counts = np.diff(np.searchsorted(times, edges_for_counts)).astype(np.float64)
-            grid_rate = fs if native else float(rate_spec)
-            trace = smooth_trace(counts * grid_rate, grid_rate,
-                                 mua_spec.get("smooth"))
-            columns.append(finish_trace(key, trace, mua_spec.get("log", False),
+            if normalize == "total_spikes":
+                # column of counts divided by its own sum: the share of this
+                # population's spikes landing in each bin. Empty bins are 0,
+                # and a population that fires ten times as much as another no
+                # longer enters the model ten times as large.
+                total = counts.sum()
+                if total <= 0:
+                    raise ValueError(f"{key}: no spikes in the epoch, so it "
+                                     f"cannot be normalized by its total")
+                series = counts / total
+            elif normalize is None:
+                series = counts * rate          # spikes per second
+            else:
+                raise ValueError(f"unknown mua normalize: {normalize!r} — use "
+                                 f"'total_spikes' or None")
+            trace = smooth_trace(series, rate, mua_spec.get("smooth"))
+            columns.append(finish_trace(key, trace, mua_spec.get("transform"),
                                         mua_spec.get("zscore", True)))
             names.append(key)
             kinds.append("mua")
-            notes.append(f"{session['mua_units'][key]} units, smooth="
-                         f"{_smooth_label(mua_spec.get('smooth'))}")
-            del counts, trace
+            notes.append(f"{session['mua_units'][key]} units, "
+                         f"{int(counts.sum())} spikes, norm={normalize}, "
+                         f"smooth={_smooth_label(mua_spec.get('smooth'))}")
+            del counts, series, trace
             gc.collect()
 
     if not columns:
@@ -1311,12 +1464,8 @@ def build_observations(session, spec, verbose=True):
             "OBS_SPEC selected no observations — both 'bands' and 'mua' are "
             "off, or every population fell below min_units")
 
-    decimate = int(spec.get("decimate", 1))
     Y = np.column_stack(columns)
     t = target_t
-    if decimate > 1:
-        Y, t = Y[::decimate], t[::decimate]
-    rate = (fs if native else float(rate_spec)) / decimate
 
     # A constant or non-finite column carries nothing and makes Sigma
     # singular, so the sampler would fail later with a Cholesky error naming
@@ -1339,10 +1488,12 @@ def build_observations(session, spec, verbose=True):
                           "min": Y.min(axis=0), "max": Y.max(axis=0)})
     if verbose:
         print(f"\nobservations: {Y.shape[1]} traces x {Y.shape[0]} samples at "
-              f"{rate:.0f} Hz")
+              f"{rate:.0f} Hz ({n_lags} lags x {1e3 / rate:.1f} ms = "
+              f"{lag_span_s * 1e3:.0f} ms of lag; LFP is {fs:.0f} Hz)")
         show_table(table.set_index("observation").round(3))
     return {"Y": Y, "names": names, "kinds": kinds, "t": t, "rate": rate,
-            "table": table, "spec": spec}
+            "nlags": n_lags, "lag_span_s": lag_span_s, "table": table,
+            "spec": spec}
 
 
 def _smooth_label(spec):
@@ -1395,11 +1546,9 @@ def plot_observations(session, obs, seconds=4.0, start_s=None):
                  f"into the epoch (z, offset)", fontsize=9)
 
     ax = axes[1]
-    # The diagonal is 1 by construction. Leaving it in sets the colour range
-    # to a number that carries no information and flattens everything else.
     corr = np.corrcoef(Y.T)
-    np.fill_diagonal(corr, np.nan)
-    limit = float(np.nanmax(np.abs(corr)))
+    off_diagonal = corr[~np.eye(len(names), dtype=bool)]
+    limit = float(np.max(np.abs(off_diagonal)))
     im = ax.imshow(corr, cmap="RdBu_r", vmin=-limit, vmax=limit, aspect="auto")
     bar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     bar.set_label("Pearson r", fontsize=8)
@@ -1407,7 +1556,7 @@ def plot_observations(session, obs, seconds=4.0, start_s=None):
     short = [n.replace("MUA_", "") for n in names]
     label_axis(ax, short, axis="x", rotation=90, fontsize=6)
     label_axis(ax, short, axis="y", fontsize=6)
-    ax.set_title(f"observation correlation (diagonal dropped, "
+    ax.set_title(f"observation correlation (scale from off-diagonal, "
                  f"|r| <= {limit:.2f})", fontsize=9)
     fig.tight_layout()
     plt.show()
@@ -1543,10 +1692,12 @@ def choose_segments(n_samples, rate, minutes, segment_s, start_s=None, seed=0):
 
 def fit_states(session, obs, minutes=ARHMM_MINUTES,
                segment_s=ARHMM_SEGMENT_S, start_s=ARHMM_START_S,
-               nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
+               nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
                burn_in=ARHMM_BURN_IN, kappa=ARHMM_KAPPA, alpha=ARHMM_ALPHA,
                gamma=ARHMM_GAMMA, min_frac=ARHMM_MIN_FRAC, seed=ARHMM_SEED,
-               segment_seed=ARHMM_SEGMENT_SEED):
+               segment_seed=ARHMM_SEGMENT_SEED,
+               stop_when_stationary=ARHMM_EARLY_STOP,
+               check_every=ARHMM_CHECK_EVERY, geweke_tol=ARHMM_GEWEKE_TOL):
     """Fit the AR-HMM on the observation grid and map its states onto both grids.
 
     The AR design drops the first `nlags` samples, so state i belongs to sample
@@ -1576,14 +1727,16 @@ def fit_states(session, obs, minutes=ARHMM_MINUTES,
                       for s in segments[:8])
           + (" ..." if len(segments) > 8 else ""))
     print(f"    AR order {nlags} = {nlags / rate * 1e3:.0f} ms of lag | "
-          f"p = nlags*d+1 = {p} | L={L}, kappa={kappa}, {n_iter} iterations")
+          f"p = nlags*d+1 = {p} | L={L}, kappa={kappa}, "
+          f"<={max_iter} iterations")
     print(f"    cost per iteration goes as samples x L x p^2", flush=True)
 
     t0 = time.perf_counter()
     arhmm = fit_hdp_arhmm([Y_all[s] for s in segments], nlags=nlags, L=L,
-                          n_iter=n_iter, burn_in=burn_in, alpha=alpha,
+                          max_iter=max_iter, burn_in=burn_in, alpha=alpha,
                           kappa=kappa, gamma=gamma, min_frac=min_frac,
-                          seed=seed)
+                          seed=seed, stop_when_stationary=stop_when_stationary,
+                          check_every=check_every, geweke_tol=geweke_tol)
     print(f"    fitted in {(time.perf_counter() - t0) / 60:.1f} min")
     if arhmm["K_hat"] >= L - 1:
         print(f"    WARNING: K_hat={arhmm['K_hat']} is at the truncation level "
@@ -1768,11 +1921,22 @@ def plot_arhmm(session, fit, state_table):
     ax.legend(fontsize=8)
 
     ax = axes[0, 1]
+    conv = arhmm["convergence"]
     ax.plot(arhmm["trace_ll"], lw=1, color="0.3")
     ax.axvline(fit["burn_in"], color="k", ls="--", lw=0.9)
+    # least-squares line over the retained window: its total rise is the drift
+    retained = np.arange(fit["burn_in"], len(arhmm["trace_ll"]))
+    if len(retained) > 2:
+        fitted = np.polyval(np.polyfit(retained, arhmm["trace_ll"][retained], 1),
+                            retained)
+        ax.plot(retained, fitted, lw=1.2,
+                color="#2ca02c" if conv["stationary"] else "#d62728")
     ax.set_xlabel("Gibbs iteration")
     ax.set_ylabel("log-likelihood")
-    ax.set_title("log-likelihood", fontsize=10)
+    ax.set_title(f"log-likelihood — "
+                 f"{'stationary' if conv['stationary'] else 'NOT stationary'}: "
+                 f"z={conv['geweke_z']:+.2f}, drift={conv['drift_sd']:+.2f} SD, "
+                 f"ESS {conv['ess']:.0f}", fontsize=9)
 
     ax = axes[1, 0]
     # Against sample index, not time: the segments are minutes apart, and a
@@ -2438,8 +2602,8 @@ print(f'    RECORDING = "{Path(eligible["file"].iloc[0]).stem}"')
 # observations under a new spec costs seconds and does not re-read the file.
 # build_observations() documents every key.
 #
-# Runtime is OBS_SPEC["rate"] x RUN_MINUTES x RUN_NLAGS^2. Raise the rate only
-# with a reason — it buys resolution at quadratic cost through nlags.
+# Runtime is RUN_MINUTES x n_lags^3 / lag_span_s. More lags across the same
+# span costs in both the sample count and the regression width.
 
 RECORDING = "sub-M03_ses-20240623T100000_behavior+ecephys"   # substring of the file, from CELL 2
 
@@ -2451,16 +2615,13 @@ RECORDING = "sub-M03_ses-20240623T100000_behavior+ecephys"   # substring of the 
 # already the smoothing of the band), z-scored; plus the MUA of every listed
 # region x cell type with at least 3 units, on a causal 20 ms kernel.
 OBS_SPEC = {
-    # A number resamples by averaging within each bin, which also anti-aliases
-    # — unlike "decimate", which just drops samples. 100 Hz lets RUN_NLAGS=10
-    # span 100 ms at a tractable cost; "lfp" (1250 Hz) would need 125 lags for
-    # the same span, and the cost is quadratic in that.
-    "rate": 100,              # "lfp", or a number in Hz
-    # the statistic that stands for each bin when resampling the band
-    # envelopes. Does not apply to MUA, which is counted in the target
-    # bins directly rather than aggregated from a finer grid.
-    "bin_method": "median",   # "median" | "mean" | "max" | "sum"
-    "decimate": 1,            # drops samples without filtering; prefer "rate"
+    # The AR lags reach back lag_span_s in total, in n_lags steps. One step is
+    # lag_span_s / n_lags, and that is the grid everything is built on. The
+    # LFP is recorded at 1250 Hz, so asking for a step shorter than 0.8 ms is
+    # an error. Cost goes as (n_lags * n_observations)^2.
+    "lag_span_s": 0.100,
+    "n_lags": 10,
+    "bin_method": "median",   # per bin, for bands: median | mean | max | sum
 
     "bands": {
         "use": True,
@@ -2474,7 +2635,7 @@ OBS_SPEC = {
         },
         "measure": "envelope",   # "envelope" | "power" | "filtered"
         "smooth": None,          # or {"kind": "half_gaussian", "sigma_s": 0.01}
-        "log": False,
+        "transform": None,       # None | "log1p" | "log10"
         "zscore": True,
     },
 
@@ -2496,11 +2657,12 @@ OBS_SPEC = {
             ("RSC", "Wide Interneuron"),
         ],
         "min_units": 3,          # smaller pairs are reported, not used
-        # Not really optional: spikes on the LFP grid are a near-binary train,
-        # and this kernel is what makes them a rate. Causal, so a population's
-        # rise is dated to when it happened.
+        # counts in each bin divided by that population's own spike total, so
+        # each column is the share of its spikes per bin and empty bins are 0
+        "normalize": "total_spikes",   # or None for spikes per second
+        # causal, so a population's rise is dated to when it happened
         "smooth": {"kind": "half_gaussian", "sigma_s": 0.020},
-        "log": False,
+        "transform": "log1p",    # None | "log1p" | "log10"
         "zscore": True,
     },
 }
@@ -2513,12 +2675,18 @@ RUN_SEGMENT_S = 60.0
 RUN_SEGMENT_SEED = 0
 RUN_START_S = None
 
-# nlags x (1/rate) is the lag span the model sees. 10 lags at 100 Hz = 100 ms.
-# Cost goes as samples x L x (nlags*d + 1)^2, so raising the rate without
-# dropping nlags gets expensive fast.
-RUN_NLAGS = 10
-RUN_ITER = 60
-RUN_BURN_IN = 75
+
+# The run stops once the retained log-likelihood looks stationary, so
+# RUN_MAX_ITER is a ceiling rather than a target. Failing to get there prints
+# a warning with the three diagnostics and keeps going with what it has.
+# RUN_BURN_IN must be below RUN_MAX_ITER, and the first stationarity check
+# needs 2 x RUN_CHECK_EVERY retained iterations before it can fire.
+RUN_MAX_ITER = 60
+RUN_BURN_IN = 20
+RUN_EARLY_STOP = True
+RUN_CHECK_EVERY = 10          # how often stationarity is tested, and reported
+RUN_GEWEKE_TOL = 2.0          # |z| below this counts as stationary
+
 RUN_KAPPA = 50.0              # sticky bias: bigger = longer dwell times
 RUN_L = 20                    # truncation; raise it if K_hat lands on L-1
 RUN_WINDOW_S = 8.0
@@ -2559,7 +2727,10 @@ plot_observations(session, obs)
 # 6. the AR-HMM, at the observation grid's own rate
 fit = fit_states(session, obs, minutes=RUN_MINUTES, segment_s=RUN_SEGMENT_S,
                  segment_seed=RUN_SEGMENT_SEED, start_s=RUN_START_S,
-                 nlags=RUN_NLAGS, n_iter=RUN_ITER, burn_in=RUN_BURN_IN,
+                 nlags=OBS_SPEC["n_lags"],
+                 max_iter=RUN_MAX_ITER, burn_in=RUN_BURN_IN,
+                 stop_when_stationary=RUN_EARLY_STOP,
+                 check_every=RUN_CHECK_EVERY, geweke_tol=RUN_GEWEKE_TOL,
                  kappa=RUN_KAPPA, L=RUN_L)
 state_table = state_characterization(session, fit)
 plot_arhmm(session, fit, state_table)
