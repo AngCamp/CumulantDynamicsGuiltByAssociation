@@ -49,12 +49,17 @@ Laplacian embedding exists at 500 ms and the PCA one at 50 ms. The example
 window draws anything coarser than one bin as markers, to keep that visible
 rather than hiding it behind interpolation.
 
-Coverage. The sampler's state step is a Python loop over time, so fitting at
-1250 Hz means fitting a segment, not a session: a minute of LFP is already 75k
-samples. Only the bins inside that segment carry a state label, and the
-manifold figures draw the rest in grey so the gap is visible. RUN_SECONDS is
-the knob, and OBS_SPEC["decimate"] trades resolution for coverage if you want
-the whole session instead.
+Coverage. The model is fitted on RUN_MINUTES of data, taken as several
+segments placed at random one per equal block of the recording, so it spans
+the session rather than one corner of it. Each segment gets its own design
+matrix and its own pass of the state sampler, and transitions are not counted
+across the joins. Bins outside the segments carry no state label and the
+manifold figures draw them grey.
+
+Cost. An iteration goes as samples x L x (nlags * d + 1)^2, quadratic in the
+AR order and the number of observations — that is what separates this from a
+plain HMM. OBS_SPEC["rate"] and RUN_NLAGS together set the lag span in
+milliseconds, and the rate is the cheaper of the two to change.
 """
 
 # %% ===========================================================================
@@ -166,8 +171,10 @@ LFP_REGION_HINT = "ca1"
 # At 1250 Hz an AR order of 1 is a 0.8 ms lag, which is a very local question;
 # raise ARHMM_NLAGS to let the model see further back, at linear cost in the
 # design matrix.
-ARHMM_SECONDS = 60.0      # length of the segment to fit; None = whole epoch
-ARHMM_START_S = None      # None = the most variable stretch of the epoch
+ARHMM_MINUTES = 10.0      # total data to fit; None = the whole epoch
+ARHMM_SEGMENT_S = 60.0    # length of each randomly placed segment
+ARHMM_SEGMENT_SEED = 0    # which random placement
+ARHMM_START_S = None      # a number = one contiguous window there instead
 ARHMM_NLAGS = 1
 ARHMM_L = 20              # truncation level; raise if K_hat hits it
 ARHMM_ITER = 400
@@ -287,8 +294,17 @@ def observation_colour(name, kind):
 # Gibbs sampler under the weak-limit approximation of the DP: truncate at L
 # states, and the ones that end up holding (almost) no data are unused.
 #
-# The script as supplied, with the synthetic-data and evaluation part dropped —
-# that was for debugging the sampler, and the data here is real.
+# The script as supplied, with three changes, all so it can fit several
+# disjoint stretches of a recording rather than one contiguous block:
+#   - the synthetic-data and evaluation part is dropped
+#   - Y is a list of segments, each with its own design matrix, so no row
+#     regresses on samples from a different part of the session
+#   - the state sampler runs per segment and transition counts skip the joins
+#
+# Cost per iteration is dominated by the MNIW step, which forms a p x p Gram
+# matrix per state with p = nlags * d + 1: samples x L x p^2. Quadratic in the
+# AR order and in the number of observations, which is what separates this
+# from a plain HMM — that has no regression at all.
 
 
 def make_design(Y, nlags):
@@ -297,6 +313,26 @@ def make_design(Y, nlags):
     lags = [Y[nlags - l - 1: T - l - 1] for l in range(nlags)]
     X = np.hstack(lags + [np.ones((T - nlags, 1))])
     return X, Y[nlags:]
+
+
+def stack_designs(segments, nlags):
+    """One design matrix per segment, stacked, plus where each one starts.
+
+    Building the lags per segment is the point: a single design over the
+    concatenation would regress the first rows of each segment on the last
+    samples of the one before it, which are minutes away.
+    """
+    Xs, Ys, starts, n = [], [], [], 0
+    for seg in segments:
+        if len(seg) <= nlags:
+            raise ValueError(f"a segment of {len(seg)} samples cannot support "
+                             f"nlags={nlags}")
+        X, Yt = make_design(seg, nlags)
+        Xs.append(X)
+        Ys.append(Yt)
+        starts.append(n)
+        n += len(Yt)
+    return np.vstack(Xs), np.vstack(Ys), np.array(starts, dtype=int)
 
 
 def sample_mniw(X, Y, M0, K0, S0, nu0, rng):
@@ -331,8 +367,23 @@ def ar_loglik(X, Y, A, Sigma):
     return -0.5 * (d * np.log(2 * np.pi) + logdet + np.sum(sol ** 2, axis=0))
 
 
-def sample_states(logL, P, pi0, rng):
-    """Blocked sampling of the state sequence (backward filter, forward sample)."""
+def sample_states(logL, P, pi0, rng, starts=None):
+    """Blocked sampling of the state sequence (backward filter, forward sample).
+
+    `starts` marks where each segment begins. Each one is filtered and sampled
+    on its own and drawn from pi0 at its first sample, because a segment's
+    opening state has no predecessor — the sample before it in the array is
+    from somewhere else in the recording.
+    """
+    T, L = logL.shape
+    bounds = np.append(np.array([0]) if starts is None else starts, T)
+    z = np.empty(T, dtype=int)
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        z[lo:hi] = _sample_states_one(logL[lo:hi], P, pi0, rng)
+    return z
+
+
+def _sample_states_one(logL, P, pi0, rng):
     T, L = logL.shape
     lik = np.exp(logL - logL.max(axis=1, keepdims=True))
     bwd = np.ones((T, L))
@@ -397,7 +448,7 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
                   gamma=ARHMM_GAMMA, min_frac=ARHMM_MIN_FRAC, standardize=True,
                   seed=ARHMM_SEED, verbose=True):
     """
-    Y        : (T, d) array
+    Y        : (T, d) array, or a list of them — one per contiguous segment
     nlags    : AR order r
     L        : truncation level (max number of states)
     alpha    : transition concentration
@@ -406,15 +457,24 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
     min_frac : a state counts as "used" if it holds >= this fraction of timesteps
     """
     rng = np.random.default_rng(seed)
-    Y = np.asarray(Y, dtype=float)
-    if Y.ndim == 1:
-        Y = Y[:, None]
+    segments = [Y] if isinstance(Y, np.ndarray) else list(Y)
+    segments = [np.atleast_2d(np.asarray(s, dtype=float).T).T
+                if np.asarray(s).ndim == 1 else np.asarray(s, dtype=float)
+                for s in segments]
     if standardize:
-        Y = (Y - Y.mean(0)) / Y.std(0)
+        # pooled over every segment, so the columns mean the same thing
+        # wherever in the recording they came from
+        pooled = np.vstack(segments)
+        mu, sd = pooled.mean(0), pooled.std(0)
+        segments = [(s - mu) / sd for s in segments]
 
-    X, Yt = make_design(Y, nlags)
+    X, Yt, starts = stack_designs(segments, nlags)
     T, d = Yt.shape
     p = X.shape[1]
+    # pairs of consecutive rows that sit inside one segment; the rest straddle
+    # a join and are not transitions the chain ever made
+    adjacent = np.ones(T - 1, dtype=bool)
+    adjacent[starts[1:] - 1] = False
 
     # MNIW prior
     M0 = np.zeros((d, p))
@@ -438,15 +498,16 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
             idx = z == k
             As[k], Sigmas[k] = sample_mniw(X[idx], Yt[idx], M0, K0, S0, nu0, rng)
 
-        # 2. Transition counts -> beta and transition matrix
+        # 2. Transition counts -> beta and transition matrix. Only pairs
+        #    inside a segment; a join is not a transition.
         N = np.zeros((L, L))
-        np.add.at(N, (z[:-1], z[1:]), 1)
+        np.add.at(N, (z[:-1][adjacent], z[1:][adjacent]), 1)
         beta = sample_beta(N, alpha, kappa, gamma, beta, rng)
         P = sample_transitions(N, alpha, kappa, beta, rng)
 
-        # 3. State sequence
+        # 3. State sequence, each segment filtered and sampled on its own
         logL = np.column_stack([ar_loglik(X, Yt, As[k], Sigmas[k]) for k in range(L)])
-        z = sample_states(logL, P, beta, rng)
+        z = sample_states(logL, P, beta, rng, starts)
 
         counts = np.bincount(z, minlength=L)
         K_used = int(np.sum(counts >= min_frac * T))
@@ -480,8 +541,9 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
 
     return dict(K_hat=K_hat, z=z_best, trace_K=np.array(trace_K),
                 trace_ll=np.array(trace_ll), z_samples=z_samples,
-                As=As, Sigmas=Sigmas, beta=beta, P=P,
-                Y=Y, nlags=nlags, burn_in=burn_in)
+                As=As, Sigmas=Sigmas, beta=beta, P=P, Y=Yt,
+                segment_starts=starts, nlags=nlags, burn_in=burn_in,
+                n_lag_terms=p)
 
 
 # -----------------------------------------------------------------------------
@@ -1050,22 +1112,35 @@ def smooth_trace(values, fs, spec):
     return np.convolve(padded, kernel, mode="valid")[:len(values)]
 
 
-def resample_trace(values, source_t, target_edges, method="mean"):
-    """Aggregate a densely sampled trace into the target bins."""
+def resample_trace(values, source_t, target_edges, method="median"):
+    """Aggregate a densely sampled trace into the target bins.
+
+    method is the statistic that stands for the bin: "median" is robust to the
+    spikes an envelope carries at event onsets, "mean" weights them in, "max"
+    keeps the largest excursion, "sum" integrates. Empty bins are NaN.
+    """
     idx = np.searchsorted(target_edges, source_t, side="right") - 1
     n = len(target_edges) - 1
     ok = (idx >= 0) & (idx < n) & np.isfinite(values)
     idx, vals = idx[ok], np.asarray(values, dtype=np.float64)[ok]
+    out = np.full(n, np.nan)
+    if method == "median":
+        grouped = pd.Series(vals).groupby(idx).median()
+        out[grouped.index.values] = grouped.values
+        return out
     if method == "sum":
         return np.bincount(idx, weights=vals, minlength=n)
     if method == "max":
-        out = np.full(n, -np.inf)
-        np.maximum.at(out, idx, vals)
-        out[~np.isfinite(out)] = np.nan
+        filled = np.full(n, -np.inf)
+        np.maximum.at(filled, idx, vals)
+        hit = np.isfinite(filled)
+        out[hit] = filled[hit]
         return out
+    if method != "mean":
+        raise ValueError(f"unknown bin_method: {method!r} — use median, mean, "
+                         f"max or sum")
     total = np.bincount(idx, weights=vals, minlength=n)
     count = np.bincount(idx, minlength=n)
-    out = np.full(n, np.nan)
     hit = count > 0
     out[hit] = total[hit] / count[hit]
     return out
@@ -1099,9 +1174,10 @@ def build_observations(session, spec, verbose=True):
     every column enters the model on equal terms whatever its physical units.
 
     The spec (OBS_SPEC in CELL 3):
-        rate        "lfp" keeps the LFP sampling rate; a number resamples to
-                    that many Hz using bin_method. decimate then takes every
-                    nth sample of whatever grid results.
+        rate        "lfp" keeps the LFP sampling rate; a number resamples
+                    to that many Hz, aggregating each bin with
+                    bin_method ("median", "mean", "max", "sum").
+                    decimate then takes every nth sample of the result.
         bands
           measure   "envelope" is the Hilbert amplitude — the band's power
                     trace, and already a smoothing of the band. "power"
@@ -1163,7 +1239,7 @@ def build_observations(session, spec, verbose=True):
             trace = smooth_trace(raw, fs, band_spec.get("smooth"))
             if not native:
                 trace = resample_trace(trace, lfp_t, target_edges,
-                                       spec.get("bin_method", "mean"))
+                                       spec.get("bin_method", "median"))
             columns.append(finish_trace(name, trace,
                                         band_spec.get("log", False),
                                         band_spec.get("zscore", True)))
@@ -1432,35 +1508,45 @@ def load_embeddings(session, methods=METHODS, cache_dir=CACHE_DIR, verbose=True)
 # -----------------------------------------------------------------------------
 
 
-def choose_segment(Y, rate, seconds, start_s=None):
-    """Which stretch to fit, as indices into the observation grid.
+def choose_segments(n_samples, rate, minutes, segment_s, start_s=None, seed=0):
+    """Which stretches to fit, as a list of index arrays into the grid.
 
-    start_s=None looks for the most variable window rather than the first one:
-    the opening minute of a session is often the animal sitting still, which
-    teaches the model about one state and nothing about switching.
+    Stratified rather than uniformly random: the recording is cut into as many
+    equal blocks as there are segments and one window is placed at random
+    inside each. That guarantees the segments cannot overlap and that they
+    span the session, so a model fit on ten minutes is not ten minutes from
+    one corner of it.
+
+    minutes=None takes the whole recording as a single segment. A number in
+    start_s overrides everything and takes one contiguous window there, which
+    is what to use when chasing a particular event.
     """
-    n = len(Y)
-    if seconds is None:
-        return np.arange(n)
-    span = int(round(seconds * rate))
-    if span >= n:
-        return np.arange(n)
+    if minutes is None:
+        return [np.arange(n_samples)]
+    span = int(round(segment_s * rate))
+    if span >= n_samples:
+        return [np.arange(n_samples)]
     if start_s is not None:
-        first = int(np.clip(round(start_s * rate), 0, n - span))
-        return np.arange(first, first + span)
-    step = max(span // 4, 1)
-    activity = np.abs(np.diff(Y, axis=0)).sum(axis=1)
-    cumulative = np.concatenate(([0.0], np.cumsum(activity)))
-    starts = np.arange(0, n - span, step)
-    scores = cumulative[starts + span - 1] - cumulative[starts]
-    first = int(starts[np.argmax(scores)])
-    return np.arange(first, first + span)
+        first = int(np.clip(round(start_s * rate), 0, n_samples - span))
+        return [np.arange(first, first + span)]
+
+    wanted = int(round(minutes * 60 * rate))
+    n_seg = max(int(round(wanted / span)), 1)
+    if n_seg * span > n_samples:
+        n_seg = max(n_samples // span, 1)
+    block = n_samples // n_seg
+    rng = np.random.default_rng(seed)
+    return [np.arange(s, s + span) for s in
+            (b * block + rng.integers(0, max(block - span, 1))
+             for b in range(n_seg))]
 
 
-def fit_states(session, obs, seconds=ARHMM_SECONDS, start_s=ARHMM_START_S,
+def fit_states(session, obs, minutes=ARHMM_MINUTES,
+               segment_s=ARHMM_SEGMENT_S, start_s=ARHMM_START_S,
                nlags=ARHMM_NLAGS, L=ARHMM_L, n_iter=ARHMM_ITER,
                burn_in=ARHMM_BURN_IN, kappa=ARHMM_KAPPA, alpha=ARHMM_ALPHA,
-               gamma=ARHMM_GAMMA, min_frac=ARHMM_MIN_FRAC, seed=ARHMM_SEED):
+               gamma=ARHMM_GAMMA, min_frac=ARHMM_MIN_FRAC, seed=ARHMM_SEED,
+               segment_seed=ARHMM_SEGMENT_SEED):
     """Fit the AR-HMM on the observation grid and map its states onto both grids.
 
     The AR design drops the first `nlags` samples, so state i belongs to sample
@@ -1471,30 +1557,33 @@ def fit_states(session, obs, seconds=ARHMM_SECONDS, start_s=ARHMM_START_S,
     Two state arrays come back. `states_obs` is the sequence on the
     observation grid, which is what the example window draws. `states` is the
     modal state within each 50 ms manifold bin, which is what colours the
-    manifold; bins outside the fitted segment are -1.
+    manifold; bins outside the fitted segments are -1.
     """
     Y_all, rate, t_all = obs["Y"], obs["rate"], obs["t"]
-    segment = choose_segment(Y_all, rate, seconds, start_s)
-    Y = Y_all[segment]
+    segments = choose_segments(len(Y_all), rate, minutes, segment_s, start_s,
+                               seed=segment_seed)
+    total = sum(len(s) for s in segments)
+    d = Y_all.shape[1]
+    p = nlags * d + 1
 
     print(f"\nfitting the sticky HDP-AR-HMM")
-    print(f"    observations: {len(obs['names'])} traces — "
-          f"{', '.join(obs['names'])}")
-    print(f"    segment: {len(Y)} samples at {rate:.0f} Hz "
-          f"({len(Y) / rate:.1f} s), starting "
-          f"{t_all[segment[0]] - session['t_start']:.1f}s into the epoch")
-    print(f"    AR order {nlags} ({nlags / rate * 1e3:.2f} ms lag), L={L}, "
-          f"kappa={kappa}, {n_iter} iterations")
-    if len(segment) < len(Y_all):
-        print(f"    this is {100 * len(segment) / len(Y_all):.1f}% of the "
-              f"epoch — the rest gets no state label")
-    print("    the state step is a Python loop over time, so this is the slow "
-          "part", flush=True)
+    print(f"    observations: {d} traces — {', '.join(obs['names'])}")
+    print(f"    {len(segments)} segment(s), {total} samples at {rate:.0f} Hz "
+          f"({total / rate / 60:.1f} min, "
+          f"{100 * total / len(Y_all):.1f}% of the epoch)")
+    print(f"    placed at "
+          + ", ".join(f"{t_all[s[0]] - session['t_start']:.0f}s"
+                      for s in segments[:8])
+          + (" ..." if len(segments) > 8 else ""))
+    print(f"    AR order {nlags} = {nlags / rate * 1e3:.0f} ms of lag | "
+          f"p = nlags*d+1 = {p} | L={L}, kappa={kappa}, {n_iter} iterations")
+    print(f"    cost per iteration goes as samples x L x p^2", flush=True)
 
     t0 = time.perf_counter()
-    arhmm = fit_hdp_arhmm(Y, nlags=nlags, L=L, n_iter=n_iter, burn_in=burn_in,
-                          alpha=alpha, kappa=kappa, gamma=gamma,
-                          min_frac=min_frac, seed=seed)
+    arhmm = fit_hdp_arhmm([Y_all[s] for s in segments], nlags=nlags, L=L,
+                          n_iter=n_iter, burn_in=burn_in, alpha=alpha,
+                          kappa=kappa, gamma=gamma, min_frac=min_frac,
+                          seed=seed)
     print(f"    fitted in {(time.perf_counter() - t0) / 60:.1f} min")
     if arhmm["K_hat"] >= L - 1:
         print(f"    WARNING: K_hat={arhmm['K_hat']} is at the truncation level "
@@ -1525,8 +1614,13 @@ def fit_states(session, obs, seconds=ARHMM_SECONDS, start_s=ARHMM_START_S,
             f"kept {n_states} states but the sampler reported K_hat="
             f"{arhmm['K_hat']} — these are the same threshold and must agree")
 
-    state_index = segment[nlags:]            # row of obs["t"] for each state
+    # Each segment loses its first `nlags` samples to the design, so the rows
+    # of z line up with the segments' tails, concatenated in the same order.
+    state_index = np.concatenate([s[nlags:] for s in segments])
     t_states = t_all[state_index]
+    if len(state_index) != len(z):
+        raise AssertionError(f"{len(state_index)} sample indices for "
+                             f"{len(z)} states — the segment bookkeeping is off")
 
     # modal state per 50 ms bin, via a 2d bincount rather than a groupby loop.
     # Samples in the minor states are left out of the tally, so a bin votes on
@@ -1547,19 +1641,31 @@ def fit_states(session, obs, seconds=ARHMM_SECONDS, start_s=ARHMM_START_S,
     print(f"    {n_states} states kept over {len(z)} samples | "
           f"{(states >= 0).sum()} of {session['n_bins']} manifold bins labelled")
     return {"arhmm": arhmm, "obs": obs, "obs_names": obs["names"],
-            "obs_kinds": obs["kinds"], "segment": segment, "rate": rate,
+            "obs_kinds": obs["kinds"], "segments": segments, "rate": rate,
             "nlags": nlags, "states_obs": z, "state_index": state_index,
             "t_states": t_states, "states": states, "relabel": relabel,
             "n_states": n_states, "burn_in": burn_in,
+            "segment_starts": arhmm["segment_starts"],
             "cmap": ListedColormap(
                 plt.get_cmap("tab20")(np.linspace(0, 1, 20))[:n_states])}
 
 
-def run_lengths(labels):
-    """(state, start index, length) for every contiguous run."""
-    change = np.flatnonzero(np.diff(labels) != 0) + 1
-    starts = np.concatenate(([0], change))
-    stops = np.concatenate((change, [len(labels)]))
+def run_lengths(labels, breaks=None):
+    """(state, start index, length) for every contiguous run.
+
+    `breaks` are indices where a new segment begins. A run is cut there even
+    if the label is unchanged, because the two samples are not adjacent in
+    time — without it a dwell time can span the gap between two segments
+    minutes apart.
+    """
+    change = np.diff(labels) != 0
+    if breaks is not None:
+        cut = np.asarray(breaks, dtype=int)
+        cut = cut[(cut > 0) & (cut < len(labels))]
+        change[cut - 1] = True
+    idx = np.flatnonzero(change) + 1
+    starts = np.concatenate(([0], idx))
+    stops = np.concatenate((idx, [len(labels)]))
     return labels[starts], starts, stops - starts
 
 
@@ -1572,8 +1678,8 @@ def state_characterization(session, fit, verbose=True):
     """
     z, n_states = fit["states_obs"], fit["n_states"]
     names = fit["obs_names"]
-    Y = fit["arhmm"]["Y"][fit["nlags"]:]          # standardized observations
-    run_state, _, run_len = run_lengths(z)
+    Y = fit["arhmm"]["Y"]          # standardized observations, design-aligned
+    run_state, _, run_len = run_lengths(z, fit["segment_starts"])
     step_ms = 1e3 / fit["rate"]
 
     rows = []
@@ -1646,7 +1752,7 @@ def plot_arhmm(session, fit, state_table):
     arhmm, names, kinds = fit["arhmm"], fit["obs_names"], fit["obs_kinds"]
     step_ms = 1e3 / fit["rate"]
     t_rel = fit["t_states"] - session["t_start"]
-    run_state, _, run_len = run_lengths(z)
+    run_state, _, run_len = run_lengths(z, fit["segment_starts"])
 
     fig, axes = plt.subplots(3, 2, figsize=(15, 10))
     fig.suptitle(f"{session['label']} — sticky HDP-AR-HMM on "
@@ -1669,14 +1775,22 @@ def plot_arhmm(session, fit, state_table):
     ax.set_title("log-likelihood", fontsize=10)
 
     ax = axes[1, 0]
-    # -1 is a sample in one of the sub-threshold states; masking keeps it from
-    # being painted as state 0
+    # Against sample index, not time: the segments are minutes apart, and a
+    # single time axis would draw the gaps between them as though they were
+    # part of the sequence. The dotted lines are the joins, labelled with
+    # where each segment sits in the recording. -1 is masked so a
+    # sub-threshold sample is not painted as state 0.
     ax.imshow(np.ma.masked_less(z, 0)[None, :], aspect="auto",
               interpolation="nearest", cmap=cmap,
               vmin=-0.5, vmax=n_states - 0.5,
-              extent=[t_rel[0], t_rel[-1], 0, 1])
+              extent=[0, len(z), 0, 1])
+    for start in fit["segment_starts"][1:]:
+        ax.axvline(start, color="k", lw=0.9, ls=":")
+    ax.set_xticks(fit["segment_starts"])
+    ax.set_xticklabels([f"{t_rel[s]:.0f}s" for s in fit["segment_starts"]],
+                       rotation=45, ha="right", fontsize=7)
     ax.set_yticks([])
-    ax.set_xlabel("time into epoch (s)")
+    ax.set_xlabel("segments, in order (tick = start, in epoch time)")
     ax.set_title(f"inferred state sequence ({n_states} states, "
                  f"{100 * (z < 0).mean():.1f}% unlabelled)", fontsize=10)
 
@@ -2171,17 +2285,30 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
     span = int(round(window_s * fit["rate"]))
 
     if start_s is None:
+        # The window must sit inside one segment: the samples either side of a
+        # join are minutes apart, so a window spanning one would draw a jump
+        # in time as a jump in the data.
+        bounds = np.append(fit["segment_starts"], len(z))
         changes = np.concatenate(([0.0], (np.diff(z) != 0).astype(float)))
-        density = np.convolve(changes, np.ones(min(span, len(changes))),
-                              mode="valid")
-        first = int(np.argmax(density))
-        print(f"\nstart_s is None — busiest window in the segment: "
-              f"{density[first]:.0f} state changes starting "
+        changes[fit["segment_starts"][1:]] = 0.0
+        best, first = -1.0, 0
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            if hi - lo < span:
+                continue
+            density = np.convolve(changes[lo:hi], np.ones(span), mode="valid")
+            j = int(np.argmax(density))
+            if density[j] > best:
+                best, first = float(density[j]), int(lo + j)
+        print(f"\nstart_s is None — busiest window in any segment: "
+              f"{best:.0f} state changes starting "
               f"{t_states[first] - t0:.1f}s into the epoch")
     else:
         first = int(np.clip(np.searchsorted(t_states - t0, start_s),
                             0, max(len(z) - span, 0)))
-    last = min(first + span, len(z))
+    # never run past the end of the segment the window starts in
+    bounds = np.append(fit["segment_starts"], len(z))
+    segment_end = int(bounds[np.searchsorted(bounds, first, side="right")])
+    last = min(first + span, segment_end, len(z))
     seg = np.arange(first, last)
     t_win = t_states[seg] - t_states[first]
     win_t0, win_t1 = t_states[first], t_states[last - 1]
@@ -2311,10 +2438,8 @@ print(f'    RECORDING = "{Path(eligible["file"].iloc[0]).stem}"')
 # observations under a new spec costs seconds and does not re-read the file.
 # build_observations() documents every key.
 #
-# RUN_SECONDS is the one to watch. The sampler's state step is a Python loop
-# over time, so 60 s at 1250 Hz is already 75k samples per iteration. Start
-# short, settle kappa and L, then lengthen — or raise OBS_SPEC["decimate"] to
-# trade resolution for coverage.
+# Runtime is OBS_SPEC["rate"] x RUN_MINUTES x RUN_NLAGS^2. Raise the rate only
+# with a reason — it buys resolution at quadratic cost through nlags.
 
 RECORDING = "sub-M03_ses-20240623T100000_behavior+ecephys"   # substring of the file, from CELL 2
 
@@ -2326,9 +2451,16 @@ RECORDING = "sub-M03_ses-20240623T100000_behavior+ecephys"   # substring of the 
 # already the smoothing of the band), z-scored; plus the MUA of every listed
 # region x cell type with at least 3 units, on a causal 20 ms kernel.
 OBS_SPEC = {
-    "rate": "lfp",            # "lfp", or a number in Hz
-    "bin_method": "mean",     # "mean" | "max" | "sum", when resampling
-    "decimate": 1,            # >1 trades resolution for coverage
+    # A number resamples by averaging within each bin, which also anti-aliases
+    # — unlike "decimate", which just drops samples. 100 Hz lets RUN_NLAGS=10
+    # span 100 ms at a tractable cost; "lfp" (1250 Hz) would need 125 lags for
+    # the same span, and the cost is quadratic in that.
+    "rate": 100,              # "lfp", or a number in Hz
+    # the statistic that stands for each bin when resampling the band
+    # envelopes. Does not apply to MUA, which is counted in the target
+    # bins directly rather than aggregated from a finer grid.
+    "bin_method": "median",   # "median" | "mean" | "max" | "sum"
+    "decimate": 1,            # drops samples without filtering; prefer "rate"
 
     "bands": {
         "use": True,
@@ -2373,11 +2505,20 @@ OBS_SPEC = {
     },
 }
 
-RUN_SECONDS = 60.0            # segment to fit, in seconds; None = whole epoch
-RUN_START_S = None            # None = the most variable stretch
-RUN_NLAGS = 1
-RUN_ITER = 400
-RUN_BURN_IN = 200
+# Segments are placed one per equal block of the recording at a random offset,
+# so this is 10 min from across the session, not 10 min of one corner.
+# RUN_START_S as a number takes a single contiguous window there instead.
+RUN_MINUTES = 10.0
+RUN_SEGMENT_S = 60.0
+RUN_SEGMENT_SEED = 0
+RUN_START_S = None
+
+# nlags x (1/rate) is the lag span the model sees. 10 lags at 100 Hz = 100 ms.
+# Cost goes as samples x L x (nlags*d + 1)^2, so raising the rate without
+# dropping nlags gets expensive fast.
+RUN_NLAGS = 10
+RUN_ITER = 60
+RUN_BURN_IN = 75
 RUN_KAPPA = 50.0              # sticky bias: bigger = longer dwell times
 RUN_L = 20                    # truncation; raise it if K_hat lands on L-1
 RUN_WINDOW_S = 8.0
@@ -2416,7 +2557,8 @@ obs = build_observations(session, OBS_SPEC)
 plot_observations(session, obs)
 
 # 6. the AR-HMM, at the observation grid's own rate
-fit = fit_states(session, obs, seconds=RUN_SECONDS, start_s=RUN_START_S,
+fit = fit_states(session, obs, minutes=RUN_MINUTES, segment_s=RUN_SEGMENT_S,
+                 segment_seed=RUN_SEGMENT_SEED, start_s=RUN_START_S,
                  nlags=RUN_NLAGS, n_iter=RUN_ITER, burn_in=RUN_BURN_IN,
                  kappa=RUN_KAPPA, L=RUN_L)
 state_table = state_characterization(session, fit)
