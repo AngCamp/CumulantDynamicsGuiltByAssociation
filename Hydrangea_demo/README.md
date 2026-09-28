@@ -36,3 +36,7 @@ The data archive is mounted under /storage/dandi_downloads/ and includes subject
 - `fit_hmm` uses a simple integer state range: `n_states_min` and `n_states_max`.
 - `fold_strategy` controls how the validation sets are formed. The default is temporal segments with optional randomization inside each segment.
 - `report` accepts `"full"`, `"selected"`, or `"none"`.
+
+## UMAP_EDA
+
+Briefly visually checking the manifolds of the DANDIset being used to test some of this, and quanitifying things like position encoding as well as LFP band correspondance among other things. 
