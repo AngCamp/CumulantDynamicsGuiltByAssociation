@@ -225,7 +225,6 @@ SEQUENCE_TOP = 12         # how many of each length to show
 # T^2 is inside the retained subspace, Q the residual outside it. The null
 # shifts the state labels by up to Q_JITTER_S and re-reads them at the same
 # bins, which keeps both series' autocorrelation and breaks only the alignment.
-Q_DIMS = 10               # components retained for both statistics
 Q_MAX_SAMPLES = 4000
 Q_BOOT = 1000
 Q_JITTER_S = 1.0
@@ -2363,80 +2362,96 @@ def knee_point(x, y):
     return int(np.argmax(np.abs(dy * (xs - xs[0]) - dx * (ys - ys[0])) / norm))
 
 
-def plot_elbows(session, embeddings, scores, max_dims=ELBOW_DIMS):
-    """Two elbows per method: the embedding's spectrum, and its own recovery.
+def retained_components(rank_table, method):
+    """The components this method keeps: its own ranking, cut at its elbow.
 
-    Left: variance held by each component of the embedding, and the cumulative
-    share. For PCA this is the eigenvalue spectrum; for kernel PCA it is the
-    kernel's. For Laplacian eigenmaps it is neither — the components come out
-    in ascending graph-Laplacian order, so the curve is not expected to decay
-    and a flat one is information rather than a bug.
+    The single definition. Every analysis downstream reads the result of this
+    through embeddings[method]["retained"], so there is one component set per
+    method and one count, rather than a per-figure choice.
+    """
+    sub = rank_table[rank_table["method"] == method].sort_values("rank")
+    values = sub["score"].values
+    keep = knee_point(np.arange(1, len(values) + 1), values) + 1
+    return sub["component"].values[:keep]
 
-    Right: this recording's held-out reconstruction MSE from the sweep, which
-    is the elbow that matters for how many dimensions to keep.
+
+def store_retained(embeddings, rank_table, verbose=True):
+    """Attach each method's retained component set to its embedding entry."""
+    for method in embeddings:
+        comps = retained_components(rank_table, method)
+        embeddings[method]["retained"] = comps
+        if verbose:
+            criterion = (rank_table.loc[rank_table["method"] == method,
+                                        "criterion"].iloc[0])
+            print(f"    {method:10s} keeps {len(comps):2d} by {criterion}: "
+                  + ", ".join(f"#{int(j)}" for j in comps))
+    return embeddings
+
+
+def plot_elbows(session, embeddings, scores, rank_table, max_dims=ELBOW_DIMS):
+    """One column per method: its own spectrum, and its own reconstruction MSE.
+
+    Not overlaid. A share of PCA's variance, a share of the kernel's, and a
+    share of a graph-Laplacian's are three different quantities that happen to
+    lie on the same numeric range, and drawing them on one axis invites a
+    comparison none of them supports. Only the MSE row is on a common scale,
+    and it is drawn per method anyway so the two rows line up.
+
+    The marked knee on the bottom row is the count `retained_components` uses,
+    so what is on this figure is what every later analysis runs on.
     """
     methods = list(embeddings)
     mine = scores[scores["file"] == session["file"]]
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4.6))
-    fig.suptitle(f"{session['label']} — embedding spectrum, and "
-                 f"reconstruction MSE against dimensions")
-
-    ax = axes[0]
-    twin = ax.twinx()
-    for method in methods:
-        var = embeddings[method]["scaled"].var(axis=0)
-        # sorted descending, always: an elbow is a statement about the ranked
-        # curve, and Laplacian eigenmaps do not return their components in
-        # anything like that order
-        share = np.sort(var / var.sum())[::-1]
-        k = np.arange(1, len(share) + 1)
-        colour = METHOD_COLORS[method]
-        ax.plot(k, share, color=colour, lw=1.6, label=method)
-        twin.plot(k, np.cumsum(share), color=colour, lw=1.0, ls="--", alpha=0.7)
-        cut = min(max_dims, len(share))
-        knee = knee_point(k[:cut], share[:cut])
-        ax.plot(k[knee], share[knee], "o", ms=7, mfc="none", mec=colour, mew=1.8)
-        ax.annotate(f"{method} knee k={k[knee]}", (k[knee], share[knee]),
-                    textcoords="offset points", xytext=(6, 6), fontsize=7,
-                    color=colour)
-    ax.set_xlim(1, max_dims)
-    ax.set_ylim(bottom=0)
-    ax.set_xlabel("component, ranked by variance")
-    ax.set_ylabel("share of embedding variance")
-    twin.set_ylabel("cumulative share (dashed)")
-    twin.set_ylim(0, 1.02)
-    ax.legend(fontsize=8, loc="upper right")
-
     if not len(mine):
         raise ValueError(
             f"{session['file']} has no rows in the score frame, so there is no "
             f"reconstruction curve to draw. The sweep either skipped it or "
             f"wrote a different CACHE_DIR.")
 
-    ax = axes[1]
-    for method in methods:
-        sub = (mine[mine["method"] == method]
-               .groupby("k", as_index=False)["rec_mse"].mean()
-               .sort_values("k"))
-        if not len(sub):
+    fig, axes = plt.subplots(2, len(methods), figsize=(4.8 * len(methods), 8),
+                             squeeze=False)
+    fig.suptitle(f"{session['label']} — each method's own spectrum and "
+                 f"reconstruction MSE")
+
+    for c, method in enumerate(methods):
+        colour = METHOD_COLORS[method]
+        criterion = (rank_table.loc[rank_table["method"] == method,
+                                    "criterion"].iloc[0])
+        comps = retained_components(rank_table, method)
+
+        ax = axes[0, c]
+        twin = ax.twinx()
+        sub = (rank_table[rank_table["method"] == method]
+               .sort_values("rank"))
+        values = sub["score"].values
+        k = np.arange(1, len(values) + 1)
+        ax.plot(k, values, "-o", ms=4, color=colour)
+        twin.plot(k, np.cumsum(values) / values.sum(), lw=1.0, ls="--",
+                  color=colour, alpha=0.7)
+        ax.axvline(len(comps), color="k", ls=":", lw=1.2)
+        ax.annotate(f"keeps {len(comps)}", (len(comps), values[len(comps) - 1]),
+                    textcoords="offset points", xytext=(6, 6), fontsize=8)
+        ax.set_ylim(bottom=0)
+        twin.set_ylim(0, 1.02)
+        ax.set_xlabel("component, ranked")
+        ax.set_ylabel(RANK_SCORE_LABEL[criterion], fontsize=9)
+        twin.set_ylabel("cumulative (dashed)", fontsize=8)
+        ax.set_title(f"{method} — ranked by {criterion}", fontsize=10)
+
+        ax = axes[1, c]
+        curve = (mine[mine["method"] == method]
+                 .groupby("k", as_index=False)["rec_mse"].mean()
+                 .sort_values("k"))
+        if not len(curve):
             raise ValueError(
                 f"{session['file']}: the score frame has no {method} rows, "
                 f"although its embedding loaded. The sweep and the cache "
                 f"disagree about what was scored.")
-        colour = METHOD_COLORS[method]
-        ax.plot(sub["k"], sub["rec_mse"], color=colour, lw=1.8, label=method)
-        cut = sub[sub["k"] <= max_dims]
-        knee = knee_point(cut["k"].values, cut["rec_mse"].values)
-        kk = cut["k"].values[knee]
-        ax.axvline(kk, color=colour, ls=":", lw=1.0)
-        ax.annotate(f"k={kk}", (kk, cut["rec_mse"].values[knee]),
-                    textcoords="offset points", xytext=(5, -10),
-                    fontsize=7, color=colour)
-    ax.set_xlim(1, max_dims)
-    ax.set_xlabel("number of dimensions kept")
-    ax.set_ylabel("held-out reconstruction MSE")
-    ax.legend(fontsize=8, loc="upper right")
+        ax.plot(curve["k"], curve["rec_mse"], color=colour, lw=1.8)
+        ax.axvline(len(comps), color="k", ls=":", lw=1.2)
+        ax.set_xlim(1, max_dims)
+        ax.set_xlabel("number of dimensions kept")
+        ax.set_ylabel("held-out reconstruction MSE", fontsize=9)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -2482,14 +2497,29 @@ def cv_mse(Y_sub, X, splits):
     return total / count
 
 
+# Each criterion's y-axis label. "variance" and "kernel_eigenvalue" are the
+# same arithmetic — the variance of that component's scores — but not the same
+# quantity. For PCA the scores are coordinates in the original activity space,
+# so their variance is variance of the data along that direction. For kernel
+# PCA they are coordinates in the space the cosine kernel induces, so their
+# variance is that kernel's eigenvalue; a cosine kernel is a linear kernel on
+# L2-normalized rows, which makes it a statement about direction and not
+# about magnitude. The two are not comparable and are named apart so they are
+# not read as if they were.
 RANK_SCORE_LABEL = {
-    "variance": "share of embedding variance",
+    "variance": "share of explained variance (covariance eigenvalue)",
+    "kernel_eigenvalue": "share of the cosine kernel's spectrum",
     "drop_one_mse": "reconstruction loss when dropped ($\\Delta$MSE)",
 }
 
 
-def component_variance(embeddings, method, dims):
-    """Each component's share of the embedding's total variance."""
+def component_spectrum(embeddings, method, dims):
+    """Each component's share of the spectrum, as the variance of its scores.
+
+    What that share is a share OF depends on the method, which is why the
+    two criteria using this are named apart: for PCA it is the covariance
+    eigenvalue, for kernel PCA the cosine kernel's eigenvalue.
+    """
     var = embeddings[method]["scaled"].var(axis=0)
     return (var / var.sum())[:int(min(dims, len(var)))]
 
@@ -2535,8 +2565,8 @@ def rank_components(session, embeddings, by, methods=METHODS,
     for method in methods:
         criterion = criteria[method]
         t0 = time.perf_counter()
-        if criterion == "variance":
-            score = component_variance(embeddings, method, dims)
+        if criterion in ("variance", "kernel_eigenvalue"):
+            score = component_spectrum(embeddings, method, dims)
         else:
             idx = embeddings[method]["idx"]
             take = np.arange(len(idx))
@@ -2568,29 +2598,34 @@ def rank_components(session, embeddings, by, methods=METHODS,
     return ranking, table
 
 
-def monitoring_statistics(session, embeddings, method, dims=Q_DIMS,
-                          folds=RANK_FOLDS, max_samples=Q_MAX_SAMPLES,
-                          seed=RANK_SEED):
+def monitoring_statistics(session, embeddings, method, folds=RANK_FOLDS,
+                          max_samples=Q_MAX_SAMPLES, seed=RANK_SEED):
     """The two standard subspace-monitoring statistics, per sample.
 
-    T^2 is Hotelling's, inside the retained subspace: the sum over the kept
-    components of the squared score divided by that component's variance, so
-    it measures how far a sample sits from the centre along directions the
-    embedding does keep.
+    The subspace is embeddings[method]["retained"] — the set store_retained
+    put there, and the only component set this script uses.
+
+    T^2 is Hotelling's, inside that subspace: the sum over the kept components
+    of the squared score divided by that component's variance, so it measures
+    how far a sample sits from the centre along directions the embedding does
+    keep.
 
     Q is the squared prediction error, outside it: the squared norm of the
-    held-out reconstruction residual, so it measures what the embedding does
-    not account for at all. Cross-validated, since the LLE map would otherwise
-    rebuild each point from itself.
+    held-out reconstruction residual, rebuilt from those same components.
+    Cross-validated, since the LLE map would otherwise rebuild each point from
+    itself.
 
     Returns (bin indices, T2, Q) on the manifold's 50 ms grid.
     """
+    if "retained" not in embeddings[method]:
+        raise KeyError(f"{method} has no retained component set — run "
+                       f"store_retained(embeddings, rank_table) first")
+    comps = list(embeddings[method]["retained"])
     idx = embeddings[method]["idx"]
     take = np.arange(len(idx))
     if len(take) > max_samples:
         take = np.unique(np.linspace(0, len(idx) - 1, max_samples).astype(int))
-    k = int(min(dims, embeddings[method]["scaled"].shape[1]))
-    Y = embeddings[method]["scaled"][np.ix_(take, np.arange(k))]
+    Y = embeddings[method]["scaled"][np.ix_(take, comps)]
     X = session["X"][idx[take]]
 
     t2 = ((Y - Y.mean(axis=0)) ** 2 / (Y.var(axis=0) + 1e-12)).sum(axis=1)
@@ -2641,25 +2676,25 @@ def state_statistic_null(states_full, bins, values, n_states,
 
 
 def plot_state_monitoring(session, embeddings, fit, methods=MAP_METHODS,
-                          dims=Q_DIMS, n_boot=Q_BOOT, jitter_s=Q_JITTER_S,
-                          verbose=True):
+                          n_boot=Q_BOOT, jitter_s=Q_JITTER_S, verbose=True):
     """T^2 and Q per state, each against its circular-shift null.
 
-    Two rows per method is too many panels, so T^2 is the top row and Q the
-    bottom, one column per method. The violin is the null, the marker the
-    observed mean, and the p is the fraction of shifted label sets reaching
-    that mean or higher.
+    On each method's retained component set, which comes from
+    embeddings[method]["retained"] and is not chosen here.
+
+    T^2 is the top row and Q the bottom, one column per method. The violin is
+    the null, the marker the observed mean, and the p is the fraction of
+    shifted label sets reaching that mean or higher.
     """
     n_states, cmap = fit["n_states"], fit["cmap"]
     fig, axes = plt.subplots(2, len(methods), figsize=(4.8 * len(methods), 8),
                              squeeze=False)
     fig.suptitle(f"{session['label']} — subspace statistics by state, against "
-                 f"{n_boot} label shifts of up to {jitter_s:.0f} s "
-                 f"({dims} components)")
+                 f"{n_boot} label shifts of up to {jitter_s:.0f} s")
 
     rows = []
     for c, method in enumerate(methods):
-        bins, t2, q = monitoring_statistics(session, embeddings, method, dims)
+        bins, t2, q = monitoring_statistics(session, embeddings, method)
         for r, (values, label) in enumerate(((t2, "Hotelling $T^2$"),
                                              (q, "Q (squared residual)"))):
             observed, null, p = state_statistic_null(
@@ -2687,7 +2722,9 @@ def plot_state_monitoring(session, embeddings, fit, methods=MAP_METHODS,
             ax.set_xlabel("state")
             ax.set_ylabel(label, fontsize=9)
             if r == 0:
-                ax.set_title(method, fontsize=10)
+                ax.set_title(f"{method} — "
+                             f"{len(embeddings[method]['retained'])} "
+                             f"components", fontsize=10)
             rows += [{"method": method, "statistic": label.split(" ")[0],
                       "state": s, "observed": observed[s],
                       "null_mean": float(np.nanmean(null[:, s])),
@@ -3179,19 +3216,27 @@ RUN_SEQUENCE_LENGTHS = (2, 3, 4)
 # T^2 (inside the retained subspace) and Q (the residual outside it) per
 # state, each against a null that shifts the state labels by up to
 # RUN_Q_JITTER_S. A low p means the manifold treats that state differently
-# from a set of labels with the same dwell structure placed elsewhere.
-RUN_Q_DIMS = 10
+# from a set of labels with the same dwell structure placed elsewhere. The
+# subspace is the retained set from step 4 — no dimension knob here.
 RUN_Q_BOOT = 1000
 RUN_Q_JITTER_S = 1.0
 
-# How each method's components are ordered, and so which three the manifold
-# figures draw. PCA by its eigenvalues, which is its own natural order; the
-# other two by what dropping a component costs the reconstruction, since
-# neither returns components in an order that means anything for rebuilding
-# the activity. "drop_one_mse" costs (RANK_DIMS + 1) x RANK_FOLDS LLE solves.
+# PCA and kernel PCA both already return their components in descending
+# eigenvalue order, so these criteria confirm that order rather than changing
+# it. They are named apart because PCA's eigenvalue is variance of the data
+# and kernel PCA's is variance in the cosine kernel's feature space, which is
+# a statement about direction alone. Only Laplacian eigenmaps come out in an
+# order that means nothing for
+# reconstruction — ascending graph-Laplacian, which is smoothness — so it is
+# the one that needs the drop-one criterion — sklearn's SpectralEmbedding
+# exposes no eigenvalues at all.
+#
+# This ranking, cut at each method's elbow, is the only place the component
+# set is decided. Step 4 stores it on embeddings[method]["retained"] and
+# every later analysis reads it from there.
 RUN_RANK_BY = {
     "PCA": "variance",
-    "KernelPCA": "drop_one_mse",
+    "KernelPCA": "kernel_eigenvalue",
     "Laplacian": "drop_one_mse",
 }
 
@@ -3211,8 +3256,16 @@ session = filter_bands(session, OBS_SPEC["bands"]["bands"])
 # 3. the embeddings the sweep already computed
 embeddings, common_idx = load_embeddings(session)
 
-# 4. elbows: the embedding spectra, and this recording's own recovery curve
-plot_elbows(session, embeddings, scores)
+# 4. rank each method's components and cut at its elbow, once. The result is
+#    stored on embeddings[method]["retained"], and that is the component set
+#    every figure and statistic below uses — nothing recomputes it and nothing
+#    chooses its own number of dimensions.
+ranking, rank_table = rank_components(session, embeddings, by=RUN_RANK_BY)
+print("\nretained components, used by everything downstream:")
+embeddings = store_retained(embeddings, rank_table)
+RETAINED = {m: embeddings[m]["retained"] for m in embeddings}
+plot_ranking(session, rank_table)
+plot_elbows(session, embeddings, scores, rank_table)
 
 # 5. build the observations from OBS_SPEC and look at them before fitting
 obs = build_observations(session, OBS_SPEC)
@@ -3235,16 +3288,14 @@ plot_observations(session, obs, fit=fit)   # again, now shaded by state
 plot_state_dynamics(session, fit, max_lags=RUN_AR_MAP_LAGS)
 plot_state_sequences(session, fit, lengths=RUN_SEQUENCE_LENGTHS)
 
-# 7. order the components, and take the top three into the figures below
-ranking, rank_table = rank_components(session, embeddings, by=RUN_RANK_BY)
-plot_ranking(session, rank_table)
-
-# 7b. is any state harder for the manifold than the label shuffle expects?
+# 7. is any state harder for the manifold than the label shuffle expects?
 q_table = plot_state_monitoring(session, embeddings, fit, methods=RUN_METHODS,
-                                dims=RUN_Q_DIMS, n_boot=RUN_Q_BOOT,
+                                n_boot=RUN_Q_BOOT,
                                 jitter_s=RUN_Q_JITTER_S)
 
-# 8. the manifolds and the components, against behaviour and band power
+# 8. the manifolds and the components, against behaviour and band power.
+#    The 3d panels draw the top three of the retained set, since a scatter
+#    takes three axes.
 for method in RUN_METHODS:
     plot_manifold(session, embeddings, fit, ranking, method)
     plot_covariates(session, embeddings, fit, ranking, method)
