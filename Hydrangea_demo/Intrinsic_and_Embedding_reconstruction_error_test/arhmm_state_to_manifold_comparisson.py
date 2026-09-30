@@ -27,21 +27,24 @@ not a CA1 object even when the LFP is.
 What CELL 3 does
     1. rebuild the session's 50 ms bin grid exactly as the sweep did, and
        check it against the cached embeddings before using them
-    2. build the observation traces from OBS_SPEC and show them, so the inputs
-       can be looked at before an hour is spent sampling
-    3. fit the sticky HDP-AR-HMM, with the number of states inferred
-    4. elbow plots: the eigenvalue spectrum of each embedding, and this
-       recording's own reconstruction curve against dimensions
-    5. rank each method's components by what dropping one does to held-out
-       reconstruction MSE — not by eigenvalue order, which is a smoothness
-       ordering for Laplacian eigenmaps and means nothing for reconstruction
-    6. plot the manifolds and the top-ranked components against position,
-       speed and band power, coloured by inferred state, and one example
-       window with everything on a shared time axis
+    2. rank each method's components by its own criterion and cut at the
+       elbow. That set is stored on embeddings[method]["retained"] and is the
+       only component set anything downstream uses
+    3. build the observation traces from OBS_SPEC, mark the artifacts, and
+       show them, so the inputs can be looked at before an hour is sampled
+    4. fit the sticky HDP-AR-HMM on the clean stretches, with the number of
+       states inferred, and report its AIC and BIC
+    5. tag every run with a duration class from a per-state GMM on log dwell
+       time, and count the sequences over those symbols
+    6. T^2 and Q per state inside and outside the retained subspace, against
+       a circular-shift null
+    7. plot the manifolds and the retained components against position, speed
+       and band power, coloured by inferred state, and one example window
+       with everything on a shared time axis
 
 Nothing is written to disk. Everything is print() and plt.show().
 
-Two things to keep in mind.
+Three things to keep in mind.
 
 Resolution. PCA was fit on every bin, kernel PCA and Laplacian eigenmaps on
 every tenth (they build an n x n matrix and cannot take 50k bins). So the
@@ -55,6 +58,13 @@ the session rather than one corner of it. Each segment gets its own design
 matrix and its own pass of the state sampler, and transitions are not counted
 across the joins. Bins outside the segments carry no state label and the
 manifold figures draw them grey.
+
+Artifacts. Samples where a band envelope exceeds OBS_SPEC's max_sd are not
+oscillations, and they are cut out before fitting: they split the recording
+into clean stretches, which become segments in exactly the sense above. They
+carry no state label, their 50 ms bins are excluded from T^2 and Q, and they
+stay in the observation matrix so the traces still draw — hatched, so what
+the model never saw is visible.
 
 Cost. An iteration goes as samples x L x (n_lags * d + 1)^2, quadratic in the
 AR order and the number of observations — that is what separates this from a
@@ -90,7 +100,7 @@ from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
 from scipy.fft import next_fast_len
 from scipy.linalg import solve_triangular
-from scipy.stats import invwishart
+from scipy.stats import invwishart, norm
 from sklearn.model_selection import KFold
 from sklearn.neighbors import NearestNeighbors
 
@@ -194,6 +204,18 @@ ARHMM_KAPPA = 50.0        # sticky bias: bigger = longer dwell times
 ARHMM_GAMMA = 1.0
 ARHMM_MIN_FRAC = 0.01     # a state is "used" if it holds >= 1% of samples
 ARHMM_SEED = 0
+ARHMM_MIN_SEGMENT_S = 1.0  # a stretch left between artifacts shorter than this
+                           # is dropped rather than fitted
+
+# --- artifact rejection -------------------------------------------------------
+# An LFP envelope ten standard deviations above its own mean is not an
+# oscillation, it is a movement or amplifier transient. Those samples are cut
+# out of the AR-HMM's design and out of every statistic downstream. They stay
+# in the observation matrix so the traces still draw.
+ARTIFACT_BANDS = ("gamma", "ripple")
+ARTIFACT_MAX_SD = 10.0
+ARTIFACT_PAD_S = 0.050     # dilation either side, to catch the filter ringing
+ARTIFACT_MAX_FRAC = 0.20   # above this the z-score itself is suspect: raise
 
 # --- component ranking --------------------------------------------------------
 # Rank by what dropping a component does to held-out reconstruction MSE, which
@@ -218,8 +240,14 @@ ELBOW_DIMS = 40           # x-limit of the scree and reconstruction elbows
 
 # --- what the states look like ------------------------------------------------
 AR_MAP_LAGS = 5           # lags shown in the AR coefficient heatmaps
-SEQUENCE_LENGTHS = (2, 3, 4)   # sequence lengths counted, runs collapsed
-SEQUENCE_TOP = 12         # how many of each length to show
+SEQUENCE_LENGTHS = (2, 3)      # sequence lengths counted, in runs
+SEQUENCE_TOP = 5          # how many of each length to show
+# Sequences are over symbols, not bare states: each run is tagged with the
+# duration cluster it falls in, so "state 2 held briefly" and "state 2 held
+# for a second" are different symbols.
+DWELL_MAX_K = 5           # largest mixture tried; K is chosen by BIC
+DWELL_SEED = 0
+DWELL_RESTARTS = 4        # EM restarts per K, best log-likelihood kept
 
 # --- the subspace statistics --------------------------------------------------
 # T^2 is inside the retained subspace, Q the residual outside it. The null
@@ -427,6 +455,70 @@ def _sample_states_one(logL, P, pi0, rng):
     return z
 
 
+def forward_loglik(logL, P, pi0, starts=None):
+    """log p(Y | theta), with the state sequence marginalized out.
+
+    The scaled forward recursion, one pass per segment:
+
+        a_1(k) = pi0(k) p(y_1 | k),              c_1 = sum_k a_1(k)
+        a_t(k) = p(y_t | k) sum_j a_{t-1}(j) P(j, k),   c_t = sum_k a_t(k)
+        log p(Y | theta) = sum_t log c_t
+
+    with a_t renormalized by c_t at every step so nothing underflows. Each
+    segment restarts from pi0, since its first sample has no predecessor in
+    the data.
+
+    This is the observed-data likelihood, not the complete-data one the Gibbs
+    trace records: trace_ll conditions on the sampled z and so is larger. AIC
+    and BIC need this one.
+    """
+    T, L = logL.shape
+    bounds = np.append(np.array([0]) if starts is None else starts, T)
+    shift = logL.max(axis=1)
+    lik = np.exp(logL - shift[:, None])
+    total = 0.0
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        a = pi0 * lik[lo]
+        c = a.sum()
+        total += np.log(c) + shift[lo]
+        a = a / c
+        for t in range(lo + 1, hi):
+            a = (a @ P) * lik[t]
+            c = a.sum()
+            total += np.log(c) + shift[t]
+            a = a / c
+    return float(total)
+
+
+def information_criteria(loglik, n, K, d, p):
+    """AIC and BIC at the representative posterior draw.
+
+    Free parameters, counting the K states the model actually uses rather
+    than the truncation level L:
+
+        A_k      d x p each                       K d p
+        Sigma_k  symmetric d x d each             K d(d+1)/2
+        P        rows on the simplex              K(K - 1)
+        pi0      on the simplex                   K - 1
+
+        m   = K[dp + d(d+1)/2] + K(K-1) + (K-1)
+        AIC = 2m - 2 log p(Y | theta)
+        BIC = m log n - 2 log p(Y | theta)
+
+    n is the number of design rows, so one d-vector observation counts once.
+
+    Descriptive, not a test. These are point-estimate criteria applied to a
+    nonparametric posterior in which K was inferred rather than fixed, so
+    they do not select K. They are here to compare OBS_SPECs at matched K and
+    d, where m is identical and the comparison is entirely in the likelihood.
+    """
+    m = K * (d * p + d * (d + 1) // 2) + K * (K - 1) + (K - 1)
+    return {"loglik": float(loglik), "n_params": int(m), "n_obs": int(n),
+            "aic": float(2 * m - 2 * loglik),
+            "bic": float(m * np.log(n) - 2 * loglik),
+            "loglik_per_sample": float(loglik / n)}
+
+
 def safe_dirichlet(a, rng):
     g = rng.gamma(np.maximum(a, 1e-12)) + 1e-300
     return g / g.sum()
@@ -600,7 +692,7 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
     As = np.zeros((L, d, p))
     Sigmas = np.zeros((L, d, d))
 
-    trace_K, trace_ll, z_samples = [], [], []
+    trace_K, trace_ll, z_samples, param_samples = [], [], [], []
     converged, stopped_early = None, False
     started = time.perf_counter()
     for it in range(max_iter):
@@ -626,7 +718,13 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
         trace_K.append(K_used)
         trace_ll.append(ll)
         if it >= burn_in:
+            # z was drawn from p(z | As, Sigmas, P, Y), so storing them
+            # together keeps a coherent joint draw. The information criteria
+            # need the parameters that go with the representative z, and
+            # which iteration that is only becomes known after the loop.
             z_samples.append(z.copy())
+            param_samples.append((As.copy(), Sigmas.copy(), P.copy(),
+                                  beta.copy()))
 
         if verbose and (it % check_every == 0 or it == max_iter - 1):
             spent = time.perf_counter() - started
@@ -671,6 +769,16 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
     cands = [i for i in range(burn_in, n_run) if trace_K[i] == K_hat]
     best = max(cands, key=lambda i: trace_ll[i])
     z_best = z_samples[best - burn_in]
+    As, Sigmas, P, beta = param_samples[best - burn_in]
+
+    # AIC and BIC at that draw, on the marginal likelihood — one forward pass
+    # over the design with the state sequence integrated out.
+    logL_best = np.column_stack([ar_loglik(X, Yt, As[k], Sigmas[k])
+                                 for k in range(L)])
+    criteria = information_criteria(
+        forward_loglik(logL_best, P, beta, starts), T, K_hat, d, p)
+    del logL_best
+    gc.collect()
 
     if verbose:
         print(f"    ran {n_run} of {max_iter} iterations"
@@ -681,12 +789,16 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
         for v, f in zip(values, freq):
             print(f"      K = {v:2d}: {f / len(post_K):.2f}")
         print(f"    estimated number of states: {K_hat}")
+        print(f"    marginal log-likelihood {criteria['loglik']:.1f} "
+              f"({criteria['loglik_per_sample']:+.4f} per sample) | "
+              f"m = {criteria['n_params']} free parameters | "
+              f"AIC {criteria['aic']:.1f} | BIC {criteria['bic']:.1f}")
 
     return dict(K_hat=K_hat, z=z_best, trace_K=np.array(trace_K),
                 trace_ll=np.array(trace_ll), z_samples=z_samples,
                 As=As, Sigmas=Sigmas, beta=beta, P=P, Y=Yt,
                 segment_starts=starts, nlags=nlags, burn_in=burn_in,
-                n_lag_terms=p, n_iterations=n_run,
+                n_lag_terms=p, n_iterations=n_run, criteria=criteria,
                 stopped_early=stopped_early, convergence=converged)
 
 
@@ -872,7 +984,7 @@ def plot_unit_survey(units_long, focus=FOCUS_REGION):
 
     fig, axes = plt.subplots(2, 1, figsize=(max(11, 1.1 * len(names)), 9),
                              sharex=True)
-    fig.suptitle("units per recording, by region and by cell type")
+    fig.suptitle("Units per recording, by region and cell type")
 
     # --- top: totals, stacked by region --------------------------------------
     ax = axes[0]
@@ -890,8 +1002,9 @@ def plot_unit_survey(units_long, focus=FOCUS_REGION):
     for xi, value in zip(x, focus_counts.values):
         ax.text(xi, bottom[xi] + 4, f"{int(value)}", ha="center", fontsize=7,
                 color=region_colour(focus))
-    ax.set_ylabel("units by region")
-    ax.set_title(f"the number above each bar is the {focus} count", fontsize=9)
+    ax.set_ylabel("Units")
+    ax.set_title(f"Total units, stacked by region ({focus} count above each "
+                 f"bar)", fontsize=9)
     ax.legend(fontsize=8, ncol=len(regions))
 
     # --- bottom: a bar per region, stacked by cell type ----------------------
@@ -918,9 +1031,9 @@ def plot_unit_survey(units_long, focus=FOCUS_REGION):
                    hatch=CELL_TYPE_HATCH[t % len(CELL_TYPE_HATCH)],
                    edgecolor="white", linewidth=0.4)
             bottom += values
-    ax.set_ylabel("units by region and cell type")
-    ax.set_title("one bar per region within each recording; shading and hatch "
-                 "are cell type", fontsize=9)
+    ax.set_ylabel("Units")
+    ax.set_title("Units by region and cell type (one bar per region; shading "
+                 "and hatch are cell type)", fontsize=9)
 
     region_keys = [Patch(facecolor=region_colour(r), label=r) for r in regions]
     type_keys = [Patch(facecolor=shade("0.35", shades[t]), edgecolor="white",
@@ -1318,6 +1431,80 @@ def finish_trace(name, values, transform, do_zscore):
     return zscore(values) if do_zscore else values
 
 
+def artifact_mask(Y, names, spec, rate, verbose=True):
+    """Samples to exclude: |z| of a named band above max_sd, dilated by pad_s.
+
+    A band envelope ten standard deviations above its own mean is not an
+    oscillation. It is a movement or amplifier transient, and a sticky AR-HMM
+    fitted through one will spend a state on it. These samples are cut out of
+    the design and out of every statistic downstream; they stay in Y so the
+    traces still draw and the figures can hatch them.
+
+    The test is on z of the finished column, so max_sd is in SD of that trace
+    over the whole epoch whatever the band spec did to it — z-scoring an
+    already-z-scored column is a no-op, so the rule does not change when
+    OBS_SPEC's zscore flag does.
+
+    Dilation by pad_s takes the samples either side as well. A Butterworth
+    bandpass rings around a step, and that ringing is the same artifact
+    arriving through the filter rather than a separate event.
+
+    spec=None means no rejection, which is a deliberate setting and the one
+    case that returns an all-false mask.
+    """
+    if spec is None:
+        return np.zeros(len(Y), dtype=bool)
+    wanted = list(spec.get("bands", ARTIFACT_BANDS))
+    max_sd = float(spec.get("max_sd", ARTIFACT_MAX_SD))
+    pad_s = float(spec.get("pad_s", ARTIFACT_PAD_S))
+    max_frac = float(spec.get("max_frac", ARTIFACT_MAX_FRAC))
+
+    absent = [b for b in wanted if b not in names]
+    if absent:
+        raise KeyError(
+            f"OBS_SPEC['artifact']['bands'] names {absent}, which are not "
+            f"observations — the columns are {names}. Rejection has to run on "
+            f"a trace the model actually sees.")
+    if max_sd <= 0:
+        raise ValueError(f"artifact max_sd={max_sd} must be positive; use "
+                         f"artifact=None for no rejection")
+
+    mask = np.zeros(len(Y), dtype=bool)
+    rows = []
+    for band in wanted:
+        z = np.abs(zscore(Y[:, names.index(band)]))
+        hit = z > max_sd
+        mask |= hit
+        rows.append({"band": band, "max_|z|": float(z.max()),
+                     "samples_over": int(hit.sum())})
+
+    pad = int(round(pad_s * rate))
+    before = int(mask.sum())
+    if pad > 0 and before:
+        mask = np.convolve(mask.astype(np.float64),
+                           np.ones(2 * pad + 1), mode="same") > 0
+
+    frac = float(mask.mean())
+    if frac > max_frac:
+        raise ValueError(
+            f"rejection at {max_sd:g} SD marks {frac:.1%} of the recording, "
+            f"over max_frac={max_frac:.0%}. At that rate the SD itself is set "
+            f"by the artifacts, so the threshold is not measuring what it "
+            f"says. Check the band ranges and the LFP channel before raising "
+            f"max_frac.")
+    if verbose:
+        run_flag, _, _ = run_lengths(mask.astype(int))
+        n_events = int((run_flag == 1).sum())
+        print(f"\nartifact rejection: |z| > {max_sd:g} SD on "
+              f"{', '.join(wanted)}, dilated {pad_s * 1e3:.0f} ms")
+        show_table(pd.DataFrame(rows).set_index("band").round(2))
+        print(f"    {before} samples over threshold -> {int(mask.sum())} after "
+              f"dilation, in {n_events} events "
+              f"({frac:.2%} of {len(Y)} samples, "
+              f"{mask.sum() / rate:.1f} s of {len(Y) / rate / 60:.1f} min)")
+    return mask
+
+
 def build_observations(session, spec, verbose=True):
     """Turn the session's raw ingredients into the matrix the AR-HMM sees.
 
@@ -1351,6 +1538,11 @@ def build_observations(session, spec, verbose=True):
                     in each bin and empty bins are 0
           smooth    not optional in practice: without a kernel the counts are
                     a near-binary train
+        artifact  None, or {"bands": names, "max_sd": SD, "pad_s": seconds}.
+                  Samples where one of those bands exceeds max_sd are marked
+                  and excluded from the fit and from every statistic; they
+                  stay in Y so the traces still draw. artifact_mask() has the
+                  detail.
     """
     spec = deepcopy(spec)
     fs = session["fs"]
@@ -1514,9 +1706,11 @@ def build_observations(session, spec, verbose=True):
               f"{rate:.0f} Hz ({n_lags} lags x {1e3 / rate:.1f} ms = "
               f"{lag_span_s * 1e3:.0f} ms of lag; LFP is {fs:.0f} Hz)")
         show_table(table.set_index("observation").round(3))
+
+    artifact = artifact_mask(Y, names, spec.get("artifact"), rate, verbose)
     return {"Y": Y, "names": names, "kinds": kinds, "t": t, "rate": rate,
             "nlags": n_lags, "lag_span_s": lag_span_s, "table": table,
-            "spec": spec}
+            "artifact": artifact, "spec": spec}
 
 
 def _smooth_label(spec):
@@ -1526,18 +1720,21 @@ def _smooth_label(spec):
 
 
 def plot_observations(session, obs, seconds=4.0, start_s=None, fit=None):
-    """What the AR-HMM is about to be trained on, as traces and as a matrix.
+    """Observation traces over one window, plus their correlation matrix.
 
     Worth looking at before the sampler runs: a trace that is flat, clipped or
     dominated by one excursion will make states that are about that. Speed is
     drawn alongside although it is not an input, because the traces are easier
-    to read against what the animal was doing.
+    to read against what the animal was doing. Artifact samples are hatched.
 
-    Passing `fit` shades the window by the inferred state, which is what to do
-    when re-running this after a fit rather than before one.
+    Passing `fit` shades the window by the inferred state and adds a panel
+    beneath carrying P(z_t = k | Y) at each sample, so where the model is
+    certain and where it is switching can be read against the traces that
+    drove it.
     """
     Y, names, kinds, t = obs["Y"], obs["names"], obs["kinds"], obs["t"]
     rate = obs["rate"]
+    artifact = obs["artifact"]
     span = int(round(seconds * rate))
     if start_s is None:
         activity = np.abs(np.diff(Y, axis=0)).sum(axis=1)
@@ -1552,10 +1749,22 @@ def plot_observations(session, obs, seconds=4.0, start_s=None, fit=None):
                             0, max(len(Y) - span, 0)))
     seg = np.arange(first, min(first + span, len(Y)))
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 0.55 * len(names) + 3),
-                             gridspec_kw={"width_ratios": [2, 1]})
+    # With a fit the left column is two rows sharing a time axis: traces on
+    # top, the posterior over states beneath. The correlation matrix spans
+    # both rows of the right column either way.
+    heights = [1.0, 0.45] if fit is not None else [1.0]
+    fig = plt.figure(figsize=(15, 0.55 * len(names) + 3
+                              + 2.2 * (len(heights) - 1)))
+    grid = fig.add_gridspec(len(heights), 2, width_ratios=[2, 1],
+                            height_ratios=heights)
+    trace_ax = fig.add_subplot(grid[0, 0])
+    prob_ax = (fig.add_subplot(grid[1, 0], sharex=trace_ax)
+               if fit is not None else None)
+    time_ax = prob_ax if fit is not None else trace_ax
+    corr_ax = fig.add_subplot(grid[:, 1])
+    axes = [trace_ax, corr_ax]
     fig.suptitle(f"{session['label']} — AR-HMM observations "
-                 f"({len(names)} traces @ {rate:.0f} Hz)")
+                 f"({len(names)} traces at {rate:.0f} Hz, z-scored)")
 
     ax = axes[0]
     t_win = t[seg] - t[seg][0]
@@ -1582,9 +1791,18 @@ def plot_observations(session, obs, seconds=4.0, start_s=None, fit=None):
     ax.text(-0.01, 0.0, "speed", fontsize=7, ha="right", va="center",
             transform=ax.get_yaxis_transform(), color="0.25")
     ax.set_yticks([])
-    ax.set_xlabel("time in window (s)")
-    ax.set_title(f"{seconds:.1f} s from {t[first] - session['t_start']:.1f}s "
-                 f"into the epoch (z, offset)", fontsize=9)
+    ax.set_title(f"{seconds:.1f} s from t = {t[first] - session['t_start']:.1f} s, "
+                 f"offset vertically", fontsize=9)
+
+    # Artifact samples are in Y and drawn, but nothing was fitted on them.
+    # Hatching says which stretch of the trace the model never saw.
+    art_s, art_i, art_n = run_lengths(artifact[seg].astype(int))
+    for flag, i0, n in zip(art_s, art_i, art_n):
+        if not flag:
+            continue
+        ax.axvspan(t_win[i0], t_win[min(i0 + n, len(t_win) - 1)],
+                   facecolor="none", edgecolor="0.4", hatch="///",
+                   lw=0.0, alpha=0.6, zorder=1)
 
     # state shading, when this is called after a fit rather than before one
     if fit is not None:
@@ -1599,6 +1817,30 @@ def plot_observations(session, obs, seconds=4.0, start_s=None, fit=None):
                 ax.axvspan(times[i0], times[min(i0 + n, len(times) - 1)],
                            color=fit["cmap"](s), alpha=0.18, lw=0, zorder=0)
 
+        # P(z_t = k | Y) beneath, stacked: the columns sum to 1, so the
+        # thickness of each band is that state's posterior share at that
+        # sample and a vertical boundary is a switch the chain agreed on.
+        ax = prob_ax
+        rows = np.flatnonzero(in_window)
+        if len(rows):
+            times = fit["t_states"][rows] - t[seg[0]]
+            prob = fit["state_prob"][:, rows]
+            ax.stackplot(times, prob,
+                         colors=[fit["cmap"](s) for s in range(fit["n_states"])],
+                         labels=[f"{s}" for s in range(fit["n_states"])],
+                         lw=0)
+            ax.set_ylim(0, 1)
+            ax.legend(fontsize=6, ncol=fit["n_states"], loc="upper right",
+                      title="state", title_fontsize=6, framealpha=0.85)
+        ax.set_ylabel("$P(z_t = k \\mid Y)$", fontsize=9)
+        ax.set_title(f"State posterior over {fit['n_draws']} retained Gibbs "
+                     f"draws (resolution $1/R$ = {1 / fit['n_draws']:.3f})",
+                     fontsize=9)
+        ax.tick_params(labelsize=7)
+        plt.setp(trace_ax.get_xticklabels(), visible=False)
+    time_ax.set_xlabel("Time in window (s)")
+    time_ax.set_xlim(t_win[0], t_win[-1])
+
     ax = axes[1]
     corr = np.corrcoef(Y.T)
     off_diagonal = corr[~np.eye(len(names), dtype=bool)]
@@ -1610,8 +1852,9 @@ def plot_observations(session, obs, seconds=4.0, start_s=None, fit=None):
     short = [n.replace("MUA_", "") for n in names]
     label_axis(ax, short, axis="x", rotation=90, fontsize=6)
     label_axis(ax, short, axis="y", fontsize=6)
-    ax.set_title(f"observation correlation (scale from off-diagonal, "
-                 f"|r| <= {limit:.2f})", fontsize=9)
+    ax.set_title(f"Observation correlation, whole epoch "
+                 f"(scale from off-diagonal, $|r| \\leq$ {limit:.2f})",
+                 fontsize=9)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -1748,12 +1991,57 @@ def choose_segments(n_samples, rate, minutes, segment_s, start_s=None, seed=0):
              for b in range(n_seg))]
 
 
+def split_on_artifacts(segments, artifact, min_samples, verbose=True):
+    """Cut each fitting window at the artifact samples, dropping short remnants.
+
+    An artifact is not a gap in the recording, but it has to be treated as
+    one: the pieces either side become separate segments, so no design row
+    regresses across the transient and no transition is counted over it.
+    That is exactly what the sampler already does at the joins between
+    randomly placed segments, so this needs no change to it.
+
+    A remnant shorter than min_samples is dropped. It would contribute a
+    handful of design rows whose first nlags samples are spent on the lags
+    and whose state is drawn from pi0 rather than from a predecessor, which
+    is a lot of prior for very little data.
+    """
+    kept, dropped = [], 0
+    for seg in segments:
+        good = ~artifact[seg]
+        if not good.any():
+            dropped += len(seg)
+            continue
+        cuts = np.flatnonzero(np.diff(good.astype(np.int8)) != 0) + 1
+        for piece in np.split(seg, cuts):
+            if artifact[piece[0]]:
+                continue
+            if len(piece) >= min_samples:
+                kept.append(piece)
+            else:
+                dropped += len(piece)
+    if not kept:
+        raise ValueError(
+            f"artifact rejection left no stretch of {min_samples} clean "
+            f"samples to fit. Either the threshold is too tight or the LFP "
+            f"channel is bad — look at plot_observations before changing it.")
+    if verbose:
+        total = sum(len(s) for s in segments)
+        clean = sum(len(s) for s in kept)
+        print(f"    artifacts split {len(segments)} window(s) into "
+              f"{len(kept)} segment(s): {clean} samples fitted, "
+              f"{total - clean} excluded "
+              f"({int(artifact[np.concatenate(segments)].sum())} artifact, "
+              f"{dropped} in remnants under {min_samples} samples)")
+    return kept
+
+
 def fit_states(session, obs, minutes=ARHMM_MINUTES,
                segment_s=ARHMM_SEGMENT_S, start_s=ARHMM_START_S,
                nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
                burn_in=ARHMM_BURN_IN, kappa=ARHMM_KAPPA, alpha=ARHMM_ALPHA,
                gamma=ARHMM_GAMMA, min_frac=ARHMM_MIN_FRAC, seed=ARHMM_SEED,
                segment_seed=ARHMM_SEGMENT_SEED,
+               min_segment_s=ARHMM_MIN_SEGMENT_S,
                stop_when_stationary=ARHMM_EARLY_STOP,
                check_every=ARHMM_CHECK_EVERY, geweke_tol=ARHMM_GEWEKE_TOL):
     """Fit the AR-HMM on the observation grid and map its states onto both grids.
@@ -1763,28 +2051,38 @@ def fit_states(session, obs, minutes=ARHMM_MINUTES,
     they hold, so state 0 is the most common one and the numbering carries
     meaning across every figure below.
 
-    Two state arrays come back. `states_obs` is the sequence on the
-    observation grid, which is what the example window draws. `states` is the
-    modal state within each 50 ms manifold bin, which is what colours the
-    manifold; bins outside the fitted segments are -1.
+    Artifact samples are cut out first, which splits each window into the
+    clean stretches between transients. Nothing is fitted on them and nothing
+    downstream reads them: they carry no state label, their 50 ms bins are
+    marked in `artifact_bins`, and the subspace statistics drop those bins.
+
+    Three state arrays come back. `states_obs` is the representative draw's
+    sequence on the observation grid, which is what the example window draws.
+    `state_prob` is P(z_t = k | Y) at each of those samples, over the retained
+    draws. `states` is the modal state within each 50 ms manifold bin, which
+    is what colours the manifold; bins outside the fitted segments, and bins
+    holding an artifact, are -1.
     """
     Y_all, rate, t_all = obs["Y"], obs["rate"], obs["t"]
-    segments = choose_segments(len(Y_all), rate, minutes, segment_s, start_s,
-                               seed=segment_seed)
-    total = sum(len(s) for s in segments)
+    windows = choose_segments(len(Y_all), rate, minutes, segment_s, start_s,
+                              seed=segment_seed)
+    artifact = obs["artifact"]
     d = Y_all.shape[1]
     p = nlags * d + 1
 
     print(f"\nfitting the sticky HDP-AR-HMM")
     print(f"    observations: {d} traces — {', '.join(obs['names'])}")
+    segments = split_on_artifacts(
+        windows, artifact, max(int(round(min_segment_s * rate)), nlags + 2))
+    total = sum(len(s) for s in segments)
     print(f"    {len(segments)} segment(s), {total} samples at {rate:.0f} Hz "
           f"({total / rate / 60:.1f} min, "
           f"{100 * total / len(Y_all):.1f}% of the epoch)")
-    if len(segments) > 1:
-        print(f"    placed at "
+    if len(windows) > 1:
+        print(f"    windows placed at "
               + ", ".join(f"{t_all[s[0]] - session['t_start']:.0f}s"
-                          for s in segments[:8])
-              + (" ..." if len(segments) > 8 else "")
+                          for s in windows[:8])
+              + (" ..." if len(windows) > 8 else "")
               + " — events falling between them get no state label")
     print(f"    AR order {nlags} = {nlags / rate * 1e3:.0f} ms of lag | "
           f"p = nlags*d+1 = {p} | L={L}, kappa={kappa}, "
@@ -1851,13 +2149,39 @@ def fit_states(session, obs, minutes=ARHMM_MINUTES,
         modal = tally.argmax(axis=1)
         states[lo:hi + 1][covered] = modal[covered]
 
+    # Any 50 ms bin holding an artifact sample is out, whatever else it holds.
+    # A bin is 50 ms and a transient a few milliseconds, so a bin can be
+    # mostly clean and still be the bin the transient landed in.
+    artifact_bins = np.zeros(session["n_bins"], dtype=bool)
+    hit = np.searchsorted(session["edges"],
+                          t_all[np.flatnonzero(artifact)], side="right") - 1
+    hit = hit[(hit >= 0) & (hit < session["n_bins"])]
+    artifact_bins[hit] = True
+    states[artifact_bins] = -1
+
+    # P(z_t = k | Y) at each fitted sample: the share of retained draws
+    # assigning that sample to k. With R draws the resolution is 1/R, so a
+    # short chain gives a step function rather than a smooth curve.
+    state_prob = np.zeros((n_states, len(z)))
+    for draw in arhmm["z_samples"]:
+        labels = relabel[draw]
+        for s in range(n_states):
+            state_prob[s] += labels == s
+    n_draws = len(arhmm["z_samples"])
+    state_prob /= n_draws
+
     print(f"    {n_states} states kept over {len(z)} samples | "
-          f"{(states >= 0).sum()} of {session['n_bins']} manifold bins labelled")
+          f"{(states >= 0).sum()} of {session['n_bins']} manifold bins "
+          f"labelled | {int(artifact_bins.sum())} bins excluded as artifact")
     return {"arhmm": arhmm, "obs": obs, "obs_names": obs["names"],
-            "obs_kinds": obs["kinds"], "segments": segments, "rate": rate,
+            "obs_kinds": obs["kinds"], "segments": segments,
+            "windows": windows, "rate": rate,
             "nlags": nlags, "states_obs": z, "state_index": state_index,
             "t_states": t_states, "states": states, "relabel": relabel,
+            "state_prob": state_prob, "n_draws": n_draws,
+            "artifact": artifact, "artifact_bins": artifact_bins,
             "n_states": n_states, "burn_in": burn_in,
+            "criteria": arhmm["criteria"],
             "segment_starts": arhmm["segment_starts"],
             "cmap": ListedColormap(
                 plt.get_cmap("tab20")(np.linspace(0, 1, 20))[:n_states])}
@@ -1964,8 +2288,8 @@ def plot_observation_distributions(session, fit, ncols=4):
     nrows = int(np.ceil(len(panels) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 2.7 * nrows),
                              squeeze=False)
-    fig.suptitle(f"{session['label']} — what each observation does in each "
-                 f"state (line = median, diamond = mean)")
+    fig.suptitle(f"{session['label']} — observation distribution by state "
+                 f"(bar = median, diamond = mean)")
     for i, (title, values, colour, labels) in enumerate(panels):
         ax = axes[i // ncols, i % ncols]
         groups, positions = [], []
@@ -1989,7 +2313,7 @@ def plot_observation_distributions(session, fit, ncols=4):
         ax.set_title(title, fontsize=9, color=colour)
         ax.tick_params(labelsize=7)
         if i // ncols == nrows - 1:
-            ax.set_xlabel("state", fontsize=8)
+            ax.set_xlabel("State", fontsize=8)
     for i in range(len(panels), nrows * ncols):
         axes[i // ncols, i % ncols].axis("off")
     fig.tight_layout()
@@ -2022,34 +2346,38 @@ def observation_by_state(state_table, names, extra=("speed_median",)):
 
 
 def plot_arhmm(session, fit, state_table):
-    """Sampler traces, the state sequence, dwell times, observations, transitions.
+    """Sampler diagnostics, dwell times, observation medians, transitions.
 
     The transition matrix has its diagonal zeroed: kappa makes self-transitions
     dominate so completely that nothing else would be visible on the same
     colour scale, and the interesting question is where a state goes when it
     does leave.
+
+    P(z_t = k | Y) against time is not here. It belongs on a time axis beside
+    the traces that produced it, so it is a panel of plot_observations.
     """
     z, n_states, cmap = fit["states_obs"], fit["n_states"], fit["cmap"]
     arhmm, names, kinds = fit["arhmm"], fit["obs_names"], fit["obs_kinds"]
     step_ms = 1e3 / fit["rate"]
-    t_rel = fit["t_states"] - session["t_start"]
     run_state, _, run_len = run_lengths(z, fit["segment_starts"])
 
-    fig, axes = plt.subplots(4, 2, figsize=(15, 17), constrained_layout=True)
-    fig.suptitle(f"{session['label']} — sticky HDP-AR-HMM on "
-                 f"{len(names)} observations @ {fit['rate']:.0f} Hz "
+    fig, axes = plt.subplots(3, 2, figsize=(15, 13), constrained_layout=True)
+    fig.suptitle(f"{session['label']} — sticky HDP-AR-HMM, "
+                 f"{len(names)} observations at {fit['rate']:.0f} Hz "
                  f"({session['lfp_key']})")
 
     ax = axes[0, 0]
     ax.plot(arhmm["trace_K"], lw=1, color="0.3")
     ax.axvline(fit["burn_in"], color="k", ls="--", lw=0.9, label="burn-in")
     ax.set_xlabel("Gibbs iteration")
-    ax.set_ylabel("used states")
-    ax.set_title(f"states per iteration (estimate: {arhmm['K_hat']})", fontsize=10)
+    ax.set_ylabel("Used states")
+    ax.set_title(f"Used states per iteration ($\\hat{{K}}$ = "
+                 f"{arhmm['K_hat']})", fontsize=10)
     ax.legend(fontsize=8)
 
     ax = axes[0, 1]
     conv = arhmm["convergence"]
+    ic = arhmm["criteria"]
     ax.plot(arhmm["trace_ll"], lw=1, color="0.3")
     ax.axvline(fit["burn_in"], color="k", ls="--", lw=0.9)
     # least-squares line over the retained window: its total rise is the drift
@@ -2060,33 +2388,23 @@ def plot_arhmm(session, fit, state_table):
         ax.plot(retained, fitted, lw=1.2,
                 color="#2ca02c" if conv["stationary"] else "#d62728")
     ax.set_xlabel("Gibbs iteration")
-    ax.set_ylabel("log-likelihood")
-    ax.set_title(f"log-likelihood — "
-                 f"{'stationary' if conv['stationary'] else 'NOT stationary'}: "
-                 f"z={conv['geweke_z']:+.2f}, drift={conv['drift_sd']:+.2f} SD, "
-                 f"ESS {conv['ess']:.0f}", fontsize=9)
+    ax.set_ylabel("Complete-data log-likelihood")
+    ax.set_title(f"Chain: "
+                 f"{'stationary' if conv['stationary'] else 'NOT stationary'}, "
+                 f"Geweke $z$ = {conv['geweke_z']:+.2f}, drift = "
+                 f"{conv['drift_sd']:+.2f} SD, ESS = {conv['ess']:.0f}",
+                 fontsize=9)
+    # AIC and BIC are on the marginal likelihood, not on the trace plotted
+    # here, so they go in the corner rather than in the title.
+    ax.annotate(f"$m$ = {ic['n_params']}, $n$ = {ic['n_obs']}\n"
+                f"$\\log p(Y\\mid\\theta)$ = {ic['loglik']:.0f}\n"
+                f"AIC = {ic['aic']:.0f}\nBIC = {ic['bic']:.0f}",
+                xy=(0.98, 0.04), xycoords="axes fraction", ha="right",
+                va="bottom", fontsize=7.5,
+                bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="0.7",
+                          alpha=0.9))
 
     ax = axes[1, 0]
-    # Against sample index, not time: the segments are minutes apart, and a
-    # single time axis would draw the gaps between them as though they were
-    # part of the sequence. The dotted lines are the joins, labelled with
-    # where each segment sits in the recording. -1 is masked so a
-    # sub-threshold sample is not painted as state 0.
-    ax.imshow(np.ma.masked_less(z, 0)[None, :], aspect="auto",
-              interpolation="nearest", cmap=cmap,
-              vmin=-0.5, vmax=n_states - 0.5,
-              extent=[0, len(z), 0, 1])
-    for start in fit["segment_starts"][1:]:
-        ax.axvline(start, color="k", lw=0.9, ls=":")
-    ax.set_xticks(fit["segment_starts"])
-    ax.set_xticklabels([f"{t_rel[s]:.0f}s" for s in fit["segment_starts"]],
-                       rotation=45, ha="right", fontsize=7)
-    ax.set_yticks([])
-    ax.set_xlabel("segments, in order (tick = start, in epoch time)")
-    ax.set_title(f"inferred state sequence ({n_states} states, "
-                 f"{100 * (z < 0).mean():.1f}% unlabelled)", fontsize=10)
-
-    ax = axes[1, 1]
     # Violins on log dwell time. The distributions span two decades and are
     # heavily skewed, so a linear axis puts every state in the same bin.
     dwell = [np.log10(run_len[run_state == s] * step_ms) for s in range(n_states)]
@@ -2104,11 +2422,12 @@ def plot_arhmm(session, fit, state_table):
     ax.set_yticks(decades)
     ax.set_yticklabels([f"{10 ** e:g}" for e in decades], fontsize=8)
     label_axis(ax, range(n_states), axis="x")
-    ax.set_xlabel("state")
-    ax.set_ylabel("dwell time (ms, log)")
-    ax.set_title("how long each state lasts", fontsize=10)
+    ax.set_xlabel("State")
+    ax.set_ylabel("Dwell time (ms)")
+    ax.set_title(f"Dwell time by state (log$_{{10}}$ axis, "
+                 f"{step_ms:.0f} ms resolution)", fontsize=10)
 
-    ax = axes[2, 0]
+    ax = axes[1, 1]
     width = 0.8 / max(n_states, 1)
     for s in range(n_states):
         vals = [state_table.loc[s, f"{n}_median"] for n in names]
@@ -2119,11 +2438,11 @@ def plot_arhmm(session, fit, state_table):
                rotation=30, fontsize=7)
     for tick, name, kind in zip(ax.get_xticklabels(), names, kinds):
         tick.set_color(observation_colour(name, kind))
-    ax.set_ylabel("median (standardized)")
-    ax.set_title("what characterizes each state", fontsize=10)
-    ax.legend(fontsize=7, ncol=2, title="state", title_fontsize=7)
+    ax.set_ylabel("Median (SD)")
+    ax.set_title("Observation median by state (SD units)", fontsize=10)
+    ax.legend(fontsize=7, ncol=2, title="State", title_fontsize=7)
 
-    ax = axes[2, 1]
+    ax = axes[2, 0]
     trans = leaving_matrix(z, n_states)
     # Sequential map over the range the off-diagonal actually occupies, with
     # the numbers written in. At four states a matrix is a table, and reading
@@ -2139,41 +2458,12 @@ def plot_arhmm(session, fit, state_table):
                     color="white" if trans[i, j] > 0.6 * trans.max() else "0.2")
     label_axis(ax, range(n_states), axis="x")
     label_axis(ax, range(n_states), axis="y")
-    ax.set_xlabel("to state")
-    ax.set_ylabel("from state")
-    ax.set_title("where a state goes when it leaves (diagonal excluded)",
-                 fontsize=10)
+    ax.set_xlabel("To state")
+    ax.set_ylabel("From state")
+    ax.set_title("$P(z_{t+1} = j \\mid z_t = i,\\ j \\neq i)$", fontsize=10)
 
-    # --- P(state), and the same transitions as a graph -----------------------
-    # The bar is the posterior median across the retained Gibbs draws and the
-    # whisker its 5-95%. The diamond is the one representative draw every
-    # other panel is built from, which is a sample and so need not sit at the
-    # median — seeing where it falls in the posterior is the point.
-    ax = axes[3, 0]
-    draws = np.array([[(zs == s).mean() for s in range(n_states)]
-                      for zs in _relabelled_draws(fit)])
-    representative = np.array([(z == s).mean() for s in range(n_states)])
-    centre = np.median(draws, axis=0)
-    ax.bar(np.arange(n_states), centre,
-           color=[cmap(s) for s in range(n_states)])
-    if len(draws) > 1:
-        lo, hi = np.percentile(draws, [5, 95], axis=0)
-        ax.errorbar(np.arange(n_states), centre,
-                    yerr=[centre - lo, hi - centre], fmt="none",
-                    ecolor="0.2", capsize=4, lw=1.2)
-    ax.plot(np.arange(n_states), representative, "D", ms=6, color="0.15",
-            zorder=3, label="representative draw")
-    for s, value in enumerate(centre):
-        ax.text(s, value, f"{value:.3f}", ha="center", va="bottom", fontsize=8)
-    label_axis(ax, range(n_states), axis="x")
-    ax.set_xlabel("state")
-    ax.set_ylabel("P(state)")
-    ax.set_ylim(0, min(1.0, max(centre.max(), representative.max()) * 1.3))
-    ax.legend(fontsize=7, loc="upper right")
-    ax.set_title("marginal state probability (median and 5-95% over draws)",
-                 fontsize=10)
-
-    plot_state_graph(axes[3, 1], trans, centre, cmap)
+    occupancy = np.array([(z == s).mean() for s in range(n_states)])
+    plot_state_graph(axes[2, 1], trans, occupancy, cmap)
     plt.show()
     plt.close(fig)
 
@@ -2202,8 +2492,10 @@ def plot_state_dynamics(session, fit, max_lags=AR_MAP_LAGS):
     fig, axes = plt.subplots(n_states, lags,
                              figsize=(2.2 * lags + 2.5, 2.2 * n_states + 1),
                              squeeze=False)
-    fig.suptitle(f"{session['label']} — AR coefficients by state and lag: "
-                 f"how each observation predicts the others")
+    fig.suptitle(f"{session['label']} — AR coefficient blocks "
+                 f"$A_k^{{(\\ell)}}$ by state $k$ and lag $\\ell$, where "
+                 f"$y_t = \\sum_\\ell A_k^{{(\\ell)}} y_{{t-\\ell}} + c_k "
+                 f"+ e_t$")
     for s in range(n_states):
         for l in range(lags):
             ax = axes[s, l]
@@ -2222,55 +2514,260 @@ def plot_state_dynamics(session, fit, max_lags=AR_MAP_LAGS):
             else:
                 ax.set_xticks([])
     bar = fig.colorbar(im, ax=axes, fraction=0.015, pad=0.02)
-    bar.set_label("coefficient (row = predicted, column = predictor)",
+    bar.set_label("Coefficient (row = predicted, column = predictor)",
                   fontsize=8)
     bar.ax.tick_params(labelsize=7)
     plt.show()
     plt.close(fig)
 
 
-def state_sequences(fit, length=3):
-    """Counts of every run-collapsed state sequence of `length`.
+# -----------------------------------------------------------------------------
+# DWELL-TIME CLASSES AND THE SYMBOL SEQUENCES
+# -----------------------------------------------------------------------------
+# A bare state sequence 2 -> 0 -> 2 -> 0 says nothing about time, and each
+# state's dwell times span two decades. So each run is clustered by duration
+# and the sequences are over (state, duration cluster) symbols.
+#
+# One GMM per state, by EM, on x = log(dwell in samples):
+#
+#     p(x) = sum_j w_j N(x; mu_j, s_j),   mu_0 = 0
+#
+# The first component's mean is pinned at 0, a one-sample run. K goes to
+# DWELL_MAX_K and is chosen by BIC with m = 3K - 2 free parameters. A symbol
+# is written out as its cluster's mean and SD in milliseconds.
 
-    Runs are collapsed first, so 0,0,0,1,1,2 counts as 0->1->2 once rather
-    than as a hundred repeats of 0->0. Sequences are taken within a segment
-    and broken at unlabelled samples, since neither gap is a transition.
+
+def _dwell_logpdf(x, mus, sigmas):
+    """Log density of each Gaussian component at each x."""
+    return (-np.log(sigmas) - 0.5 * np.log(2 * np.pi)
+            - 0.5 * ((x[:, None] - mus) / sigmas) ** 2)
+
+
+def _dwell_em(x, k, rng, max_iter=500, tol=1e-8, sigma_floor=0.05, jitter=0.0):
+    """EM for a K-component GMM on x with mu_0 pinned at 0.
+
+    sigma_floor keeps a component from collapsing onto the pile of one-sample
+    runs sitting at exactly x = 0, which would send the likelihood to
+    infinity. Durations are integers, so nothing below log(2) - log(1) is
+    resolvable anyway.
     """
-    z, bounds = fit["states_obs"], np.append(fit["segment_starts"],
-                                             len(fit["states_obs"]))
+    n = len(x)
+    edges = np.quantile(x, np.linspace(0, 1, k + 1))
+    mus = np.concatenate(([0.0], 0.5 * (edges[1:k] + edges[2:k + 1])))
+    if jitter and k > 1:
+        mus[1:] = np.maximum(mus[1:] + rng.normal(0.0, jitter * x.std(), k - 1),
+                             0.0)
+    sigmas = np.full(k, max(x.std() / max(k, 1), 2 * sigma_floor))
+    w = np.full(k, 1.0 / k)
+
+    previous, loglik = -np.inf, -np.inf
+    resp = np.zeros((n, k))
+    for _ in range(max_iter):
+        logp = _dwell_logpdf(x, mus, sigmas) + np.log(w)
+        peak = logp.max(axis=1)
+        total = peak + np.log(np.exp(logp - peak[:, None]).sum(axis=1))
+        loglik = float(total.sum())
+        resp = np.exp(logp - total[:, None])
+
+        mass = resp.sum(axis=0) + 1e-12
+        w = mass / n
+        # component 0 keeps mu = 0, so its scale is the second moment about 0
+        sigmas[0] = max(np.sqrt((resp[:, 0] * x ** 2).sum() / mass[0]),
+                        sigma_floor)
+        for j in range(1, k):
+            mus[j] = (resp[:, j] * x).sum() / mass[j]
+            sigmas[j] = max(
+                np.sqrt((resp[:, j] * (x - mus[j]) ** 2).sum() / mass[j]),
+                sigma_floor)
+        if loglik - previous < tol * max(abs(loglik), 1.0):
+            break
+        previous = loglik
+    return {"w": w, "mus": mus, "sigmas": sigmas, "loglik": loglik,
+            "resp": resp, "k": k}
+
+
+def fit_dwell_mixture(run_samples, step_ms, max_k=DWELL_MAX_K,
+                      restarts=DWELL_RESTARTS, seed=DWELL_SEED):
+    """GMM on log dwell time for one state, K chosen by BIC.
+
+    run_samples is each run's length in samples and step_ms the sampling step,
+    so x = log(dwell / step) and x = 0 is a one-sample run.
+
+    Each cluster is reported in milliseconds through its own 16th, 50th and
+    84th percentiles:
+
+        mu    = step * exp(mu_j)
+        sigma = step * [exp(mu_j + s_j) - exp(mu_j - s_j)] / 2
+
+    the half-width of the one-sigma interval on the duration scale. It is
+    asymmetric in reality, so sigma is a scale rather than a symmetric bar.
+    """
+    lengths = np.asarray(run_samples, dtype=np.float64)
+    if lengths.min() < 1:
+        raise ValueError(f"a run of {lengths.min():g} samples is impossible — "
+                         f"run_lengths returns counts of at least 1")
+    n = len(lengths)
+    # K is bounded by the data: 20 runs per component, and no more components
+    # than there are distinct durations to tell apart.
+    k_top = int(min(max_k, max(n // 20, 1), len(np.unique(lengths))))
+    rng = np.random.default_rng(seed)
+    x = np.log(lengths)
+
+    fits, table = {}, []
+    for k in range(1, k_top + 1):
+        best = None
+        for r in range(restarts if k > 1 else 1):
+            trial = _dwell_em(x, k, rng, jitter=0.0 if r == 0 else 0.2)
+            if best is None or trial["loglik"] > best["loglik"]:
+                best = trial
+        m = 3 * k - 2
+        best["n_params"] = m
+        best["bic"] = m * np.log(n) - 2 * best["loglik"]
+        best["aic"] = 2 * m - 2 * best["loglik"]
+        fits[k] = best
+        table.append({"K": k, "n_params": m, "loglik": best["loglik"],
+                      "AIC": best["aic"], "BIC": best["bic"]})
+    selection = pd.DataFrame(table)
+    k_hat = int(selection.loc[selection["BIC"].idxmin(), "K"])
+    chosen = fits[k_hat]
+
+    # Ascending duration, so class 0 is the briefest for every state.
+    order = np.argsort(chosen["mus"])
+    resp = chosen["resp"][:, order]
+    assignment = resp.argmax(axis=1)
+    w, mus, sigmas = (chosen["w"][order], chosen["mus"][order],
+                      chosen["sigmas"][order])
+    pinned = int(np.flatnonzero(order == 0)[0])
+
+    components = pd.DataFrame([{
+        "class": j, "weight": float(w[j]),
+        "n_runs": int((assignment == j).sum()),
+        "mu_ms": float(step_ms * np.exp(mus[j])),
+        "sigma_ms": float(step_ms * (np.exp(mus[j] + sigmas[j])
+                                     - np.exp(mus[j] - sigmas[j])) / 2),
+        "p16_ms": float(step_ms * np.exp(mus[j] - sigmas[j])),
+        "p84_ms": float(step_ms * np.exp(mus[j] + sigmas[j])),
+    } for j in range(k_hat)])
+
+    return {"k": k_hat, "x": x, "step_ms": step_ms, "assignment": assignment,
+            "resp": resp, "w": w, "mus": mus, "sigmas": sigmas,
+            "pinned": pinned, "components": components,
+            "selection": selection, "fits": fits, "lengths": lengths}
+
+
+def dwell_classes(fit, max_k=DWELL_MAX_K, seed=DWELL_SEED, verbose=True):
+    """Every run of the state sequence, tagged with a duration cluster.
+
+    One GMM per state, so the clusters are that state's own. Each symbol is
+    written out as "State 0 (10 +/- 1 ms)" — the state, and the mean and SD
+    of the cluster the run fell in.
+
+    A run is one contiguous stretch of a single state inside one segment. The
+    unlabelled runs (state -1, below min_frac) are kept in the table as
+    boundaries but take no part in a fit and none in a sequence.
+    """
+    z = fit["states_obs"]
+    run_state, run_start, run_len = run_lengths(z, fit["segment_starts"])
+    step_ms = 1e3 / fit["rate"]
+    labelled = run_state >= 0
+
+    cls = np.full(len(run_state), -1, dtype=int)
+    mixtures = {}
+    for s in range(fit["n_states"]):
+        sel = run_state == s
+        mixtures[s] = fit_dwell_mixture(run_len[sel], step_ms, max_k=max_k,
+                                        seed=seed)
+        cls[sel] = mixtures[s]["assignment"]
+
+    runs = pd.DataFrame({
+        "state": run_state, "start": run_start, "n_samples": run_len,
+        "dwell_ms": run_len * step_ms, "class": cls,
+        "new_segment": np.isin(run_start, fit["segment_starts"])})
+
+    vocabulary = {}
+    for (s, c), group in runs[labelled].groupby(["state", "class"]):
+        row = mixtures[int(s)]["components"].set_index("class").loc[int(c)]
+        vocabulary[(int(s), int(c))] = {
+            "label": (f"State {int(s)} ({row['mu_ms']:.0f}$\\pm$"
+                      f"{row['sigma_ms']:.0f} ms)"),
+            "mu_ms": float(row["mu_ms"]), "sigma_ms": float(row["sigma_ms"]),
+            "n": int(len(group))}
+
+    if verbose:
+        print("\ndwell-time clusters, one GMM per state on "
+              f"x = log(dwell / {step_ms:.0f} ms), K by BIC over 1..{max_k}: "
+              + ", ".join(f"state {s} K={mixtures[s]['k']}"
+                          for s in sorted(mixtures))
+              + f" | {len(vocabulary)} symbols over {int(labelled.sum())} runs")
+    return {"runs": runs, "mixtures": mixtures, "vocabulary": vocabulary,
+            "step_ms": step_ms}
+
+
+def symbol_sequences(dwell, length=2):
+    """Counts of every (state, duration class) sequence of `length` runs.
+
+    A sequence is `length` consecutive runs, so length 2 is one transition.
+    Sequences are broken at segment joins and at unlabelled runs, since
+    neither is a transition the chain made.
+    """
+    runs = dwell["runs"]
+    state = runs["state"].values
+    cls = runs["class"].values
+    boundary = runs["new_segment"].values | (state < 0)
+
     counts = {}
-    for lo, hi in zip(bounds[:-1], bounds[1:]):
-        labels, _, _ = run_lengths(z[lo:hi])
-        # split on unlabelled runs: they are not a state the chain passed through
-        for piece in np.split(labels, np.flatnonzero(labels < 0)):
-            piece = piece[piece >= 0]
-            for i in range(len(piece) - length + 1):
-                key = tuple(int(v) for v in piece[i:i + length])
-                counts[key] = counts.get(key, 0) + 1
-    frame = pd.DataFrame({"sequence": [" → ".join(map(str, k))
-                                       for k in counts],
-                          "count": list(counts.values())})
+    for piece in np.split(np.arange(len(state)), np.flatnonzero(boundary)):
+        piece = piece[state[piece] >= 0]
+        for i in range(len(piece) - length + 1):
+            key = tuple((int(state[j]), int(cls[j]))
+                        for j in piece[i:i + length])
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        raise ValueError(
+            f"no run of {length} consecutive labelled runs survives the "
+            f"segment breaks — the segments are shorter than the sequences "
+            f"being counted")
+
+    vocabulary = dwell["vocabulary"]
+    frame = pd.DataFrame({
+        "sequence": [" → ".join(vocabulary[sym]["label"] for sym in key)
+                     for key in counts],
+        "first_state": [key[0][0] for key in counts],
+        "count": list(counts.values())})
+    frame["share"] = frame["count"] / frame["count"].sum()
     return frame.sort_values("count", ascending=False).reset_index(drop=True)
 
 
-def plot_state_sequences(session, fit, lengths=SEQUENCE_LENGTHS,
+def plot_state_sequences(session, fit, dwell, lengths=SEQUENCE_LENGTHS,
                          top=SEQUENCE_TOP):
-    """The most common run-collapsed state sequences, at a few lengths."""
-    fig, axes = plt.subplots(1, len(lengths), figsize=(5.0 * len(lengths), 4.4),
+    """The commonest symbol sequences, as a share of all sequences observed.
+
+    A symbol is a state together with the duration cluster the run fell in,
+    written out as its mean and SD in milliseconds. Stacked one panel per
+    length so the sequences have room to be spelled out; each bar is coloured
+    by the state it starts in.
+    """
+    frames = [symbol_sequences(dwell, length).head(top) for length in lengths]
+    fig, axes = plt.subplots(len(lengths), 1,
+                             figsize=(11, 0.52 * sum(len(f) for f in frames)
+                                      + 1.6 * len(lengths)),
                              squeeze=False)
-    fig.suptitle(f"{session['label']} — most common state sequences "
-                 f"(runs collapsed, so each arrow is one transition)")
-    for c, length in enumerate(lengths):
-        frame = state_sequences(fit, length).head(top)
-        ax = axes[0, c]
+    fig.suptitle(f"{session['label']} — commonest state sequences, "
+                 f"top {top} of each length")
+    for ax, length, frame in zip(axes[:, 0], lengths, frames):
         y = np.arange(len(frame))[::-1]
-        # colour each bar by the state it starts from
-        starts = [int(s.split(" ")[0]) for s in frame["sequence"]]
-        ax.barh(y, frame["count"], color=[fit["cmap"](s) for s in starts])
+        ax.barh(y, 100 * frame["share"],
+                color=[fit["cmap"](s) for s in frame["first_state"]])
+        for yi, share in enumerate(frame["share"]):
+            ax.text(100 * share, y[yi], f"  {100 * share:.1f}%", va="center",
+                    fontsize=8, color="0.3")
         ax.set_yticks(y)
         ax.set_yticklabels(frame["sequence"], fontsize=8)
-        ax.set_xlabel("times observed")
-        ax.set_title(f"length {length}", fontsize=10)
+        ax.set_xlim(0, 100 * frame["share"].max() * 1.18)
+        ax.set_xlabel("Share of all sequences of this length (%)", fontsize=9)
+        ax.set_title(f"{length} consecutive runs "
+                     f"({length - 1} transition{'s' if length > 2 else ''})",
+                     fontsize=10)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -2288,12 +2785,6 @@ def leaving_matrix(z, n_states):
     np.add.at(trans, (z[:-1][pairs], z[1:][pairs]), 1)
     np.fill_diagonal(trans, 0)
     return trans / np.maximum(trans.sum(axis=1, keepdims=True), 1)
-
-
-def _relabelled_draws(fit):
-    """The retained state sequences, under the same labels as fit['states_obs']."""
-    relabel = fit["relabel"]
-    return [relabel[draw] for draw in fit["arhmm"]["z_samples"]]
 
 
 def plot_state_graph(ax, trans, occupancy, cmap, min_p=0.02):
@@ -2331,8 +2822,9 @@ def plot_state_graph(ax, trans, occupancy, cmap, min_p=0.02):
     ax.set_ylim(-1.5, 1.5)
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_title("transition graph — node area P(state), arrow width "
-                 "P(next | leaving)", fontsize=10)
+    ax.set_title("Transition graph: node area $\\propto P(z = k)$, arrow "
+                 "width $\\propto P(z_{t+1} = j \\mid z_t = i, j \\neq i)$",
+                 fontsize=10)
 
 
 # -----------------------------------------------------------------------------
@@ -2410,8 +2902,8 @@ def plot_elbows(session, embeddings, scores, rank_table, max_dims=ELBOW_DIMS):
 
     fig, axes = plt.subplots(2, len(methods), figsize=(4.8 * len(methods), 8),
                              squeeze=False)
-    fig.suptitle(f"{session['label']} — each method's own spectrum and "
-                 f"reconstruction MSE")
+    fig.suptitle(f"{session['label']} — component spectrum and held-out "
+                 f"reconstruction error, per method")
 
     for c, method in enumerate(methods):
         colour = METHOD_COLORS[method]
@@ -2433,10 +2925,10 @@ def plot_elbows(session, embeddings, scores, rank_table, max_dims=ELBOW_DIMS):
                     textcoords="offset points", xytext=(6, 6), fontsize=8)
         ax.set_ylim(bottom=0)
         twin.set_ylim(0, 1.02)
-        ax.set_xlabel("component, ranked")
+        ax.set_xlabel("Component, ranked")
         ax.set_ylabel(RANK_SCORE_LABEL[criterion], fontsize=9)
-        twin.set_ylabel("cumulative (dashed)", fontsize=8)
-        ax.set_title(f"{method} — ranked by {criterion}", fontsize=10)
+        twin.set_ylabel("Cumulative share (dashed)", fontsize=8)
+        ax.set_title(f"{method}, ranked by {criterion}", fontsize=10)
 
         ax = axes[1, c]
         curve = (mine[mine["method"] == method]
@@ -2450,8 +2942,8 @@ def plot_elbows(session, embeddings, scores, rank_table, max_dims=ELBOW_DIMS):
         ax.plot(curve["k"], curve["rec_mse"], color=colour, lw=1.8)
         ax.axvline(len(comps), color="k", ls=":", lw=1.2)
         ax.set_xlim(1, max_dims)
-        ax.set_xlabel("number of dimensions kept")
-        ax.set_ylabel("held-out reconstruction MSE", fontsize=9)
+        ax.set_xlabel("Dimensions kept, $k$")
+        ax.set_ylabel("Held-out reconstruction MSE (SD$^2$)", fontsize=9)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -2599,11 +3091,16 @@ def rank_components(session, embeddings, by, methods=METHODS,
 
 
 def monitoring_statistics(session, embeddings, method, folds=RANK_FOLDS,
-                          max_samples=Q_MAX_SAMPLES, seed=RANK_SEED):
+                          max_samples=Q_MAX_SAMPLES, seed=RANK_SEED,
+                          exclude=None):
     """The two standard subspace-monitoring statistics, per sample.
 
     The subspace is embeddings[method]["retained"] — the set store_retained
     put there, and the only component set this script uses.
+
+    `exclude` is a boolean over the session's bins, normally the artifact
+    bins. Those bins are dropped before the subsample is taken, so they are
+    neither scored nor used as LLE neighbours for the bins that are.
 
     T^2 is Hotelling's, inside that subspace: the sum over the kept components
     of the squared score divided by that component's variance, so it measures
@@ -2623,8 +3120,15 @@ def monitoring_statistics(session, embeddings, method, folds=RANK_FOLDS,
     comps = list(embeddings[method]["retained"])
     idx = embeddings[method]["idx"]
     take = np.arange(len(idx))
+    if exclude is not None:
+        take = take[~np.asarray(exclude, dtype=bool)[idx[take]]]
+        if not len(take):
+            raise ValueError(
+                f"{method}: every embedded bin is excluded, so there is "
+                f"nothing left to score")
     if len(take) > max_samples:
-        take = np.unique(np.linspace(0, len(idx) - 1, max_samples).astype(int))
+        take = take[np.unique(np.linspace(0, len(take) - 1,
+                                          max_samples).astype(int))]
     Y = embeddings[method]["scaled"][np.ix_(take, comps)]
     X = session["X"][idx[take]]
 
@@ -2690,11 +3194,13 @@ def plot_state_monitoring(session, embeddings, fit, methods=MAP_METHODS,
     fig, axes = plt.subplots(2, len(methods), figsize=(4.8 * len(methods), 8),
                              squeeze=False)
     fig.suptitle(f"{session['label']} — subspace statistics by state, against "
-                 f"{n_boot} label shifts of up to {jitter_s:.0f} s")
+                 f"{n_boot} circular label shifts of up to "
+                 f"$\\pm${jitter_s:.0f} s (artifact bins excluded)")
 
     rows = []
     for c, method in enumerate(methods):
-        bins, t2, q = monitoring_statistics(session, embeddings, method)
+        bins, t2, q = monitoring_statistics(session, embeddings, method,
+                                            exclude=fit["artifact_bins"])
         for r, (values, label) in enumerate(((t2, "Hotelling $T^2$"),
                                              (q, "Q (squared residual)"))):
             observed, null, p = state_statistic_null(
@@ -2719,11 +3225,11 @@ def plot_state_monitoring(session, embeddings, fit, methods=MAP_METHODS,
                             textcoords="offset points", xytext=(0, 11),
                             ha="center", fontsize=7)
             label_axis(ax, range(n_states), axis="x")
-            ax.set_xlabel("state")
+            ax.set_xlabel("State")
             ax.set_ylabel(label, fontsize=9)
             if r == 0:
-                ax.set_title(f"{method} — "
-                             f"{len(embeddings[method]['retained'])} "
+                ax.set_title(f"{method}, "
+                             f"{len(embeddings[method]['retained'])} retained "
                              f"components", fontsize=10)
             rows += [{"method": method, "statistic": label.split(" ")[0],
                       "state": s, "observed": observed[s],
@@ -2751,7 +3257,8 @@ def plot_ranking(session, rank_table, dims=RANK_DIMS, top_n=TOP_N):
     methods = list(dict.fromkeys(rank_table["method"]))
     fig, axes = plt.subplots(1, len(methods), figsize=(5.0 * len(methods), 4.2),
                              squeeze=False)
-    fig.suptitle(f"{session['label']} — components ranked, first {dims}")
+    fig.suptitle(f"{session['label']} — components ranked by criterion, "
+                 f"first {dims}")
     for c, method in enumerate(methods):
         sub = rank_table[rank_table["method"] == method].sort_values("rank")
         criterion = sub["criterion"].iloc[0]
@@ -2772,9 +3279,9 @@ def plot_ranking(session, rank_table, dims=RANK_DIMS, top_n=TOP_N):
                         (rank_x[r], values[r]), textcoords="offset points",
                         xytext=(0, 9), ha="center", fontsize=7, color=colour)
         label_axis(ax, rank_x.tolist(), axis="x", fontsize=7)
-        ax.set_xlabel("rank")
+        ax.set_xlabel("Rank")
         ax.set_ylabel(RANK_SCORE_LABEL[criterion], fontsize=9)
-        ax.set_title(f"{method} — by {criterion}", fontsize=10)
+        ax.set_title(f"{method}, by {criterion}", fontsize=10)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
@@ -2843,9 +3350,9 @@ def plot_manifold(session, embeddings, fit, ranking, method,
     ]
 
     fig = plt.figure(figsize=(5.0 * len(layers), 4.6))
-    fig.suptitle(f"{session['label']} — {method} — components "
+    fig.suptitle(f"{session['label']} — {method}, components "
                  + ", ".join(f"#{c}" for c in comps)
-                 + " (top 3 by drop-one MSE)")
+                 + " (top 3 of the retained set)")
     for i, (title, values, cmap_i, limits, mask) in enumerate(layers, start=1):
         ax = fig.add_subplot(1, len(layers), i, projection="3d")
         if mask is not None and not mask.all():
@@ -2891,9 +3398,9 @@ def plot_covariates(session, embeddings, fit, ranking, method, top_n=TOP_N,
     fig, axes = plt.subplots(len(comps), len(covariates),
                              figsize=(2.9 * len(covariates), 2.7 * len(comps)),
                              squeeze=False)
-    fig.suptitle(f"{session['label']} — {method} — top {top_n} components "
-                 f"against the covariates, coloured by AR-HMM state "
-                 f"(grey = outside the fitted segment)")
+    fig.suptitle(f"{session['label']} — {method}, top {top_n} retained "
+                 f"components against the covariates, coloured by AR-HMM "
+                 f"state (grey = unfitted or artifact)")
     for r, comp in enumerate(comps):
         score = coords[:, r]
         for c, (name, series) in enumerate(covariates):
@@ -2992,18 +3499,29 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
     rows = 2 + int(bool(band_cols)) + int(bool(mua_cols)) + len(methods)
     fig, axes = plt.subplots(rows, 1, figsize=(13, 1.9 * rows), sharex=True)
     fig.suptitle(f"{session['label']} — {window_s:.1f} s from "
-                 f"{win_t0 - t0:.1f}s into the epoch, shaded by state")
+                 f"t = {win_t0 - t0:.1f} s, shaded by AR-HMM state")
 
     run_s, run_i, run_n = run_lengths(z[seg])
+    # The window sits inside one fitted segment, so it holds no artifact by
+    # construction — but the mask is indexed here anyway, because a future
+    # start_s can be pointed anywhere.
+    art_s, art_i, art_n = run_lengths(
+        fit["artifact"][obs_rows].astype(int))
     for ax in axes:
         for s, i0, n in zip(run_s, run_i, run_n):
             if s < 0:
                 continue
             ax.axvspan(t_win[i0], t_win[min(i0 + n, len(t_win) - 1)],
                        color=cmap(s), alpha=0.18, lw=0)
+        for flag, i0, n in zip(art_s, art_i, art_n):
+            if not flag:
+                continue
+            ax.axvspan(t_win[i0], t_win[min(i0 + n, len(t_win) - 1)],
+                       facecolor="none", edgecolor="0.4", hatch="///",
+                       lw=0.0, alpha=0.6)
     # a key for the shading, above the figure rather than inside any panel
     present_states = sorted({int(s) for s in z[seg] if s >= 0})
-    fig.legend(handles=[Patch(facecolor=cmap(s), alpha=0.5, label=f"state {s}")
+    fig.legend(handles=[Patch(facecolor=cmap(s), alpha=0.5, label=f"State {s}")
                         for s in present_states],
                loc="upper right", ncol=len(present_states) or 1, fontsize=8,
                frameon=False, bbox_to_anchor=(0.995, 0.985))
@@ -3012,16 +3530,16 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
     ax = axes[0]
     ax.plot(t_bins, session["track_x"][bins_win], lw=1.4, color="#1f77b4", label="x")
     ax.plot(t_bins, session["track_y"][bins_win], lw=1.4, color="#2ca02c", label="y")
-    ax.set_ylabel("position (cm)", fontsize=9)
+    ax.set_ylabel("Position (cm)", fontsize=9)
     ax.legend(fontsize=7, ncol=2, loc="upper right")
 
     ax = axes[1]
     ax.plot(t_bins, session["speed"][bins_win], lw=1.4, color="0.2")
-    ax.set_ylabel("speed (cm/s)", fontsize=9)
+    ax.set_ylabel("Speed (cm s$^{-1}$)", fontsize=9)
 
     next_row = 2
-    for cols, ylabel in ((band_cols, "band power (z)"),
-                         (mua_cols, "MUA (z)")):
+    for cols, ylabel in ((band_cols, "Band power (SD)"),
+                         (mua_cols, "MUA (SD)")):
         if not cols:
             continue
         ax = axes[next_row]
@@ -3048,12 +3566,12 @@ def plot_example_window(session, embeddings, fit, ranking, state_table,
             else:
                 ax.plot(t_here, embeddings[method]["scaled"][here, comp], "o-",
                         ms=4, lw=0.8, alpha=0.8, **style)
-        ax.set_ylabel(f"{method}\nscore"
+        ax.set_ylabel(f"{method}\nScore"
                       + (f"\n({stride * session['bin_size_s'] * 1e3:.0f} ms)"
                          if stride > 1 else ""), fontsize=9)
         ax.legend(fontsize=7, ncol=top_n, loc="upper right")
 
-    axes[-1].set_xlabel("time in window (s)")
+    axes[-1].set_xlabel("Time in window (s)")
     axes[-1].set_xlim(t_win[0], t_win[-1])
     fig.tight_layout()
     plt.show()
@@ -3176,6 +3694,24 @@ OBS_SPEC = {
         "transform": "log1p",    # None | "log1p" | "log10"
         "zscore": True,
     },
+
+    # Transients, not oscillations. Samples where one of these bands exceeds
+    # max_sd in its own SD are cut out of the AR-HMM's design and out of the
+    # subspace statistics; they stay in the observation matrix so the traces
+    # still draw, and the figures hatch them. pad_s takes the samples either
+    # side as well, since a Butterworth bandpass rings around a step and that
+    # ringing is the same artifact.
+    #
+    # Rejection splits the recording into the clean stretches between
+    # transients, which the sampler already handles: each is its own segment,
+    # no design row regresses across a gap, no transition is counted over one.
+    # Set to None for no rejection.
+    "artifact": {
+        "bands": ("gamma", "ripple"),
+        "max_sd": 10.0,
+        "pad_s": 0.050,
+        "max_frac": 0.20,        # above this it raises: the SD is then set
+    },                           # by the artifacts and means nothing
 }
 
 # How much data, and from where.
@@ -3211,7 +3747,11 @@ RUN_METHODS = ("PCA", "KernelPCA", "Laplacian")
 
 # What the states look like as dynamics, and the order they come in.
 RUN_AR_MAP_LAGS = 5           # lags shown in the AR coefficient heatmaps
-RUN_SEQUENCE_LENGTHS = (2, 3, 4)
+
+# Sequences treat dwell time distributions as symbols
+RUN_SEQUENCE_LENGTHS = (2, 3)
+RUN_DWELL_MAX_K = 5
+RUN_MIN_SEGMENT_S = 1.0       # clean stretch below this is dropped, not fitted
 
 # T^2 (inside the retained subspace) and Q (the residual outside it) per
 # state, each against a null that shifts the state labels by up to
@@ -3267,14 +3807,15 @@ RETAINED = {m: embeddings[m]["retained"] for m in embeddings}
 plot_ranking(session, rank_table)
 plot_elbows(session, embeddings, scores, rank_table)
 
-# 5. build the observations from OBS_SPEC and look at them before fitting
+# 5. build the observations from OBS_SPEC and look at them before fitting.
+#    This is where artifact rejection is computed; the mask rides on `obs`.
 obs = build_observations(session, OBS_SPEC)
 plot_observations(session, obs)
 
-# 6. the AR-HMM, at the observation grid's own rate
+# 6. the AR-HMM, at the observation grid's own rate, on the clean stretches
 fit = fit_states(session, obs, minutes=RUN_MINUTES, segment_s=RUN_SEGMENT_S,
                  segment_seed=RUN_SEGMENT_SEED, start_s=RUN_START_S,
-                 nlags=OBS_SPEC["n_lags"],
+                 nlags=OBS_SPEC["n_lags"], min_segment_s=RUN_MIN_SEGMENT_S,
                  max_iter=RUN_MAX_ITER, burn_in=RUN_BURN_IN,
                  stop_when_stationary=RUN_EARLY_STOP,
                  check_every=RUN_CHECK_EVERY, geweke_tol=RUN_GEWEKE_TOL,
@@ -3282,11 +3823,14 @@ fit = fit_states(session, obs, minutes=RUN_MINUTES, segment_s=RUN_SEGMENT_S,
 state_table = state_characterization(session, fit)
 plot_arhmm(session, fit, state_table)
 plot_observation_distributions(session, fit)
-plot_observations(session, obs, fit=fit)   # again, now shaded by state
+# again, now shaded by state and carrying P(z_t = k | Y) beneath the traces
+plot_observations(session, obs, fit=fit)
 
-# 6b. what the states are as dynamics, and the order they come in
+# 6b. what the states are as dynamics, and what order they come in. The
+#     duration classes are fitted once here and reused by the sequence plot.
 plot_state_dynamics(session, fit, max_lags=RUN_AR_MAP_LAGS)
-plot_state_sequences(session, fit, lengths=RUN_SEQUENCE_LENGTHS)
+dwell = dwell_classes(fit, max_k=RUN_DWELL_MAX_K)
+plot_state_sequences(session, fit, dwell, lengths=RUN_SEQUENCE_LENGTHS)
 
 # 7. is any state harder for the manifold than the label shuffle expects?
 q_table = plot_state_monitoring(session, embeddings, fit, methods=RUN_METHODS,
