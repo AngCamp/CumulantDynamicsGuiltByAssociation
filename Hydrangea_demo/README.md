@@ -4,6 +4,8 @@ Potential Acronyms: HYbrid Dynamics Regime Analysis of Neural Geometry, Embeddin
 
  HYbrid Dynamics Regime Analysis of Neural Geometry, Embeddings, and Attractors (I think attractors are too )
 
+Draft of the necessary methods and a potential pipeline: "Hybrifolds, Conley-More Indexes and Cognitive-Dynamic Symbols.pdf" (in this folder)
+
 Alternatives: HYDRANGEAS
 HYbrid Dynamic Regime Analysis of Neural GEometries, Attractors, and Symbols
 We could apply the Conley-Morse Index
