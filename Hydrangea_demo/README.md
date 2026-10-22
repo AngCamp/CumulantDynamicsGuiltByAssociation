@@ -4,6 +4,32 @@ Potential Acronyms: HYbrid Dynamics Regime Analysis of Neural Geometry, Embeddin
 
  HYbrid Dynamics Regime Analysis of Neural Geometry, Embeddings, and Attractors (I think attractors are too )
 
+Alternatives: HYDRANGEAS
+HYbrid Dynamic Regime Analysis of Neural GEometries, Attractors, and Symbols
+We could apply the Conley-Morse Index
+Original paper on combinatorial multivariate 
+Key publication: Rivas, B., & Kalies, W. (2026). Conley Index Theory for Hybrid Systems. arXiv preprint arXiv:2606.18501.
+-this could unify brain state and neural manifolds, by adding rigour to the way manifolds of each "state" are computed
+Barcodes, for visualization or decomposing the dynamics into symbols:
+Dey, T. K., Lipiński, M., & Soriano-Trigueros, M. (2026). Conley–Morse Persistence Barcode: A Homological Signature of Combinatorial Bifurcations. Foundations of Computational Mathematics, 1-59.
+
+-To understand Conley-Morse theory, for
+understanding the conly index read...
+Mrozek, M. (2017). Conley–Morse–Forman theory for combinatorial multivector fields on Lefschetz complexes. Foundations of Computational Mathematics, 17(6), 1585-1633.
+https://arxiv.org/abs/1506.00018
+
+this work might be useful for understanding persistance of the DAG a conley-morse theory returns itself, this could be useful for distinguishing regimes from one another, evnetually understanding brain states:
+Dey, T. K., Mrozek, M., & Slechta, R. (2022). Persistence of Conley--Morse Graphs in Combinatorial Dynamical Systems. SIAM Journal on Applied Dynamical Systems, 21(2), 817-839.
+Also see: Kokubu, H., & Spendlove, K. A User’s Guide to the Conley-Morse Database.
+https://chomp.rutgers.edu/Projects/survey/cmdbSurvey.pdf. 
+also here: https://kellyspendlove.github.io/cmdbSurveyII.pdf
+
+Note that for hyprid dynamics to be described, you
+have to be able to identify the reset map.  This is partly an unsolved probelm in mathematics. But there are some attempts to work towards it:
+https://arxiv.org/pdf/2511.08737
+
+
+
 This folder holds the early-stage analysis object for hybrid dynamics modeling.
 The design is object-oriented, modular, and ordered by analysis step.
 The remote notebook path is expected under /notebooks/CumulantDynamicsGuiltByAssociation/Hydrangea_demo/.
