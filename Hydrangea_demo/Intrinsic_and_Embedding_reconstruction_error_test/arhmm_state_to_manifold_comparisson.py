@@ -32,10 +32,11 @@ What CELL 3 does
        only component set anything downstream uses
     3. build the observation traces from OBS_SPEC, mark the artifacts, and
        show them, so the inputs can be looked at before an hour is sampled
-    4. fit the sticky HDP-AR-HMM on the clean stretches, with the number of
+    4. fit the HDP-AR-HSMM (or the sticky HDP-AR-HMM — ARHMM_DURATION) on
+       the clean stretches, with each state's dwell distribution and the number of
        states inferred, and report its AIC and BIC
-    5. tag every run with a duration class from a per-state GMM on log dwell
-       time, and count the sequences over those symbols
+    5. the commonest sequences of states, over the run order, as the chance
+       a random window of 1..k runs equals each one (k = number of states)
     6. T^2 and Q per state inside and outside the retained subspace, against
        a circular-shift null
     7. plot the manifolds and the retained components against position, speed
@@ -98,9 +99,11 @@ import pynapple as nap
 import scipy.signal as sps
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy.fft import next_fast_len
 from scipy.linalg import solve_triangular
-from scipy.stats import invwishart, norm
+from scipy.special import betaln, gammaln
+from scipy.stats import invwishart, nbinom, norm
 from sklearn.model_selection import KFold
 from sklearn.neighbors import NearestNeighbors
 
@@ -200,8 +203,36 @@ ARHMM_EARLY_STOP = True
 ARHMM_CHECK_EVERY = 10    # how often stationarity is tested, and reported
 ARHMM_GEWEKE_TOL = 2.0    # |z| below this counts as stationary
 ARHMM_ALPHA = 1.0
-ARHMM_KAPPA = 50.0        # sticky bias: bigger = longer dwell times
+ARHMM_KAPPA = 50.0        # sticky bias, used only when ARHMM_DURATION="sticky"
 ARHMM_GAMMA = 1.0
+
+# How long a state lasts once entered.
+#   "sticky"     the sticky HDP-AR-HMM: every state's dwell is geometric, with
+#                one self-transition bias kappa shared by all of them. A
+#                geometric distribution always peaks at one sample.
+#   "geometric"  the HDP-AR-HSMM as Lehman et al. ran it: still geometric, but
+#                each state has its own leaving probability under a
+#                Beta(alpha0, beta0) prior, and the HDP is over the
+#                transitions between different states only.
+#   "negbin"     the same HSMM with negative-binomial dwell times, NB(r_k, q_k)
+#                per state: a sum of r_k geometric stages, so a state lasts at
+#                least r_k samples and its dwell distribution has a real mode.
+#                r_k and q_k are sampled with everything else. r_k = 1 is the
+#                geometric case, so "geometric" is this with ARHMM_R_MAX = 1.
+ARHMM_DURATION = "negbin"
+ARHMM_R_MAX = 10          # largest r tried; the shortest dwell NB allows is r
+# The leaving probability per stage is Beta(alpha0, beta0), as in the chapter,
+# where beta0 / alpha0 sets the prior mean dwell. alpha0 = 1 keeps it weak —
+# a handful of pseudo-runs against thousands of real ones.
+ARHMM_DUR_ALPHA0 = 1.0
+ARHMM_DUR_PRIOR_S = 0.3   # beta0 = this many seconds, in samples
+
+# MNIW prior, as the chapter set it: K0 is the row covariance of A (their
+# 10 x I), entered here as its inverse, and S0 is a multiple of the empirical
+# covariance of the standardized observations, with nu0 = d + 2 so the prior
+# mean of Sigma is S0 itself.
+ARHMM_K0_PRECISION = 0.1
+ARHMM_S0_SCALE = 0.5
 ARHMM_MIN_FRAC = 0.01     # a state is "used" if it holds >= 1% of samples
 ARHMM_SEED = 0
 ARHMM_MIN_SEGMENT_S = 1.0  # a stretch left between artifacts shorter than this
@@ -240,14 +271,8 @@ ELBOW_DIMS = 40           # x-limit of the scree and reconstruction elbows
 
 # --- what the states look like ------------------------------------------------
 AR_MAP_LAGS = 5           # lags shown in the AR coefficient heatmaps
-SEQUENCE_LENGTHS = (2, 3)      # sequence lengths counted, in runs
-SEQUENCE_TOP = 5          # how many of each length to show
-# Sequences are over symbols, not bare states: each run is tagged with the
-# duration cluster it falls in, so "state 2 held briefly" and "state 2 held
-# for a second" are different symbols.
-DWELL_MAX_K = 5           # largest mixture tried; K is chosen by BIC
-DWELL_SEED = 0
-DWELL_RESTARTS = 4        # EM restarts per K, best log-likelihood kept
+SEQUENCE_TOP = 5          # how many sequences of each length to show; the
+                          # lengths run 2..k, k = the number of states
 
 # --- the subspace statistics --------------------------------------------------
 # T^2 is inside the retained subspace, Q the residual outside it. The null
@@ -357,6 +382,136 @@ def observation_colour(name, kind):
 # matrix per state with p = nlags * d + 1: samples x L x p^2. Quadratic in the
 # AR order and in the number of observations, which is what separates this
 # from a plain HMM — that has no regression at all.
+#
+# THE HDP-AR-HSMM (duration="geometric" or "negbin")
+# Johnson & Willsky (2013); Lehman, Johnson et al. for the AR version. Same
+# AR emissions and the same MNIW step, but a state no longer decides at every
+# sample whether to stay. On entering state k a duration is drawn,
+#
+#     d ~ NB(r_k, q_k):  p(d) = C(d-1, r_k-1) q_k^r_k (1-q_k)^(d-r_k),  d >= r_k
+#
+# the chain holds k for d samples, then moves to j != k with probability
+# pi_k(j). pi has a zero diagonal: a state cannot follow itself, because its
+# duration already says how long it lasts. kappa is gone.
+#
+# NB(r, q) is the length of r geometric stages in a row, each left with
+# probability q per sample. So the HSMM is an ordinary HMM on sum_k r_k
+# sub-states — k.1 -> k.2 -> ... -> k.r_k -> another state — all sharing
+# (A_k, Sigma_k). That is exact, not an approximation, and it lets the
+# backward-filter / forward-sample step run unchanged on the expanded matrix.
+#
+# One Gibbs iteration:
+#   1. (A_k, Sigma_k) | z          MNIW, unchanged
+#   2. (r_k, q_k) | z              from the run lengths of z. r_k with q_k
+#                                  integrated out (Beta-NB), then q_k | r_k,
+#                                  which is Beta. Runs cut by a segment join
+#                                  are censored and left out.
+#   3. beta, pi | z                transitions between different states only.
+#                                  The zeroed diagonal is not conjugate, so
+#                                  each state's exits are augmented with the
+#                                  self-transitions a full DP row would have
+#                                  drawn and rejected (Johnson & Willsky's
+#                                  auxiliary variables), then sticky updates
+#                                  with kappa = 0.
+#   4. z | theta, pi, durations    expanded HMM, per segment
+
+
+def zero_diagonal(P_full):
+    """A transition matrix with its diagonal removed and rows renormalized."""
+    P = P_full.copy()
+    np.fill_diagonal(P, 0.0)
+    return P / np.maximum(P.sum(axis=1, keepdims=True), 1e-300)
+
+
+def expand_chain(P, q, r, pi0):
+    """The HSMM as an HMM on sub-states: (transition matrix, initial, owner).
+
+    State k becomes r[k] stages. Each stage stays with 1 - q[k] and advances
+    with q[k]; the last one leaves to state j with q[k] * P[k, j]. owner maps
+    each sub-state back to its state, and the initial distribution puts pi0
+    on each state's first stage.
+    """
+    r = np.asarray(r, dtype=int)
+    first = np.concatenate(([0], np.cumsum(r)[:-1]))
+    S = int(r.sum())
+    P_exp = np.zeros((S, S))
+    for k in range(len(r)):
+        idx = first[k] + np.arange(r[k])
+        P_exp[idx, idx] = 1.0 - q[k]
+        P_exp[idx[:-1], idx[1:]] = q[k]
+        P_exp[idx[-1], first] += q[k] * P[k]
+    pi_exp = np.zeros(S)
+    pi_exp[first] = pi0
+    return P_exp, pi_exp, np.repeat(np.arange(len(r)), r)
+
+
+def censored_runs(z, starts):
+    """Every run of z as (state, length, censored).
+
+    A run touching a segment's first or last sample is censored: it may have
+    begun before the segment or carried on past it, so its length is a lower
+    bound rather than a duration.
+    """
+    run_state, run_start, run_len = run_lengths(z, starts)
+    ends = np.append(np.asarray(starts)[1:], len(z))
+    censored = (np.isin(run_start, starts)
+                | np.isin(run_start + run_len, ends))
+    return run_state, run_len, censored
+
+
+def sample_durations(z, starts, L, alpha0, beta0, r_max, rng):
+    """Draw each state's (r_k, q_k) given the durations it holds in z.
+
+    q is the per-stage leaving probability, Beta(alpha0, beta0) a priori. With
+    n complete runs of lengths d_i,
+
+        p(d | r, q)  = prod_i C(d_i-1, r-1) q^r (1-q)^(d_i - r)
+        p(d | r)     = prod_i C(d_i-1, r-1) B(alpha0 + n r, beta0 + sum d - n r)
+                       / B(alpha0, beta0)
+        q | r, d     ~ Beta(alpha0 + n r, beta0 + sum d - n r)
+
+    r is uniform on 1..r_max a priori and has zero likelihood above the
+    shortest run. Sampling r with q integrated out is what lets it move: with
+    q held fixed, the two are so tightly coupled that r would barely change.
+    A state with no complete runs draws both from the prior.
+    """
+    run_state, run_len, censored = censored_runs(z, starts)
+    rs = np.arange(1, r_max + 1)
+    q, r = np.empty(L), np.empty(L, dtype=int)
+    for k in range(L):
+        d = run_len[(run_state == k) & ~censored].astype(np.float64)
+        if not len(d):
+            r[k] = rng.integers(1, r_max + 1)
+            q[k] = rng.beta(alpha0, beta0)
+            continue
+        n, total = len(d), d.sum()
+        ok = rs <= d.min()
+        logp = np.full(r_max, -np.inf)
+        for i in np.flatnonzero(ok):
+            rr = rs[i]
+            logp[i] = ((gammaln(d) - gammaln(rr) - gammaln(d - rr + 1)).sum()
+                       + betaln(alpha0 + n * rr, beta0 + total - n * rr))
+        w = np.exp(logp - logp.max())
+        r[k] = rng.choice(rs, p=w / w.sum())
+        q[k] = rng.beta(alpha0 + n * r[k], beta0 + total - n * r[k])
+    return q, r
+
+
+def augment_self_transitions(N, P_full, rng):
+    """Add back the self-transitions a zero-diagonal chain never shows.
+
+    Under the weak limit each row of P_full is a Dirichlet draw with a
+    diagonal; the HSMM uses it with that diagonal removed. Equivalently every
+    observed exit from k was preceded by a geometric number of draws of k
+    that were rejected. Adding those counts to the diagonal makes the
+    Dirichlet update on P_full conjugate again.
+    """
+    N = N.copy()
+    exits = N.sum(axis=1).astype(int)
+    for k in np.flatnonzero(exits):
+        leave = min(max(1.0 - P_full[k, k], 1e-6), 1.0)
+        N[k, k] += rng.negative_binomial(exits[k], leave)
+    return N
 
 
 def make_design(Y, nlags):
@@ -490,7 +645,7 @@ def forward_loglik(logL, P, pi0, starts=None):
     return float(total)
 
 
-def information_criteria(loglik, n, K, d, p):
+def information_criteria(loglik, n, K, d, p, duration="sticky"):
     """AIC and BIC at the representative posterior draw.
 
     Free parameters, counting the K states the model actually uses rather
@@ -498,10 +653,14 @@ def information_criteria(loglik, n, K, d, p):
 
         A_k      d x p each                       K d p
         Sigma_k  symmetric d x d each             K d(d+1)/2
-        P        rows on the simplex              K(K - 1)
+        P        rows on the simplex              K(K - 1), or K(K - 2) for
+                                                  the HSMM's zero diagonal
         pi0      on the simplex                   K - 1
+        dwell    q_k (geometric), q_k and r_k     0, K or 2K
+                 (negbin); the sticky model's
+                 self-transitions are in P
 
-        m   = K[dp + d(d+1)/2] + K(K-1) + (K-1)
+        m   = K[dp + d(d+1)/2] + transitions + (K-1) + dwell
         AIC = 2m - 2 log p(Y | theta)
         BIC = m log n - 2 log p(Y | theta)
 
@@ -512,7 +671,10 @@ def information_criteria(loglik, n, K, d, p):
     they do not select K. They are here to compare OBS_SPECs at matched K and
     d, where m is identical and the comparison is entirely in the likelihood.
     """
-    m = K * (d * p + d * (d + 1) // 2) + K * (K - 1) + (K - 1)
+    hsmm = duration != "sticky"
+    transitions = K * max(K - 2, 0) if hsmm else K * (K - 1)
+    dwell = {"sticky": 0, "geometric": K, "negbin": 2 * K}[duration]
+    m = K * (d * p + d * (d + 1) // 2) + transitions + (K - 1) + dwell
     return {"loglik": float(loglik), "n_params": int(m), "n_obs": int(n),
             "aic": float(2 * m - 2 * loglik),
             "bic": float(m * np.log(n) - 2 * loglik),
@@ -635,6 +797,9 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
                   gamma=ARHMM_GAMMA, min_frac=ARHMM_MIN_FRAC, standardize=True,
                   seed=ARHMM_SEED, stop_when_stationary=ARHMM_EARLY_STOP,
                   check_every=ARHMM_CHECK_EVERY, geweke_tol=ARHMM_GEWEKE_TOL,
+                  duration=ARHMM_DURATION, r_max=ARHMM_R_MAX,
+                  dur_alpha0=ARHMM_DUR_ALPHA0, dur_beta0=None,
+                  k0_precision=ARHMM_K0_PRECISION, s0_scale=ARHMM_S0_SCALE,
                   verbose=True):
     """
     Y        : (T, d) array, or a list of them — one per contiguous segment
@@ -643,9 +808,14 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
     max_iter : ceiling on Gibbs iterations; the run may stop earlier
     burn_in  : iterations discarded before any sample is retained
     alpha    : transition concentration
-    kappa    : sticky self-transition bias (bigger = longer state durations)
+    kappa    : sticky self-transition bias; "sticky" only
     gamma    : top-level DP concentration (bigger = more states a priori)
     min_frac : a state counts as "used" if it holds >= this fraction of timesteps
+    duration : "sticky", "geometric" or "negbin" — see ARHMM_DURATION
+    r_max    : largest NB r tried; "geometric" fixes it at 1
+    dur_alpha0, dur_beta0 : Beta prior on the per-stage leaving probability,
+               in samples. dur_beta0 is required for the HSMM variants.
+    k0_precision, s0_scale : the MNIW prior, see ARHMM_K0_PRECISION
 
     stop_when_stationary checks every `check_every` iterations past burn_in and
     stops once the Geweke z on the retained log-likelihood is under
@@ -658,6 +828,15 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
             f"burn_in={burn_in} must be at least 0 and less than "
             f"max_iter={max_iter}; as given, no iteration would be retained "
             f"and there would be nothing to compute a posterior from")
+    if duration not in ("sticky", "geometric", "negbin"):
+        raise ValueError(f"duration must be 'sticky', 'geometric' or "
+                         f"'negbin', got {duration!r}")
+    hsmm = duration != "sticky"
+    if hsmm and dur_beta0 is None:
+        raise ValueError("the HSMM needs dur_beta0, the prior mean dwell in "
+                         "samples — fit_states sets it from ARHMM_DUR_PRIOR_S")
+    if duration == "geometric":
+        r_max = 1
     rng = np.random.default_rng(seed)
     segments = [Y] if isinstance(Y, np.ndarray) else list(Y)
     segments = [np.atleast_2d(np.asarray(s, dtype=float).T).T
@@ -678,16 +857,22 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
     adjacent = np.ones(T - 1, dtype=bool)
     adjacent[starts[1:] - 1] = False
 
-    # MNIW prior
+    # MNIW prior, as Lehman et al. set it. K0 enters sample_mniw as a
+    # precision (Sxx = X'X + K0), so their row covariance 10 x I is 0.1 x I
+    # here. nu0 = d + 2 makes E[Sigma] = S0 / (nu0 - d - 1) = S0.
     M0 = np.zeros((d, p))
-    K0 = np.eye(p)
+    K0 = k0_precision * np.eye(p)
     nu0 = d + 2
-    S0 = 0.1 * np.eye(d) * (nu0 - d - 1)
+    S0 = s0_scale * np.atleast_2d(np.cov(Yt.T)) * (nu0 - d - 1)
 
     # Initialise: random blocks of states
     block = 50
     z = np.repeat(rng.integers(0, L, size=T // block + 1), block)[:T]
     beta = np.ones(L) / L
+    # The HSMM keeps the full Dirichlet rows between iterations: the
+    # self-transition augmentation needs the diagonal the chain never uses.
+    P_full = sample_transitions(np.zeros((L, L)), alpha, 0.0, beta, rng)
+    q, r = np.full(L, np.nan), np.ones(L, dtype=int)
 
     As = np.zeros((L, d, p))
     Sigmas = np.zeros((L, d, d))
@@ -701,16 +886,38 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
             idx = z == k
             As[k], Sigmas[k] = sample_mniw(X[idx], Yt[idx], M0, K0, S0, nu0, rng)
 
-        # 2. Transition counts -> beta and transition matrix. Only pairs
-        #    inside a segment; a join is not a transition.
-        N = np.zeros((L, L))
-        np.add.at(N, (z[:-1][adjacent], z[1:][adjacent]), 1)
-        beta = sample_beta(N, alpha, kappa, gamma, beta, rng)
-        P = sample_transitions(N, alpha, kappa, beta, rng)
-
-        # 3. State sequence, each segment filtered and sampled on its own
         logL = np.column_stack([ar_loglik(X, Yt, As[k], Sigmas[k]) for k in range(L)])
-        z = sample_states(logL, P, beta, rng, starts)
+        if hsmm:
+            # 2. Dwell distributions, from the complete runs of z.
+            q, r = sample_durations(z, starts, L, dur_alpha0, dur_beta0,
+                                    r_max, rng)
+
+            # 3. Transitions between different states only, inside a
+            #    segment. The rejected self-draws go back on the diagonal
+            #    so the Dirichlet update is conjugate; kappa = 0.
+            leave = adjacent & (z[:-1] != z[1:])
+            N = np.zeros((L, L))
+            np.add.at(N, (z[:-1][leave], z[1:][leave]), 1)
+            N = augment_self_transitions(N, P_full, rng)
+            beta = sample_beta(N, alpha, 0.0, gamma, beta, rng)
+            P_full = sample_transitions(N, alpha, 0.0, beta, rng)
+            P = zero_diagonal(P_full)
+
+            # 4. State sequence on the sub-state chain, mapped back to states
+            P_exp, pi_exp, owner = expand_chain(P, q, r, beta)
+            z = owner[sample_states(logL[:, owner], P_exp, pi_exp, rng,
+                                    starts)]
+            del P_exp, pi_exp, owner
+        else:
+            # 2. Transition counts -> beta and transition matrix. Only pairs
+            #    inside a segment; a join is not a transition.
+            N = np.zeros((L, L))
+            np.add.at(N, (z[:-1][adjacent], z[1:][adjacent]), 1)
+            beta = sample_beta(N, alpha, kappa, gamma, beta, rng)
+            P = sample_transitions(N, alpha, kappa, beta, rng)
+
+            # 3. State sequence, each segment filtered and sampled on its own
+            z = sample_states(logL, P, beta, rng, starts)
 
         counts = np.bincount(z, minlength=L)
         K_used = int(np.sum(counts >= min_frac * T))
@@ -724,7 +931,7 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
             # which iteration that is only becomes known after the loop.
             z_samples.append(z.copy())
             param_samples.append((As.copy(), Sigmas.copy(), P.copy(),
-                                  beta.copy()))
+                                  beta.copy(), q.copy(), r.copy()))
 
         if verbose and (it % check_every == 0 or it == max_iter - 1):
             spent = time.perf_counter() - started
@@ -769,14 +976,21 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
     cands = [i for i in range(burn_in, n_run) if trace_K[i] == K_hat]
     best = max(cands, key=lambda i: trace_ll[i])
     z_best = z_samples[best - burn_in]
-    As, Sigmas, P, beta = param_samples[best - burn_in]
+    As, Sigmas, P, beta, q, r = param_samples[best - burn_in]
 
     # AIC and BIC at that draw, on the marginal likelihood — one forward pass
-    # over the design with the state sequence integrated out.
+    # over the design with the state sequence integrated out. For the HSMM
+    # that is the pass over the sub-state chain, which marginalizes the
+    # durations as well.
     logL_best = np.column_stack([ar_loglik(X, Yt, As[k], Sigmas[k])
                                  for k in range(L)])
-    criteria = information_criteria(
-        forward_loglik(logL_best, P, beta, starts), T, K_hat, d, p)
+    if hsmm:
+        P_exp, pi_exp, owner = expand_chain(P, q, r, beta)
+        marginal = forward_loglik(logL_best[:, owner], P_exp, pi_exp, starts)
+        del P_exp, pi_exp, owner
+    else:
+        marginal = forward_loglik(logL_best, P, beta, starts)
+    criteria = information_criteria(marginal, T, K_hat, d, p, duration)
     del logL_best
     gc.collect()
 
@@ -799,7 +1013,11 @@ def fit_hdp_arhmm(Y, nlags=ARHMM_NLAGS, L=ARHMM_L, max_iter=ARHMM_MAX_ITER,
                 As=As, Sigmas=Sigmas, beta=beta, P=P, Y=Yt,
                 segment_starts=starts, nlags=nlags, burn_in=burn_in,
                 n_lag_terms=p, n_iterations=n_run, criteria=criteria,
-                stopped_early=stopped_early, convergence=converged)
+                stopped_early=stopped_early, convergence=converged,
+                duration=duration, dur_q=q if hsmm else None,
+                dur_r=r if hsmm else None,
+                dur_samples=([s[4:] for s in param_samples] if hsmm else None),
+                dur_prior=(dur_alpha0, dur_beta0) if hsmm else None)
 
 
 # -----------------------------------------------------------------------------
@@ -2043,8 +2261,15 @@ def fit_states(session, obs, minutes=ARHMM_MINUTES,
                segment_seed=ARHMM_SEGMENT_SEED,
                min_segment_s=ARHMM_MIN_SEGMENT_S,
                stop_when_stationary=ARHMM_EARLY_STOP,
-               check_every=ARHMM_CHECK_EVERY, geweke_tol=ARHMM_GEWEKE_TOL):
+               check_every=ARHMM_CHECK_EVERY, geweke_tol=ARHMM_GEWEKE_TOL,
+               duration=ARHMM_DURATION, r_max=ARHMM_R_MAX,
+               dur_alpha0=ARHMM_DUR_ALPHA0, dur_prior_s=ARHMM_DUR_PRIOR_S,
+               k0_precision=ARHMM_K0_PRECISION, s0_scale=ARHMM_S0_SCALE):
     """Fit the AR-HMM on the observation grid and map its states onto both grids.
+
+    `duration` picks the model — see ARHMM_DURATION. For the HSMM variants
+    the fitted dwell distribution of each kept state comes back as `dur_r`
+    and `dur_q`, in the relabelled order.
 
     The AR design drops the first `nlags` samples, so state i belongs to sample
     i+nlags of the segment. The occupied states are relabelled by how much time
@@ -2070,7 +2295,11 @@ def fit_states(session, obs, minutes=ARHMM_MINUTES,
     d = Y_all.shape[1]
     p = nlags * d + 1
 
-    print(f"\nfitting the sticky HDP-AR-HMM")
+    model = {"sticky": "sticky HDP-AR-HMM",
+             "geometric": "HDP-AR-HSMM, geometric dwell",
+             "negbin": "HDP-AR-HSMM, negative-binomial dwell"}[duration]
+    dur_beta0 = dur_prior_s * rate
+    print(f"\nfitting the {model}")
     print(f"    observations: {d} traces — {', '.join(obs['names'])}")
     segments = split_on_artifacts(
         windows, artifact, max(int(round(min_segment_s * rate)), nlags + 2))
@@ -2085,44 +2314,58 @@ def fit_states(session, obs, minutes=ARHMM_MINUTES,
               + (" ..." if len(windows) > 8 else "")
               + " — events falling between them get no state label")
     print(f"    AR order {nlags} = {nlags / rate * 1e3:.0f} ms of lag | "
-          f"p = nlags*d+1 = {p} | L={L}, kappa={kappa}, "
+          f"p = nlags*d+1 = {p} | L={L}, "
+          + (f"kappa={kappa}" if duration == "sticky" else
+             f"dwell prior Beta({dur_alpha0:g}, {dur_beta0:.1f}) = "
+             f"{dur_prior_s * 1e3:.0f} ms, r <= "
+             f"{1 if duration == 'geometric' else r_max}")
+          + f" | K0 precision {k0_precision:g}, S0 = {s0_scale:g} x cov | "
           f"<={max_iter} iterations")
-    print(f"    cost per iteration goes as samples x L x p^2", flush=True)
+    print(f"    cost per iteration goes as samples x L x p^2"
+          + ("" if duration == "sticky" else
+             " + samples x (sum r_k)^2 for the sub-state chain"), flush=True)
 
     t0 = time.perf_counter()
     arhmm = fit_hdp_arhmm([Y_all[s] for s in segments], nlags=nlags, L=L,
                           max_iter=max_iter, burn_in=burn_in, alpha=alpha,
                           kappa=kappa, gamma=gamma, min_frac=min_frac,
                           seed=seed, stop_when_stationary=stop_when_stationary,
-                          check_every=check_every, geweke_tol=geweke_tol)
+                          check_every=check_every, geweke_tol=geweke_tol,
+                          duration=duration, r_max=r_max,
+                          dur_alpha0=dur_alpha0, dur_beta0=dur_beta0,
+                          k0_precision=k0_precision, s0_scale=s0_scale)
     print(f"    fitted in {(time.perf_counter() - t0) / 60:.1f} min")
     if arhmm["K_hat"] >= L - 1:
         print(f"    WARNING: K_hat={arhmm['K_hat']} is at the truncation level "
               f"L={L}. Raise L — the model wanted more states than it was "
               f"allowed.")
 
-    # Keep exactly the states the model calls used — the ones holding at least
-    # min_frac of the samples, which is what K_hat counts. The truncation
-    # leaves a tail of states with a handful of samples each; carrying them
-    # into the figures put fifteen entries in a legend for a four-state fit.
-    # Those samples become -1 and are drawn grey, with the cost printed.
+    # Every occupied state keeps a label, numbered by how much time it holds.
+    # The major states — at least min_frac of the samples, which is what
+    # K_hat counts — come first, 0..n_major-1. The minor ones follow. A rare,
+    # brief state (a ripple, say) can sit under min_frac and still be real,
+    # so the minor states are drawn everywhere except the transition matrix
+    # and graph, which are about the major states' structure.
     z_raw = arhmm["z"]
     occupancy = np.bincount(z_raw, minlength=L)
-    used = occupancy >= min_frac * len(z_raw)
+    major = occupancy >= min_frac * len(z_raw)
+    occupied = occupancy > 0
     order = np.argsort(-occupancy)
     relabel = np.full(len(occupancy), -1)
-    relabel[order[used[order]]] = np.arange(int(used.sum()))
+    relabel[order[occupied[order]]] = np.arange(int(occupied.sum()))
     z = relabel[z_raw]
-    n_states = int(used.sum())
+    n_states = int(occupied.sum())
+    n_major = int(major.sum())
 
-    minor = int((z < 0).sum())
-    if minor:
-        print(f"    {int((occupancy > 0).sum()) - n_states} states below "
-              f"min_frac={min_frac:.0%} hold {minor} samples "
-              f"({100 * minor / len(z):.2f}%) — left unlabelled")
-    if n_states != arhmm["K_hat"]:
+    if n_states > n_major:
+        held = occupancy[order[n_major:n_states]]
+        print(f"    {n_states - n_major} minor states (under min_frac="
+              f"{min_frac:.0%}) hold {int(held.sum())} samples "
+              f"({100 * held.sum() / len(z):.2f}%) — labelled "
+              f"{n_major}..{n_states - 1}, left out of the transition plots")
+    if n_major != arhmm["K_hat"]:
         raise AssertionError(
-            f"kept {n_states} states but the sampler reported K_hat="
+            f"{n_major} major states but the sampler reported K_hat="
             f"{arhmm['K_hat']} — these are the same threshold and must agree")
 
     # Each segment loses its first `nlags` samples to the design, so the rows
@@ -2170,17 +2413,32 @@ def fit_states(session, obs, minutes=ARHMM_MINUTES,
     n_draws = len(arhmm["z_samples"])
     state_prob /= n_draws
 
-    print(f"    {n_states} states kept over {len(z)} samples | "
-          f"{(states >= 0).sum()} of {session['n_bins']} manifold bins "
+    print(f"    {n_states} states labelled ({n_major} major) over {len(z)} "
+          f"samples | {(states >= 0).sum()} of {session['n_bins']} manifold bins "
           f"labelled | {int(artifact_bins.sum())} bins excluded as artifact")
+
+    # The fitted dwell distribution of each kept state, in the new numbering.
+    dur_q = dur_r = None
+    if arhmm["duration"] != "sticky":
+        raw = np.array([np.flatnonzero(relabel == s)[0]
+                        for s in range(n_states)])
+        dur_q, dur_r = arhmm["dur_q"][raw], arhmm["dur_r"][raw]
+        step_ms = 1e3 / rate
+        print("    fitted dwell, NB(r, q) at the representative draw:")
+        for s in range(n_states):
+            print(f"      state {s}: r = {dur_r[s]:2d}, q = {dur_q[s]:.3f} | "
+                  f"shortest {dur_r[s] * step_ms:.0f} ms, mean "
+                  f"{dur_r[s] / dur_q[s] * step_ms:.0f} ms"
+                  + ("" if s < n_major else "  (minor)"))
     return {"arhmm": arhmm, "obs": obs, "obs_names": obs["names"],
+            "duration": arhmm["duration"], "dur_q": dur_q, "dur_r": dur_r,
             "obs_kinds": obs["kinds"], "segments": segments,
             "windows": windows, "rate": rate,
             "nlags": nlags, "states_obs": z, "state_index": state_index,
             "t_states": t_states, "states": states, "relabel": relabel,
             "state_prob": state_prob, "n_draws": n_draws,
             "artifact": artifact, "artifact_bins": artifact_bins,
-            "n_states": n_states, "burn_in": burn_in,
+            "n_states": n_states, "n_major": n_major, "burn_in": burn_in,
             "criteria": arhmm["criteria"],
             "segment_starts": arhmm["segment_starts"],
             "cmap": ListedColormap(
@@ -2228,7 +2486,8 @@ def state_characterization(session, fit, verbose=True):
         if not len(runs):
             raise AssertionError(f"state {s} is in the label set but holds no "
                                  f"samples — the relabelling is wrong")
-        entry = {"state": s, "samples": int(sel.sum()),
+        entry = {"state": s, "major": s < fit["n_major"],
+                 "samples": int(sel.sum()),
                  "occupancy_%": 100 * sel.sum() / len(z),
                  "n_runs": int(len(runs)),
                  "median_dwell_ms": float(np.median(runs) * step_ms),
@@ -2249,14 +2508,21 @@ def state_characterization(session, fit, verbose=True):
         eig = np.linalg.eigvals(A_k)
         entry["max_|eig|"] = float(np.max(np.abs(eig)))
         entry["oscillatory"] = bool(np.any(np.abs(eig.imag) > 1e-6))
+        if fit["dur_r"] is not None:
+            entry["model_r"] = int(fit["dur_r"][s])
+            entry["model_mean_dwell_ms"] = float(
+                fit["dur_r"][s] / fit["dur_q"][s] * step_ms)
         rows.append(entry)
     table = pd.DataFrame(rows)
 
     if verbose:
         print("\nwhat each state is — occupancy, dwell time, AR dynamics, speed")
-        show_table(table[["state", "samples", "occupancy_%", "n_runs",
-                          "median_dwell_ms", "p90_dwell_ms", "max_|eig|",
-                          "oscillatory", "speed_bins", "speed_median"]]
+        model_cols = (["model_r", "model_mean_dwell_ms"]
+                      if fit["dur_r"] is not None else [])
+        show_table(table[["state", "major", "samples", "occupancy_%", "n_runs",
+                          "median_dwell_ms", "p90_dwell_ms"] + model_cols
+                         + ["max_|eig|", "oscillatory", "speed_bins",
+                            "speed_median"]]
                    .set_index("state").round(2))
         # observations down the rows, states across: with a dozen observations
         # the other way round is far wider than a page. The distributions
@@ -2264,6 +2530,79 @@ def state_characterization(session, fit, verbose=True):
         print("\nthe observations by state (standardized; states across)")
         show_table(observation_by_state(table, names).round(2))
     return table
+
+
+def plot_dwell_fit(session, fit, ncols=4):
+    """Each state's fitted dwell distribution against the runs it holds.
+
+    Survival P(D >= d) on a log time axis: the dots are the complete runs of
+    the representative draw, the line is NB(r, q) at that draw, and the band
+    is the pointwise 5-95% range of the model over the retained draws. Runs
+    cut by a segment join are left out, as they were in the fit.
+
+    A line through the dots says the dwell family fits; a line that misses
+    the head (short runs) or the tail (long ones) says it does not, whatever
+    the table's means say. The dashed line is the shortest dwell, r samples.
+    """
+    if fit["dur_r"] is None:
+        raise ValueError("this fit is the sticky HMM, which has no dwell "
+                         "distribution of its own — set duration='geometric' "
+                         "or 'negbin'")
+    z, n_states, cmap = fit["states_obs"], fit["n_states"], fit["cmap"]
+    step_ms = 1e3 / fit["rate"]
+    run_state, run_len, censored = censored_runs(z, fit["segment_starts"])
+    raw = np.array([np.flatnonzero(fit["relabel"] == s)[0]
+                    for s in range(n_states)])
+    draws = fit["arhmm"]["dur_samples"]
+
+    nrows = int(np.ceil(n_states / ncols))
+    fig, axes = plt.subplots(nrows, min(ncols, n_states),
+                             figsize=(max(3.6 * min(ncols, n_states), 10),
+                                      3.0 * nrows),
+                             squeeze=False)
+    fig.suptitle(f"{session['label']} — dwell time by state: complete runs "
+                 f"(dots) against the fitted NB($r$, $q$) (line, band = 5-95% "
+                 f"over {len(draws)} draws)")
+    for s in range(n_states):
+        ax = axes[s // ncols, s % ncols]
+        d = np.sort(run_len[(run_state == s) & ~censored])
+        if not len(d):
+            ax.set_title(f"state {s}: no complete runs", fontsize=9)
+            continue
+        grid = np.arange(1, int(d.max()) * 2 + 1)
+        empirical = 1.0 - np.searchsorted(d, grid, side="left") / len(d)
+        keep = empirical > 0
+        ax.plot(grid[keep] * step_ms, empirical[keep], ".", ms=3,
+                color=cmap(s), alpha=0.8)
+
+        def survival(r, q):
+            # D = r + failures, failures ~ nbinom(r, q); P(D >= d)
+            return nbinom.sf(grid - r - 1, r, q)
+
+        band = np.array([survival(int(rr[raw[s]]), qq[raw[s]])
+                         for qq, rr in draws])
+        lo, hi = np.percentile(band, [5, 95], axis=0)
+        ax.fill_between(grid * step_ms, lo, hi, color="0.6", alpha=0.35,
+                        lw=0)
+        r_s, q_s = int(fit["dur_r"][s]), float(fit["dur_q"][s])
+        ax.plot(grid * step_ms, survival(r_s, q_s), color="0.15", lw=1.3)
+        ax.axvline(r_s * step_ms, color="0.3", ls="--", lw=0.8)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_ylim(max(0.5 / len(d), 1e-4), 1.05)
+        ax.set_title(f"state {s}: r = {r_s}, mean "
+                     f"{r_s / q_s * step_ms:.0f} ms, {len(d)} runs",
+                     fontsize=9, color=cmap(s))
+        ax.tick_params(labelsize=7)
+        if s % ncols == 0:
+            ax.set_ylabel("$P(D \\geq d)$", fontsize=8)
+        if s // ncols == nrows - 1:
+            ax.set_xlabel("Dwell $d$ (ms)", fontsize=8)
+    for i in range(n_states, axes.size):
+        axes.flat[i].axis("off")
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
 
 
 def plot_observation_distributions(session, fit, ncols=4):
@@ -2295,7 +2634,9 @@ def plot_observation_distributions(session, fit, ncols=4):
         groups, positions = [], []
         for s in range(n_states):
             sel = (labels == s) & np.isfinite(values)
-            if sel.sum() > 1:
+            # a violin is a KDE, which needs spread; a minor state with a
+            # handful of identical values has none
+            if sel.sum() > 1 and np.ptp(values[sel]) > 0:
                 groups.append(values[sel])
                 positions.append(s)
         if groups:
@@ -2362,7 +2703,9 @@ def plot_arhmm(session, fit, state_table):
     run_state, _, run_len = run_lengths(z, fit["segment_starts"])
 
     fig, axes = plt.subplots(3, 2, figsize=(15, 13), constrained_layout=True)
-    fig.suptitle(f"{session['label']} — sticky HDP-AR-HMM, "
+    model = ("sticky HDP-AR-HMM" if fit["duration"] == "sticky"
+             else f"HDP-AR-HSMM ({fit['duration']} dwell)")
+    fig.suptitle(f"{session['label']} — {model}, "
                  f"{len(names)} observations at {fit['rate']:.0f} Hz "
                  f"({session['lfp_key']})")
 
@@ -2408,15 +2751,22 @@ def plot_arhmm(session, fit, state_table):
     # Violins on log dwell time. The distributions span two decades and are
     # heavily skewed, so a linear axis puts every state in the same bin.
     dwell = [np.log10(run_len[run_state == s] * step_ms) for s in range(n_states)]
-    parts = ax.violinplot(dwell, positions=np.arange(n_states),
-                          showmedians=True, widths=0.8)
-    for s, body in enumerate(parts["bodies"]):
-        body.set_facecolor(cmap(s))
-        body.set_alpha(0.7)
-    for key in ("cmedians", "cbars", "cmins", "cmaxes"):
-        if key in parts:
-            parts[key].set_color("0.2")
-            parts[key].set_linewidth(1.0)
+    # A minor state whose runs all share one length has no spread for a
+    # violin; it is drawn as points instead.
+    spread = [s for s in range(n_states) if np.ptp(dwell[s]) > 0]
+    if spread:
+        parts = ax.violinplot([dwell[s] for s in spread], positions=spread,
+                              showmedians=True, widths=0.8)
+        for s, body in zip(spread, parts["bodies"]):
+            body.set_facecolor(cmap(s))
+            body.set_alpha(0.7)
+        for key in ("cmedians", "cbars", "cmins", "cmaxes"):
+            if key in parts:
+                parts[key].set_color("0.2")
+                parts[key].set_linewidth(1.0)
+    for s in set(range(n_states)) - set(spread):
+        ax.plot(np.full(len(dwell[s]), s), dwell[s], "o", ms=5,
+                color=cmap(s), mec="0.2")
     decades = np.arange(np.floor(min(v.min() for v in dwell)),
                         np.ceil(max(v.max() for v in dwell)) + 1)
     ax.set_yticks(decades)
@@ -2442,27 +2792,32 @@ def plot_arhmm(session, fit, state_table):
     ax.set_title("Observation median by state (SD units)", fontsize=10)
     ax.legend(fontsize=7, ncol=2, title="State", title_fontsize=7)
 
+    # Transitions among the major states only. A pair with a minor state on
+    # either side is dropped rather than bridged, so the rows are where a
+    # major state goes when it leaves for another major state.
+    n_major = fit["n_major"]
     ax = axes[2, 0]
-    trans = leaving_matrix(z, n_states)
+    trans = leaving_matrix(z, n_major)
     # Sequential map over the range the off-diagonal actually occupies, with
     # the numbers written in. At four states a matrix is a table, and reading
     # a probability off a colour bar is worse than reading the digits.
-    im = ax.imshow(trans, cmap="Blues", vmin=0, vmax=float(trans.max()),
-                   aspect="auto")
-    for i in range(n_states):
-        for j in range(n_states):
+    ax.imshow(trans, cmap="Blues", vmin=0, vmax=float(trans.max()),
+              aspect="auto")
+    for i in range(n_major):
+        for j in range(n_major):
             if i == j:
                 continue
             ax.text(j, i, f"{trans[i, j]:.2f}", ha="center", va="center",
                     fontsize=8,
                     color="white" if trans[i, j] > 0.6 * trans.max() else "0.2")
-    label_axis(ax, range(n_states), axis="x")
-    label_axis(ax, range(n_states), axis="y")
+    label_axis(ax, range(n_major), axis="x")
+    label_axis(ax, range(n_major), axis="y")
     ax.set_xlabel("To state")
     ax.set_ylabel("From state")
-    ax.set_title("$P(z_{t+1} = j \\mid z_t = i,\\ j \\neq i)$", fontsize=10)
+    ax.set_title("$P(z_{t+1} = j \\mid z_t = i,\\ j \\neq i)$, major states "
+                 "only", fontsize=10)
 
-    occupancy = np.array([(z == s).mean() for s in range(n_states)])
+    occupancy = np.array([(z == s).mean() for s in range(n_major)])
     plot_state_graph(axes[2, 1], trans, occupancy, cmap)
     plt.show()
     plt.close(fig)
@@ -2522,255 +2877,150 @@ def plot_state_dynamics(session, fit, max_lags=AR_MAP_LAGS):
 
 
 # -----------------------------------------------------------------------------
-# DWELL-TIME CLASSES AND THE SYMBOL SEQUENCES
+# THE COMMONEST STATE SEQUENCES
 # -----------------------------------------------------------------------------
-# A bare state sequence 2 -> 0 -> 2 -> 0 says nothing about time, and each
-# state's dwell times span two decades. So each run is clustered by duration
-# and the sequences are over (state, duration cluster) symbols.
+# How long a state lasts is now part of the model, so a sequence here is only
+# about order: the state sequence collapsed to one entry per run, so A A A B B
+# is A B and consecutive entries always differ.
 #
-# One GMM per state, by EM, on x = log(dwell in samples):
-#
-#     p(x) = sum_j w_j N(x; mu_j, s_j),   mu_0 = 0
-#
-# The first component's mean is pinned at 0, a one-sample run. K goes to
-# DWELL_MAX_K and is chosen by BIC with m = 3K - 2 free parameters. A symbol
-# is written out as its cluster's mean and SD in milliseconds.
+# P(pattern) is the chance that a window drawn at random from every
+# contiguous window of length 1..k of that run sequence equals the pattern,
+# with k = the number of states. All lengths share one denominator, so a
+# length-2 and a length-4 pattern are on the same scale.
 
 
-def _dwell_logpdf(x, mus, sigmas):
-    """Log density of each Gaussian component at each x."""
-    return (-np.log(sigmas) - 0.5 * np.log(2 * np.pi)
-            - 0.5 * ((x[:, None] - mus) / sigmas) ** 2)
-
-
-def _dwell_em(x, k, rng, max_iter=500, tol=1e-8, sigma_floor=0.05, jitter=0.0):
-    """EM for a K-component GMM on x with mu_0 pinned at 0.
-
-    sigma_floor keeps a component from collapsing onto the pile of one-sample
-    runs sitting at exactly x = 0, which would send the likelihood to
-    infinity. Durations are integers, so nothing below log(2) - log(1) is
-    resolvable anyway.
+def subseq_prob(seq, pattern, k=None):
     """
-    n = len(x)
-    edges = np.quantile(x, np.linspace(0, 1, k + 1))
-    mus = np.concatenate(([0.0], 0.5 * (edges[1:k] + edges[2:k + 1])))
-    if jitter and k > 1:
-        mus[1:] = np.maximum(mus[1:] + rng.normal(0.0, jitter * x.std(), k - 1),
-                             0.0)
-    sigmas = np.full(k, max(x.std() / max(k, 1), 2 * sigma_floor))
-    w = np.full(k, 1.0 / k)
+    Probability that a random contiguous window of seq equals pattern.
 
-    previous, loglik = -np.inf, -np.inf
-    resp = np.zeros((n, k))
-    for _ in range(max_iter):
-        logp = _dwell_logpdf(x, mus, sigmas) + np.log(w)
-        peak = logp.max(axis=1)
-        total = peak + np.log(np.exp(logp - peak[:, None]).sum(axis=1))
-        loglik = float(total.sum())
-        resp = np.exp(logp - total[:, None])
-
-        mass = resp.sum(axis=0) + 1e-12
-        w = mass / n
-        # component 0 keeps mu = 0, so its scale is the second moment about 0
-        sigmas[0] = max(np.sqrt((resp[:, 0] * x ** 2).sum() / mass[0]),
-                        sigma_floor)
-        for j in range(1, k):
-            mus[j] = (resp[:, j] * x).sum() / mass[j]
-            sigmas[j] = max(
-                np.sqrt((resp[:, j] * (x - mus[j]) ** 2).sum() / mass[j]),
-                sigma_floor)
-        if loglik - previous < tol * max(abs(loglik), 1.0):
-            break
-        previous = loglik
-    return {"w": w, "mus": mus, "sigmas": sigmas, "loglik": loglik,
-            "resp": resp, "k": k}
-
-
-def fit_dwell_mixture(run_samples, step_ms, max_k=DWELL_MAX_K,
-                      restarts=DWELL_RESTARTS, seed=DWELL_SEED):
-    """GMM on log dwell time for one state, K chosen by BIC.
-
-    run_samples is each run's length in samples and step_ms the sampling step,
-    so x = log(dwell / step) and x = 0 is a one-sample run.
-
-    Each cluster is reported in milliseconds through its own 16th, 50th and
-    84th percentiles:
-
-        mu    = step * exp(mu_j)
-        sigma = step * [exp(mu_j + s_j) - exp(mu_j - s_j)] / 2
-
-    the half-width of the one-sigma interval on the duration scale. It is
-    asymmetric in reality, so sigma is a scale rather than a symmetric bar.
+    k=None -> compare only against windows of the same length as pattern
+    k=int  -> compare against all windows of length 1..k
     """
-    lengths = np.asarray(run_samples, dtype=np.float64)
-    if lengths.min() < 1:
-        raise ValueError(f"a run of {lengths.min():g} samples is impossible — "
-                         f"run_lengths returns counts of at least 1")
-    n = len(lengths)
-    # K is bounded by the data: 20 runs per component, and no more components
-    # than there are distinct durations to tell apart.
-    k_top = int(min(max_k, max(n // 20, 1), len(np.unique(lengths))))
-    rng = np.random.default_rng(seed)
-    x = np.log(lengths)
+    seq, pattern = np.asarray(list(seq)), np.asarray(list(pattern))
+    n, L = len(seq), len(pattern)
+    if L == 0 or L > n or (k is not None and L > k):
+        return 0.0
 
-    fits, table = {}, []
-    for k in range(1, k_top + 1):
-        best = None
-        for r in range(restarts if k > 1 else 1):
-            trial = _dwell_em(x, k, rng, jitter=0.0 if r == 0 else 0.2)
-            if best is None or trial["loglik"] > best["loglik"]:
-                best = trial
-        m = 3 * k - 2
-        best["n_params"] = m
-        best["bic"] = m * np.log(n) - 2 * best["loglik"]
-        best["aic"] = 2 * m - 2 * best["loglik"]
-        fits[k] = best
-        table.append({"K": k, "n_params": m, "loglik": best["loglik"],
-                      "AIC": best["aic"], "BIC": best["bic"]})
-    selection = pd.DataFrame(table)
-    k_hat = int(selection.loc[selection["BIC"].idxmin(), "K"])
-    chosen = fits[k_hat]
+    windows = sliding_window_view(seq, L)               # shape (n-L+1, L)
+    count = np.all(windows == pattern, axis=1).sum()
 
-    # Ascending duration, so class 0 is the briefest for every state.
-    order = np.argsort(chosen["mus"])
-    resp = chosen["resp"][:, order]
-    assignment = resp.argmax(axis=1)
-    w, mus, sigmas = (chosen["w"][order], chosen["mus"][order],
-                      chosen["sigmas"][order])
-    pinned = int(np.flatnonzero(order == 0)[0])
+    if k is None:
+        total = n - L + 1
+    else:
+        lengths = np.arange(1, k + 1)
+        total = np.clip(n - lengths + 1, 0, None).sum()
 
-    components = pd.DataFrame([{
-        "class": j, "weight": float(w[j]),
-        "n_runs": int((assignment == j).sum()),
-        "mu_ms": float(step_ms * np.exp(mus[j])),
-        "sigma_ms": float(step_ms * (np.exp(mus[j] + sigmas[j])
-                                     - np.exp(mus[j] - sigmas[j])) / 2),
-        "p16_ms": float(step_ms * np.exp(mus[j] - sigmas[j])),
-        "p84_ms": float(step_ms * np.exp(mus[j] + sigmas[j])),
-    } for j in range(k_hat)])
-
-    return {"k": k_hat, "x": x, "step_ms": step_ms, "assignment": assignment,
-            "resp": resp, "w": w, "mus": mus, "sigmas": sigmas,
-            "pinned": pinned, "components": components,
-            "selection": selection, "fits": fits, "lengths": lengths}
+    return count / total
 
 
-def dwell_classes(fit, max_k=DWELL_MAX_K, seed=DWELL_SEED, verbose=True):
-    """Every run of the state sequence, tagged with a duration cluster.
+def run_sequence(fit):
+    """The state of every run, in order, with -1 where the chain is broken.
 
-    One GMM per state, so the clusters are that state's own. Each symbol is
-    written out as "State 0 (10 +/- 1 ms)" — the state, and the mean and SD
-    of the cluster the run fell in.
-
-    A run is one contiguous stretch of a single state inside one segment. The
-    unlabelled runs (state -1, below min_frac) are kept in the table as
-    boundaries but take no part in a fit and none in a sequence.
+    Segment joins become -1 (minor states keep their own labels). No pattern
+    contains -1, so a window spanning a join can never match one — it still
+    counts in the denominator, which the handful of joins barely moves.
     """
-    z = fit["states_obs"]
-    run_state, run_start, run_len = run_lengths(z, fit["segment_starts"])
-    step_ms = 1e3 / fit["rate"]
-    labelled = run_state >= 0
-
-    cls = np.full(len(run_state), -1, dtype=int)
-    mixtures = {}
-    for s in range(fit["n_states"]):
-        sel = run_state == s
-        mixtures[s] = fit_dwell_mixture(run_len[sel], step_ms, max_k=max_k,
-                                        seed=seed)
-        cls[sel] = mixtures[s]["assignment"]
-
-    runs = pd.DataFrame({
-        "state": run_state, "start": run_start, "n_samples": run_len,
-        "dwell_ms": run_len * step_ms, "class": cls,
-        "new_segment": np.isin(run_start, fit["segment_starts"])})
-
-    vocabulary = {}
-    for (s, c), group in runs[labelled].groupby(["state", "class"]):
-        row = mixtures[int(s)]["components"].set_index("class").loc[int(c)]
-        vocabulary[(int(s), int(c))] = {
-            "label": (f"State {int(s)} ({row['mu_ms']:.0f}$\\pm$"
-                      f"{row['sigma_ms']:.0f} ms)"),
-            "mu_ms": float(row["mu_ms"]), "sigma_ms": float(row["sigma_ms"]),
-            "n": int(len(group))}
-
-    if verbose:
-        print("\ndwell-time clusters, one GMM per state on "
-              f"x = log(dwell / {step_ms:.0f} ms), K by BIC over 1..{max_k}: "
-              + ", ".join(f"state {s} K={mixtures[s]['k']}"
-                          for s in sorted(mixtures))
-              + f" | {len(vocabulary)} symbols over {int(labelled.sum())} runs")
-    return {"runs": runs, "mixtures": mixtures, "vocabulary": vocabulary,
-            "step_ms": step_ms}
+    run_state, run_start, _ = run_lengths(fit["states_obs"],
+                                          fit["segment_starts"])
+    pieces = []
+    for state, new_segment in zip(run_state,
+                                  np.isin(run_start, fit["segment_starts"])):
+        if new_segment and pieces:
+            pieces.append(-1)
+        pieces.append(int(state))
+    return np.array(pieces, dtype=int)
 
 
-def symbol_sequences(dwell, length=2):
-    """Counts of every (state, duration class) sequence of `length` runs.
+def state_sequences(fit, lengths=None):
+    """Every pattern of 2..k states that occurs, with its subseq_prob.
 
-    A sequence is `length` consecutive runs, so length 2 is one transition.
-    Sequences are broken at segment joins and at unlabelled runs, since
-    neither is a transition the chain made.
+    k is the number of states the model reports, K_hat — the major states.
+    Minor states still appear inside patterns; they only do not set k, which
+    would otherwise run to the truncation level. Each distinct window of the
+    run sequence free of breaks is a candidate pattern.
     """
-    runs = dwell["runs"]
-    state = runs["state"].values
-    cls = runs["class"].values
-    boundary = runs["new_segment"].values | (state < 0)
-
-    counts = {}
-    for piece in np.split(np.arange(len(state)), np.flatnonzero(boundary)):
-        piece = piece[state[piece] >= 0]
-        for i in range(len(piece) - length + 1):
-            key = tuple((int(state[j]), int(cls[j]))
-                        for j in piece[i:i + length])
-            counts[key] = counts.get(key, 0) + 1
-    if not counts:
-        raise ValueError(
-            f"no run of {length} consecutive labelled runs survives the "
-            f"segment breaks — the segments are shorter than the sequences "
-            f"being counted")
-
-    vocabulary = dwell["vocabulary"]
-    frame = pd.DataFrame({
-        "sequence": [" → ".join(vocabulary[sym]["label"] for sym in key)
-                     for key in counts],
-        "first_state": [key[0][0] for key in counts],
-        "count": list(counts.values())})
-    frame["share"] = frame["count"] / frame["count"].sum()
-    return frame.sort_values("count", ascending=False).reset_index(drop=True)
+    if fit["n_states"] < 2:
+        raise ValueError(f"the model kept {fit['n_states']} state — there is "
+                         f"no sequence of states to count")
+    k = max(fit["n_major"], 2)
+    seq = run_sequence(fit)
+    lengths = range(2, k + 1) if lengths is None else lengths
+    rows = []
+    for L in lengths:
+        if L > len(seq):
+            continue
+        windows = sliding_window_view(seq, L)
+        patterns = np.unique(windows[(windows >= 0).all(axis=1)], axis=0)
+        for pattern in patterns:
+            rows.append({"length": L,
+                         "sequence": " → ".join(str(s) for s in pattern),
+                         "states": tuple(int(s) for s in pattern),
+                         "first_state": int(pattern[0]),
+                         "p": subseq_prob(seq, pattern, k=k)})
+    return (pd.DataFrame(rows)
+            .sort_values(["length", "p"], ascending=[True, False])
+            .reset_index(drop=True))
 
 
-def plot_state_sequences(session, fit, dwell, lengths=SEQUENCE_LENGTHS,
-                         top=SEQUENCE_TOP):
-    """The commonest symbol sequences, as a share of all sequences observed.
+def plot_state_sequences(session, fit, top=SEQUENCE_TOP):
+    """The commonest state sequences of each length 2..k, by subseq_prob.
 
-    A symbol is a state together with the duration cluster the run fell in,
-    written out as its mean and SD in milliseconds. Stacked one panel per
-    length so the sequences have room to be spelled out; each bar is coloured
-    by the state it starts in.
+    One panel per length, bars coloured by the state the sequence starts in.
     """
-    frames = [symbol_sequences(dwell, length).head(top) for length in lengths]
+    table = state_sequences(fit)
+    lengths = sorted(table["length"].unique())
+    frames = [table[table["length"] == L].head(top) for L in lengths]
     fig, axes = plt.subplots(len(lengths), 1,
-                             figsize=(11, 0.52 * sum(len(f) for f in frames)
-                                      + 1.6 * len(lengths)),
+                             figsize=(9, 0.42 * sum(len(f) for f in frames)
+                                      + 1.4 * len(lengths)),
                              squeeze=False)
-    fig.suptitle(f"{session['label']} — commonest state sequences, "
-                 f"top {top} of each length")
-    for ax, length, frame in zip(axes[:, 0], lengths, frames):
+    fig.suptitle(f"{session['label']} — commonest state sequences, top {top} "
+                 f"of each length (windows of 1..{max(fit['n_major'], 2)} "
+                 f"runs)")
+    for ax, L, frame in zip(axes[:, 0], lengths, frames):
         y = np.arange(len(frame))[::-1]
-        ax.barh(y, 100 * frame["share"],
+        ax.barh(y, 100 * frame["p"],
                 color=[fit["cmap"](s) for s in frame["first_state"]])
-        for yi, share in enumerate(frame["share"]):
-            ax.text(100 * share, y[yi], f"  {100 * share:.1f}%", va="center",
+        for yi, p in zip(y, frame["p"]):
+            ax.text(100 * p, yi, f"  {100 * p:.2f}%", va="center",
                     fontsize=8, color="0.3")
         ax.set_yticks(y)
-        ax.set_yticklabels(frame["sequence"], fontsize=8)
-        ax.set_xlim(0, 100 * frame["share"].max() * 1.18)
-        ax.set_xlabel("Share of all sequences of this length (%)", fontsize=9)
-        ax.set_title(f"{length} consecutive runs "
-                     f"({length - 1} transition{'s' if length > 2 else ''})",
-                     fontsize=10)
+        ax.set_yticklabels(frame["sequence"], fontsize=9)
+        ax.set_xlim(0, 100 * frame["p"].max() * 1.2)
+        ax.set_title(f"{L} runs", fontsize=10)
+    axes[-1, 0].set_xlabel("P(random window = sequence) (%)", fontsize=9)
     fig.tight_layout()
     plt.show()
     plt.close(fig)
+    return table
+
+
+def top_sequence_per_state(table, n_states, verbose=True):
+    """The commonest sequence involving each state, with no sequence twice.
+
+    States in order 0, 1, ...; for each, the highest-P sequence it appears in
+    that no earlier state has already claimed. So when one very frequent
+    sequence is the top for several states, the first takes it and the rest
+    fall through to their next best. A state with nothing left is reported
+    as such.
+    """
+    ranked = table.sort_values("p", ascending=False)
+    taken, rows = set(), []
+    for s in range(n_states):
+        mine = ranked[ranked["states"].apply(lambda st: s in st)
+                      & ~ranked["sequence"].isin(taken)]
+        if not len(mine):
+            rows.append({"state": s, "sequence": "(none left)", "p": np.nan})
+            continue
+        best = mine.iloc[0]
+        taken.add(best["sequence"])
+        rows.append({"state": s, "sequence": best["sequence"],
+                     "p": float(best["p"])})
+    frame = pd.DataFrame(rows).set_index("state")
+    if verbose:
+        print("\ncommonest sequence involving each state, no sequence repeated")
+        show_table(frame.round(4))
+    return frame
 
 
 def leaving_matrix(z, n_states):
@@ -2781,7 +3031,8 @@ def leaving_matrix(z, n_states):
     state goes once it does leave.
     """
     trans = np.zeros((n_states, n_states))
-    pairs = (z[:-1] >= 0) & (z[1:] >= 0)
+    inside = (z >= 0) & (z < n_states)
+    pairs = inside[:-1] & inside[1:]
     np.add.at(trans, (z[:-1][pairs], z[1:][pairs]), 1)
     np.fill_diagonal(trans, 0)
     return trans / np.maximum(trans.sum(axis=1, keepdims=True), 1)
@@ -3648,9 +3899,12 @@ OBS_SPEC = {
     # lag_span_s / n_lags, and that is the grid everything is built on. The
     # LFP is recorded at 1250 Hz, so asking for a step shorter than 0.8 ms is
     # an error. Cost goes as (n_lags * n_observations)^2.
-    "lag_span_s": 0.100,
-    "n_lags": 10,
-    "bin_method": "median",   # per bin, for bands: median | mean | max | sum
+    # 4 lags across 120 ms = 30 ms steps, ~33 Hz.
+    "lag_span_s": 0.120,
+    "n_lags": 4,
+    # mean, not median: a sharp-wave ripple is a brief large excursion of the
+    # ripple envelope, and a median over a 30 ms bin discards exactly that
+    "bin_method": "mean",     # per bin, for bands: median | mean | max | sum
 
     "bands": {
         "use": True,
@@ -3675,14 +3929,14 @@ OBS_SPEC = {
         # CA1 interneurons is a matter of deleting the line. None here means
         # every pair the recording has. A pair it lacks is an error.
         "groups": [
-            #("CA1", "Pyramidal Cell"),
-            #("CA1", "Narrow Interneuron"),
+            ("CA1", "Pyramidal Cell"),
+            ("CA1", "Narrow Interneuron"),
             #("CA1", "Wide Interneuron"),
             ("CA3", "Pyramidal Cell"),
             ("CA3", "Narrow Interneuron"),
             #("CA3", "Wide Interneuron"),
-            ("RSC", "Pyramidal Cell"),
-            ("RSC", "Narrow Interneuron"),
+            #("RSC", "Pyramidal Cell"),
+            #("RSC", "Narrow Interneuron"),
             #("RSC", "Wide Interneuron"),
         ],
         "min_units": 3,          # smaller pairs are reported, not used
@@ -3733,13 +3987,19 @@ RUN_START_S = None
 # a warning with the three diagnostics and keeps going with what it has.
 # RUN_BURN_IN must be below RUN_MAX_ITER, and the first stationarity check
 # needs 2 x RUN_CHECK_EVERY retained iterations before it can fire.
-RUN_MAX_ITER = 60
-RUN_BURN_IN = 20
+RUN_MAX_ITER = 100
+RUN_BURN_IN = 30
 RUN_EARLY_STOP = True
 RUN_CHECK_EVERY = 10          # how often stationarity is tested, and reported
 RUN_GEWEKE_TOL = 2.0          # |z| below this counts as stationary
 
-RUN_KAPPA = 50.0              # sticky bias: bigger = longer dwell times
+# Which model. "negbin" is the HDP-AR-HSMM with a negative-binomial dwell per
+# state, fitted with everything else; "geometric" is the same with r = 1,
+# which is what Lehman et al. ran; "sticky" is the previous model.
+RUN_DURATION = "negbin"
+RUN_R_MAX = 10                # shortest dwell a state can demand, in steps
+RUN_DUR_PRIOR_S = 0.3         # prior mean dwell; weak, alpha0 = 1
+RUN_KAPPA = 50.0              # sticky bias, "sticky" only
 RUN_L = 20                    # truncation; raise it if K_hat lands on L-1
 RUN_WINDOW_S = 8.0
 RUN_WINDOW_START_S = None     # None = the window covering the most states
@@ -3748,9 +4008,8 @@ RUN_METHODS = ("PCA", "KernelPCA", "Laplacian")
 # What the states look like as dynamics, and the order they come in.
 RUN_AR_MAP_LAGS = 5           # lags shown in the AR coefficient heatmaps
 
-# Sequences treat dwell time distributions as symbols
-RUN_SEQUENCE_LENGTHS = (2, 3)
-RUN_DWELL_MAX_K = 5
+# Sequences are over the run order; lengths 2..k with k = number of states
+RUN_SEQUENCE_TOP = 5          # sequences shown per length
 RUN_MIN_SEGMENT_S = 1.0       # clean stretch below this is dropped, not fitted
 
 # T^2 (inside the retained subspace) and Q (the residual outside it) per
@@ -3819,18 +4078,20 @@ fit = fit_states(session, obs, minutes=RUN_MINUTES, segment_s=RUN_SEGMENT_S,
                  max_iter=RUN_MAX_ITER, burn_in=RUN_BURN_IN,
                  stop_when_stationary=RUN_EARLY_STOP,
                  check_every=RUN_CHECK_EVERY, geweke_tol=RUN_GEWEKE_TOL,
-                 kappa=RUN_KAPPA, L=RUN_L)
+                 kappa=RUN_KAPPA, L=RUN_L, duration=RUN_DURATION,
+                 r_max=RUN_R_MAX, dur_prior_s=RUN_DUR_PRIOR_S)
 state_table = state_characterization(session, fit)
 plot_arhmm(session, fit, state_table)
+if fit["duration"] != "sticky":
+    plot_dwell_fit(session, fit)
 plot_observation_distributions(session, fit)
 # again, now shaded by state and carrying P(z_t = k | Y) beneath the traces
 plot_observations(session, obs, fit=fit)
 
-# 6b. what the states are as dynamics, and what order they come in. The
-#     duration classes are fitted once here and reused by the sequence plot.
+# 6b. what the states are as dynamics, and what order they come in
 plot_state_dynamics(session, fit, max_lags=RUN_AR_MAP_LAGS)
-dwell = dwell_classes(fit, max_k=RUN_DWELL_MAX_K)
-plot_state_sequences(session, fit, dwell, lengths=RUN_SEQUENCE_LENGTHS)
+sequence_table = plot_state_sequences(session, fit, top=RUN_SEQUENCE_TOP)
+top_per_state = top_sequence_per_state(sequence_table, fit["n_states"])
 
 # 7. is any state harder for the manifold than the label shuffle expects?
 q_table = plot_state_monitoring(session, embeddings, fit, methods=RUN_METHODS,
