@@ -1,8 +1,89 @@
+# Overview and Dates
+
+# Note end of day October 23rd
+
+I think I've had a breakthrough, I came up with the idea to apply CCA to create shared components,
+by plotting curves of the proscrutes distance between the next lag down for each space as a component of k,
+I was inspired by the 2009 mulitscale PCA plot.  I de think though that, what we need to do is going to be
+related to the lipschitz bound, we need to prove that for each step down the lag, So you could compose
+a smooth map out of the lags that each preserves the whole graph for Gronwalls inequatity to hold.
+
+I need to think on this a bit more.  I feel like this must be tied to perturbation theory somehow.  Or alternatively,
+it may have to do with the numbers of k you need to retain...
+
+I have to read that algortihic paper on the COnloey-Morse Graph
+
+
+The doe is here:"""
+It’s in cca_conley_morse.py, in two pieces (the plotting isn’t wrapped in a function — it’s inline cell code):
+
+The metric: procrustes_resid(Xc, Yc) — defined in the cell marked # %% ... Procrustes distances (~line 140). Computes ‖X·R − Y‖_F / ‖Y‖_F with R = UVᵀ from SVD(XᵀY).
+The curve data: immediately below it, the loop filling proc_next[k-1, li] = procrustes_resid(variates[li][:, :k], variates[li+1][:, :k]) — one row per k, one column per consecutive lag pair. (proc_mat right after is the heat-map version.)
+The plot itself: in the next cell (# %% ... figures 1 + 2, ~line 160), the block drawing on axP — the for k in range(K_MODEL): axP.plot(mid, proc_next[k], ...) loop, saved into cca_procrustes.png (left panel).
+
+The per-pair visualization (clouds rotated onto the bigger lag’s frame) is the separate last cell, # %% ... rotation+stretch visualization, saved as cca_rotation.png.
+
+If you’re folding this into your Hydrangea repo, worth extracting steps 1–2 into a function like procrustes_curve(variates, k_max) so your own pipeline can call it on any set of per-lag embeddings — happy to refactor it that way if useful.
+"""
+
+# Week of October 23rd
+
+Leaping straight into the Hybrid system is not a great idea, it may prove to be a computational formality (which I will discuss
+in a second) or it may prove instead to be useful if time-varying lipshitz constants prove to be unable to be estimated below
+the particular lag.  
+
+Conley-Morse Graphs have proved significantly more interesting on the other hand, but connections to hybrid dynamic systems remain
+in my mind.  The conley-morse graph relies on a box cutting (look up the specific method) algorithm, that goes down its
+notion of space (epsilon) and time (tau) down certain lags on each to find regions of invariant sets.  The definition
+of the invariant set comes from Grönwall's inequality
+
+So somehting I am struggling a bit with is the circularity of the analysis, we have no spatial measures and indeed we want
+estimates of attractors in neural space.  
+
+
+Romero, A. T., & Vieira, E. R. (2021). Existence of periodic orbits for piecewise-smooth vector fields with sliding region via Conley theory. arXiv preprint arXiv:2106.15569.
+- applied the conley index to wilson-cowan models and race to threshold models, its very interesting
+
+Rivas, B., Iwasaki, K., Kalies, W., Bloch, A., & Ghaffari, M. (2025). Topological Dynamics via Learned Hybrid Systems. arXiv preprint arXiv:2511.08737.
+- this paper compares a computed morse graph, vs a switching latent system
+- not sure if it contains the solution to the the "latent Grönwall knot"
+
+
+ My possible solution:  CCA between scales, becasue PCA across them will not preserve commutivity.  
+ i.e you can be sure the component 1 and scale 1 is the same latent.
+ 
+ There are mathematical arguments to ensure you go from the top down:
+ Dey, T. K., Lipiński, M., Mrozek, M., & Slechta, R. (2022). Tracking dynamical features via continuation and persistence. arXiv preprint arXiv:2203.05727.
+
+
+CCA appears to work because the box cutting will hold under compact sets, which is a linear rotation of the original set,
+Mrozek, M. (1999). An algorithmic approach to the Conley index theory. Journal of Dynamics and Differential Equations, 11(4), 711-734.
+https://ww2.ii.uj.edu.pl/~mrozek/papers/aacit-revised.pdf
+- you can visualize this by showing the CCA "grids"
+- compare them to PCA grids stabilities and show that it limits certain claims you can make downstream about the latents
+- the ranked grid alignment across the log scales may then itself be a 
+We could compare the magnitude of changes across the 
+
+# Week of october 15th
+
+Started getting interested in hybrid dynamic systems found methods for it in Conley-Morse Graphs and Hybrid Dynamic system.
+
+It seems appealing, conley index could be useful to characterize regions from a global attractor then zoom down into them.
+
+Started learning about glueing methods and what makes the Conley-Morse Graph estimateable.
+
 # Seeking empirical Evidence of Hybrid Dynamics
 
 In this folder we will begin by using the Lipschitz-Constant espescially, to look for Evidence of Hybrid dynamics in various neural datasets.  There, needs to be evidence of sudden regime shifts, and these regime shifts should be occuring in the main locations of a phase space.  While sudden regime changes are well documented in neuroscience (up/down cortical states, sleep wake, certian models of decision making in LIP which has a step), we need to characterize thema. bit to see if these exhibit what could be argued to be hybrid dynamics, and not mearly stochastic switching dynamics.
 
 We require evidence of rapid switching at similar times poiints ideally, by similar neurons.
+
+## Identifying optimal tau, window size, for computing covariance matrix for SVD
+
+Little, A. V., Lee, J., Jung, Y. M., & Maggioni, M. (2009, August). Estimation of intrinsic dimensionality of samples from noisy low-dimensional manifolds in high dimensions with multiscale SVD. In 2009 IEEE/SP 15th Workshop on Statistical Signal Processing (pp. 85-88). IEEE.
+https://jasondlee88.github.io/papers/ssp09.pdf 
+- they used standard deviation we can instead plot a smooth estimator of the lipschwitz constant
+
 
 ## A proposal for identifying Sliding Lipschitz Constants in neural data
 
@@ -204,3 +285,12 @@ its not based on any exist publication but it had this note:
 6. Lipschitz / Grönwall β, if you want it. Use finite-size Lyapunov exponents. 
 Pick pairs of trials whose latents are within δ₀ at time t, and compute λ(τ) = (1/τ) log(‖δ(τ)‖ / ‖δ₀‖). 
 Then subtract the noise contribution using the same fit: δ²(τ) ≈ e^{2λτ}δ₀² + bτ + c.
+
+
+## Discussion Points:
+
+Future work may determine if the noise limit here is truly browning or measurement effect.  Theoretical work
+has been shown that deterministic high dimensional networks may appear noisey due to undersampling.
+
+Sompolinsky, H., Crisanti, A., & Sommers, H. J. (1988). Chaos in random neural networks. Physical Review Letters, 61(3), 259.
+-find more references like this and verify
