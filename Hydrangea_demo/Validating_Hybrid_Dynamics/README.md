@@ -1,5 +1,33 @@
 # Overview and Dates
 
+## Readings from the papers found today to solve and side step identified problems (accoridng to claude)
+It seems like we may be abel to side step the CCA
+
+**Bailon et al. (2026) — what to read**
+
+- Definitions 1.2–1.3: defines attracting block and tolerance, the two objects that replace ε-chains in this framework.
+- Theorem 1.4 and Corollary 2.2 (statements only): the condition under which a latent attracting block pulls back to an attracting block, and so an attractor, in the full system.
+- Section 3.2: how CMGDB turns a map on a grid into a directed graph and a Morse graph; this is the τ-ε machinery in combinatorial form.
+- Section 4.2: what happens when grid resolution and model error interact — two coarsening moves that reconcile mismatched Morse graphs, which maps onto your bin-width comparisons.
+- Table 9 with Section A.4: evidence that the residual bound fails while the recovered structure holds, which sets how much to trust the method on data.
+
+**Rivas et al. (2026) — what to read**
+
+- Definition 4.3 and Figure 1: the outer approximation property, stated in one line and one picture; this is the object your chains become.
+- Proposition 4.4 with its proof: the padding argument that converts a model-error bound δ into an outer approximation of the true flow; the proof runs four lines and your background covers it.
+- Section 4.2: how Morse sets, Morse graphs, and regions of attraction fall out of graph reachability.
+- Tables 1–2 and the surrounding commentary: how the switching-system construction compares against Lipschitz and Gaussian-process constructions, and why each rival fails.
+
+**Synthesis for the journal**
+
+The τ-ε chain construction appears circular because chains are defined through the dynamics they are meant to recover. Both papers cut the circle the same way: fit a surrogate model to the data, discretize its domain into boxes, and map each box to the set of boxes its image can touch, with padding. The ε of a chain becomes box diameter plus padding; the τ becomes the time step or bin width; chain recurrence becomes the strongly connected components of a directed graph, computed once. Attractors, saddles, and repellers are then read off the Morse graph through Conley indices. What differs is the surrogate and the transfer argument. Rivas et al. fit a switching vector field in two dimensions and transfer through a flow-error bound (Proposition 4.4); this requires ẋ and low dimension. Bailon et al. fit an encoder and a latent map, compute in one to three latent dimensions, and transfer through a residual-versus-tolerance inequality (Theorem 1.4); this requires consecutive state pairs, which binned population rates supply. For neural data the Bailon et al. route is the one to implement, with the bin width playing the role of τ and the residual check reported as a diagnostic rather than a certificate.
+
+**References**
+
+Bailon, P., Gameiro, M., Gelb, B., Kalies, W., Kramar, M., Mischaikow, K., Rivas, B., & Vieira, E. (2026). *Characterizing high-dimensional dynamics by combinatorial-topological methods on a latent space* [Preprint]. arXiv.
+
+Rivas, B., Kalies, W., Iwasaki, K., Bloch, A., & Ghaffari, M. (2026). Topological dynamics via learned hybrid systems. *Proceedings of Machine Learning Research*. Advance online publication.
+
 # Note end of day October 23rd
 
 I think I've had a breakthrough, I came up with the idea to apply CCA to create shared components,
@@ -25,6 +53,36 @@ The per-pair visualization (clouds rotated onto the bigger lag’s frame) is the
 
 If you’re folding this into your Hydrangea repo, worth extracting steps 1–2 into a function like procrustes_curve(variates, k_max) so your own pipeline can call it on any set of per-lag embeddings — happy to refactor it that way if useful.
 """
+
+Some incredibly important references from todays work:
+Bailon, P., Gameiro, M., Gelb, B., Kalies, W., Kramar, M., Mischaikow, K., ... & Vieira, E. (2026). 
+Characterizing High-dimensional Dynamics by Combinatorial-Topological Methods on a Latent Space. 
+arXiv preprint arXiv:2609.01509.
+-examines bounds needed for latent models using autoencoders, relevant to our CCA apprach
+
+Rivas, B., Iwasaki, K., Kalies, W., Bloch, A., & Ghaffari, M. (2025). Topological Dynamics via Learned 
+Hybrid Systems. arXiv preprint arXiv:2511.08737.
+-this may offer a side step to the one above
+-in section 4.1 they cite  Viera et al., (2022) posted below (at this url https://arxiv.org/abs/2202.08383)
+-
+
+Morse Graphs: Topological Tools for Analyzing the Global Dynamics of Robot Controllers
+Ewerton R. Vieira, Edgar Granados, Aravind Sivaramakrishnan, Marcio Gameiro, Konstantin Mischaikow, Kostas E. Bekris (2022)
+https://arxiv.org/abs/2202.08383
+
+This is the refrence for the flavor of CCA we are using in computing the tau-epsilon-chain CCA
+Sørensen, M., Kanatsoulis, C. I., & Sidiropoulos, N. D. (2021). Generalized canonical correlation analysis: 
+A subspace intersection approach. IEEE Transactions on Signal Processing, 69, 2452-2467.
+https://arxiv.org/pdf/2003.11205
+
+This may have been cited earlier but it shows that overlapping comapct sets, not eact grids are whats needed for
+the epsilon-tau chains to be computed to get our morse-conley graph.
+Mrozek, M. (1999). An algorithmic approach to the Conley index theory. 
+Journal of Dynamics and Differential Equations, 11(4), 711-734.
+
+Lastly this paper has a great section on the lipschitz-bound, the method is cited in 
+
+
 
 # Week of October 23rd
 
