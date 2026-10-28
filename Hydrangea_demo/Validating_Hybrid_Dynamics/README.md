@@ -1,6 +1,35 @@
 # Overview and Dates
 
-## Readings from the papers found today to solve and side step identified problems (accoridng to claude)
+## Important papers today oct 27th
+
+We have a few options one is an autoencoder method, Im a lot more familiar with this method but on the otherhand it "feels" od to further force down
+a 6D linear embedding dimension (by CCA and PCA) into a smaller space 
+
+
+Kalies, W., Rivas, B., & Wehbe, T. (2026). Computation of Attractor Lattices for a Class of Hybrid Systems. arXiv preprint arXiv:2610.15123.
+-I'm still working out my intuition on this but...
+-so one of the key results in this that I'd still working out is in 
+preliminaries 2.1 it lays out how in practice any binary set it equivilent to
+a grid and can be used to define interiors that share a closure, or unions within the set
+-in practice this means almost any set, even sets computed as epsilon balls in R^n can be grid like.  This brings the attractor landscape, our delay embedding back to Conley-Morse Graph DB machinery we need
+
+-figure 1 shows how we can treat this as a cylindar that exists for 1 time
+step, im thinking we define it based on the lipschitz bound, that lets us
+basically treat it piece wise (this paper is the citation we can have for this to be valid)
+
+
+
+
+
+Gameiro, M., Gelb, B., & Mischaikow, K. (2025). Rigorously Characterizing Dynamics with Machine Learning. arXiv preprint arXiv:2505.17302.
+-small note on the explicit Lipschitz bound,
+-discusses using autoencoders to push dynamics down into smaller spaces
+-shows you can compte exact lipschitz bounds to provide lyaoponov stabilit
+
+
+
+
+## Readings from the papers found (Oct 26th) to solve and side step identified problems (accoridng to claude)
 It seems like we may be abel to side step the CCA
 
 **Bailon et al. (2026) — what to read**
