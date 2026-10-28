@@ -1,0 +1,290 @@
+{
+  "seed": 11,
+  "dt_ms": 1.0,
+  "duration_s": 160.0,
+  "output_dir": "output",
+  "maze": {
+    "side_m": 1.0
+  },
+  "states": {
+    "names": [
+      "WALK",
+      "STILL"
+    ],
+    "initial": "STILL",
+    "dwell_mean_s": {
+      "WALK": 14.0,
+      "STILL": 10.0
+    },
+    "dwell_sigma_log": 0.35,
+    "transition_matrix": {
+      "WALK": {
+        "WALK": 0.0,
+        "STILL": 1.0
+      },
+      "STILL": {
+        "WALK": 1.0,
+        "STILL": 0.0
+      }
+    }
+  },
+  "locomotion": {
+    "max_speed_m_s": 0.45,
+    "min_target_fraction": 0.5,
+    "ramp_tau_s": 1.2,
+    "speed_noise_sd": 0.03,
+    "target_change_rate_hz": 0.3,
+    "theta_base_hz": 8.0,
+    "theta_speed_slope_hz_per_m_s": 2.5
+  },
+  "swr": {
+    "rate_hz": 0.6,
+    "refractory_ms": 150,
+    "duration_median_ms": 80,
+    "duration_sigma_log": 0.3,
+    "duration_min_ms": 40,
+    "duration_max_ms": 220,
+    "gain_median": 1.0,
+    "gain_sigma_log": 0.35,
+    "ripple_freq_range_hz": [
+      150,
+      200
+    ],
+    "ripple_depth": 0.5,
+    "replay": {
+      "memory_size": 25,
+      "recency_tau": 4.0,
+      "sequence_window_s": 2.0,
+      "min_cells_per_sequence": 20,
+      "subsample_fraction": 0.1,
+      "p_random": 0.2,
+      "random_fraction": 0.2,
+      "p_reverse": 0.5,
+      "drive": 2.6,
+      "pulse_ms": 12
+    }
+  },
+  "populations": {
+    "pyramidal": {
+      "n": 240,
+      "tau_m_ms": 20.0,
+      "beta": 4.0,
+      "r0_hz": 20.0,
+      "refractory_ms": 2.0,
+      "tuning": {
+        "field_sd_m": 0.12,
+        "amp": 1.4,
+        "center_jitter_m": 0.03,
+        "burst_coupling": 1.0,
+        "precession_rad_per_sd": 1.0
+      },
+      "states": {
+        "WALK": {
+          "baseline": -0.15,
+          "noise_sd": 0.2,
+          "stim_gain": 1.0,
+          "osc_depth": 0.45,
+          "osc_phase": 3.1416,
+          "burst_prob": 0.12,
+          "burst_n": 3,
+          "burst_isi_ms": 6.0,
+          "noise_tau_ms": 5.0
+        },
+        "STILL": {
+          "baseline": -0.1,
+          "noise_sd": 0.35,
+          "stim_gain": 0.45,
+          "osc_depth": 0.0,
+          "burst_prob": 0.05,
+          "burst_n": 2,
+          "burst_isi_ms": 7.0,
+          "noise_tau_ms": 10.0
+        },
+        "SWR": {
+          "baseline": 0.0,
+          "noise_sd": 0.05,
+          "stim_gain": 1.0,
+          "osc_depth": 0.0,
+          "osc_phase": 0.0,
+          "burst_prob": 0.6,
+          "burst_n": 4,
+          "burst_isi_ms": 5.0,
+          "tau_m_ms": 5.0,
+          "noise_tau_ms": 3.0
+        }
+      }
+    },
+    "basket_pv": {
+      "n": 32,
+      "tau_m_ms": 8.0,
+      "beta": 4.0,
+      "r0_hz": 30.0,
+      "refractory_ms": 1.5,
+      "tuning": {
+        "field_sd_m": 1.2,
+        "amp": 0.25,
+        "burst_coupling": 0.0
+      },
+      "states": {
+        "WALK": {
+          "baseline": 0.62,
+          "noise_sd": 0.08,
+          "stim_gain": 1.0,
+          "osc_depth": 0.6,
+          "osc_phase": 0.0,
+          "burst_prob": 0.0,
+          "burst_n": 1,
+          "noise_tau_ms": 5.0
+        },
+        "STILL": {
+          "baseline": 0.0,
+          "noise_sd": 0.4,
+          "stim_gain": 0.3,
+          "osc_depth": 0.0,
+          "burst_prob": 0.0,
+          "burst_n": 1,
+          "noise_tau_ms": 10.0
+        },
+        "SWR": {
+          "baseline": 1.55,
+          "noise_sd": 0.08,
+          "stim_gain": 0.0,
+          "osc_depth": 0.0,
+          "osc_phase": 0.0,
+          "burst_prob": 0.0,
+          "burst_n": 1,
+          "tau_m_ms": 3.0,
+          "noise_tau_ms": 3.0
+        }
+      }
+    },
+    "olm": {
+      "n": 20,
+      "tau_m_ms": 15.0,
+      "beta": 4.0,
+      "r0_hz": 20.0,
+      "refractory_ms": 2.0,
+      "tuning": {
+        "field_sd_m": 1.5,
+        "amp": 0.2,
+        "burst_coupling": 0.0
+      },
+      "states": {
+        "WALK": {
+          "baseline": 0.5,
+          "noise_sd": 0.06,
+          "stim_gain": 1.0,
+          "osc_depth": 0.7,
+          "osc_phase": 3.1416,
+          "burst_prob": 0.0,
+          "burst_n": 1,
+          "noise_tau_ms": 5.0
+        },
+        "STILL": {
+          "baseline": -0.15,
+          "noise_sd": 0.35,
+          "stim_gain": 0.2,
+          "osc_depth": 0.0,
+          "burst_prob": 0.0,
+          "burst_n": 1,
+          "noise_tau_ms": 10.0
+        },
+        "SWR": {
+          "baseline": -2.0,
+          "noise_sd": 0.05,
+          "stim_gain": 0.0,
+          "osc_depth": 0.0,
+          "burst_prob": 0.0,
+          "burst_n": 1,
+          "noise_tau_ms": 3.0
+        }
+      }
+    },
+    "chandelier": {
+      "n": 12,
+      "tau_m_ms": 10.0,
+      "beta": 4.0,
+      "r0_hz": 25.0,
+      "refractory_ms": 1.5,
+      "tuning": {
+        "field_sd_m": 1.0,
+        "amp": 0.0,
+        "burst_coupling": 0.0
+      },
+      "states": {
+        "WALK": {
+          "baseline": 0.5,
+          "noise_sd": 0.08,
+          "stim_gain": 0.0,
+          "osc_depth": 0.6,
+          "osc_phase": -0.6,
+          "burst_prob": 0.0,
+          "burst_n": 1,
+          "noise_tau_ms": 5.0
+        },
+        "STILL": {
+          "baseline": -0.15,
+          "noise_sd": 0.35,
+          "stim_gain": 0.0,
+          "osc_depth": 0.0,
+          "burst_prob": 0.0,
+          "burst_n": 1,
+          "noise_tau_ms": 10.0
+        },
+        "SWR": {
+          "baseline": -1.5,
+          "noise_sd": 0.05,
+          "stim_gain": 0.0,
+          "osc_depth": 0.0,
+          "burst_prob": 0.0,
+          "burst_n": 1,
+          "noise_tau_ms": 3.0
+        }
+      }
+    }
+  },
+  "connectivity": {
+    "pyr_ring_recurrent": {
+      "sigma_neurons": 2.0,
+      "weight": 0.04,
+      "tau_ms": 5.0
+    },
+    "pyr_to_pv": {
+      "p_conn": 0.5,
+      "weight": 0.06,
+      "tau_ms": 4.0
+    },
+    "pv_to_pyr": {
+      "p_conn": 0.6,
+      "weight": -0.05,
+      "tau_ms": 4.0
+    },
+    "pyr_to_olm": {
+      "p_conn": 0.4,
+      "weight": 0.03,
+      "tau_ms": 10.0
+    },
+    "pyr_to_chandelier": {
+      "p_conn": 0.5,
+      "weight": 0.03,
+      "tau_ms": 6.0
+    },
+    "olm_gate": {
+      "tau_ms": 20.0,
+      "strength": 0.35,
+      "norm_rate_hz": 20.0
+    },
+    "chandelier_veto": {
+      "tau_ms": 8.0,
+      "strength": 0.6,
+      "norm_rate_hz": 25.0,
+      "floor": 0.05
+    }
+  },
+  "analysis": {
+    "rate_window_ms": 50.0,
+    "fc_bin_ms": 20.0,
+    "n_position_bins": 40,
+    "example_cells_per_type": 3
+  }
+}

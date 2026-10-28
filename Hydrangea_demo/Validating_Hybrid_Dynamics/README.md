@@ -15,7 +15,16 @@ a grid and can be used to define interiors that share a closure, or unions withi
 
 -figure 1 shows how we can treat this as a cylindar that exists for 1 time
 step, im thinking we define it based on the lipschitz bound, that lets us
-basically treat it piece wise (this paper is the citation we can have for this to be valid)
+basically treat it piece wise (this paper is the citation we can have for this to be valid) I have a visualization method possibly that I've added
+
+About the e-balls:
+Definition 2.1 asks for exactly two things of a grid 
+1){|ξ|}: the pieces are regular closed and cover X, and
+2) |ξ| ∩ int|ξ′| = ∅ for ξ ≠ ξ′ — no piece reaches into another piece’s interior.
+
+-e-balls fail here, that holds for a grid but not a collection of eballs,
+they pass into eachothers interior,
+
 
 
 
