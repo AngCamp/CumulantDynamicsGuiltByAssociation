@@ -1,5 +1,22 @@
 # Overview and Dates
 
+
+## October 28th
+
+So I sat down and worked through a few things about what we are actually computing.
+
+![Ulam matrix computation diagram](ReadmeImages/ulammatrixcomputationdiagram.png)
+
+For every K latent, we are esentially building a set of delay embeddings across squares of tau.  We devide up the latent into its partitions of the largest block and then keep cutting down.  Do the same for all i tau segments over some max lag.  Method for deciding on max lag is TBD.
+
+We compute "reachbilities" from a score on PCx-tau_0 (the instantaneous score) to PCy-tau_i.  So we get an estimate of when the PC score is this, what is it most likely to be in this many taus later.  
+
+So if you had 3 lags of interest, and then 5 PCs you'd return a 15D object.
+
+We can then run th binarization on it to find the unions that work to determine the conley-morse graph on from there.  Still working out some of the details and building simulations to test this on.
+
+Thats why I added the HippocmapusSim data.
+
 ## Important papers today oct 27th
 
 We have a few options one is an autoencoder method, Im a lot more familiar with this method but on the otherhand it "feels" od to further force down
