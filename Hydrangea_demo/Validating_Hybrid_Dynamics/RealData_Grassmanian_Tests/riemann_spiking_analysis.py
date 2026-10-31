@@ -356,7 +356,9 @@ def load_alm_000363(rec, h5=None, nwb=None, units_df=None):
     meta = {"session_description": str(nwb.session_description),
             "subject": getattr(getattr(nwb, "subject", None), "subject_id", ""),
             "units_in_file": len(units),
-            "quality_values": dict(pd.Series(quality).value_counts())}
+            "units_from": "units_df (pre-filtered table)" if units_df is not None else "file",
+            "quality_values": {str(k): int(v) for k, v in
+                               units["quality"].astype(str).value_counts().items()}}
     return dict(units=units, trials=trials, epochs=epochs, events=events,
                 t_range=(t0, t1), meta=meta)
 
@@ -1129,8 +1131,41 @@ class RiemannSpikingAnalysis:
             raise KeyError("%r is not a trials column (%s)" % (by, [] if st.trials is None else list(st.trials)))
         return st.trials[by].astype(str).values[st.windows["seg"].values]
 
+    def window_values(self, times, values, key=None, agg="mean", min_samples=1):
+        """Aggregate a time series inside every window [t_start, t_stop): one
+        number per window, NaN where fewer than min_samples samples fall in it.
+        agg: "mean" (vectorised), "median", "max" or "min". Use it to turn
+        running speed, LFP band power, pupil size ... into a colour for
+        plot_grassmann(values=) / plot_tangent_grid()."""
+        st = self._st(key)
+        t = np.asarray(times, dtype=float).ravel()
+        v = np.asarray(values, dtype=float).ravel()
+        if len(t) != len(v):
+            raise ValueError("times and values differ in length (%d vs %d)" % (len(t), len(v)))
+        ok = np.isfinite(t) & np.isfinite(v)
+        t, v = t[ok], v[ok]
+        order = np.argsort(t, kind="stable")
+        t, v = t[order], v[order]
+        w = st.windows
+        a = np.searchsorted(t, w["t_start"].values, side="left")
+        b = np.searchsorted(t, w["t_stop"].values, side="left")
+        n = b - a
+        good = n >= max(int(min_samples), 1)
+        out = np.full(len(w), np.nan)
+        if agg == "mean":
+            cs = np.r_[0.0, np.cumsum(v)]
+            out[good] = (cs[b[good]] - cs[a[good]]) / n[good]
+        elif agg in ("median", "max", "min"):
+            f = {"median": np.median, "max": np.max, "min": np.min}[agg]
+            for i in np.flatnonzero(good):
+                out[i] = f(v[a[i]:b[i]])
+        else:
+            raise ValueError("agg must be 'mean', 'median', 'max' or 'min'")
+        return out
+
     # -------------------------------------------------------- 5. the figure
-    def plot_grassmann(self, key=None, labels=None, view=(28, -55), connect="auto",
+    def plot_grassmann(self, key=None, labels=None, values=None, values_label="", values_cmap="magma",
+                       values_clip=(2, 98), view=(28, -55), connect="auto",
                        cmap="viridis", max_sphere_lines=600, figsize=(15, 11), title=None,
                        save_as="grassmann"):
         """Sphere view + tangent plane + timeline (as in the Gr(3,1) demo).
@@ -1141,8 +1176,10 @@ class RiemannSpikingAnalysis:
         pole (= Karcher mean), with the polar angle equal to the projected
         tangent norm / sqrt(k) (an RMS principal angle), so the equator is the
         largest distance Gr(k, N) allows. Plane: the same coordinates flat.
-        labels: None = colour by time; else one categorical label per window
-        (see window_labels()).
+        Colour: by time (default); `labels` = one categorical label per window
+        (see window_labels()); `values` = one number per window (see
+        window_values()), colour limits at the `values_clip` percentiles, NaN
+        drawn grey.
         """
         from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 
@@ -1156,7 +1193,24 @@ class RiemannSpikingAnalysis:
         seg = st.windows["seg"].values
 
         # colours
-        if labels is None:
+        color_label = "window time (s)"
+        order = np.arange(len(idx))
+        if values is not None:
+            values = np.asarray(values, dtype=float).ravel()
+            if len(values) != len(st.windows):
+                raise ValueError("values must have one entry per window (%d)" % len(st.windows))
+            fin = np.isfinite(values)
+            lo, hi = (np.nanpercentile(values[fin], values_clip) if fin.any() else (0.0, 1.0))
+            if not hi > lo:
+                hi = lo + 1e-12
+            norm = plt.Normalize(lo, hi)
+            cm = plt.get_cmap(values_cmap)
+            colors = np.tile(np.array([0.82, 0.82, 0.82, 1.0]), (len(values), 1))     # grey = no data
+            colors[fin] = cm(norm(values[fin]))
+            legend_handles = None
+            color_label = (values_label or "value") + ("" if fin.all() else "   (grey: no data)")
+            order = np.argsort(fin[idx], kind="stable")                                # grey drawn first
+        elif labels is None:
             norm = plt.Normalize(tt.min(), tt.max())
             cm = plt.get_cmap(cmap)
             colors = cm(norm(tt))
@@ -1205,7 +1259,7 @@ class RiemannSpikingAnalysis:
         ax3.add_collection3d(Line3DCollection(np.stack([P[sub], Q[sub]], axis=1), colors="0.5",
                                               linewidths=0.3, alpha=0.3))
         ax3.scatter(Q[sub, 0], Q[sub, 1], Q[sub, 2], c=colors[idx][sub], s=4, alpha=0.5, depthshade=False)
-        ax3.scatter(P[:, 0], P[:, 1], P[:, 2], c=colors[idx], s=8, alpha=0.9, depthshade=False)
+        ax3.scatter(P[order, 0], P[order, 1], P[order, 2], c=colors[idx][order], s=8, alpha=0.9, depthshade=False)
         ax3.scatter([0], [0], [1], c="k", s=35, depthshade=False)
         ax3.text(0.06, 0.06, 1.1, "Karcher mean", fontsize=9)
         lim = max(1.15, hw * 1.05)
@@ -1226,7 +1280,7 @@ class RiemannSpikingAnalysis:
                 j = np.flatnonzero(same)
                 ax2.add_collection(LineCollection(np.stack([C[j], C[j + 1]], axis=1),
                                                   colors="0.6", linewidths=0.4, alpha=0.5))
-        ax2.scatter(C[:, 0], C[:, 1], c=colors[idx], s=8, alpha=0.85, linewidths=0)
+        ax2.scatter(C[order, 0], C[order, 1], c=colors[idx][order], s=8, alpha=0.85, linewidths=0)
         ax2.axhline(0, color="0.8", lw=0.8); ax2.axvline(0, color="0.8", lw=0.8)
         ax2.plot(0, 0, "o", color="k", ms=6)
         ax2.set_aspect("equal", adjustable="datalim")
@@ -1241,11 +1295,15 @@ class RiemannSpikingAnalysis:
             sm = plt.cm.ScalarMappable(norm=norm, cmap=cm)
             sm.set_array([])
             cb = plt.colorbar(sm, ax=ax2, pad=0.02, fraction=0.04)
-            cb.set_label("window time (s)")
+            cb.set_label(color_label)
 
         # ---- timeline: label strip + angle between consecutive windows
         t0, t1 = tt.min(), tt.max()
-        if labels is None:
+        if values is not None:
+            width = float(np.nanmedian(np.diff(tt))) if len(tt) > 1 else 1.0
+            axs.bar(tt[fin], np.ones(int(fin.sum())), width=width, color=colors[fin], align="center", linewidth=0)
+            axs.set_yticks([]); axs.set_ylabel("value", fontsize=8, rotation=0, ha="right", va="center")
+        elif labels is None:
             axs.imshow(np.linspace(0, 1, 512)[None, :], aspect="auto", cmap=cm,
                        extent=[t0, t1, 0, 1], interpolation="nearest")
             axs.set_yticks([]); axs.set_ylabel("time", fontsize=8, rotation=0, ha="right", va="center")
@@ -1273,9 +1331,71 @@ class RiemannSpikingAnalysis:
                 st.key, self.mode, self.count_bin_ms,
                 "whole-trial" if self.mollification_bin_ms is None else "%g ms" % self.mollification_bin_ms,
                 k, getattr(st, "k_rule_name", "k given"))
+        if values is not None and values_label:
+            title += " | colour: %s" % values_label
         if self.run_name:
             title = "[%s] %s" % (self.run_name, title)
         fig.suptitle(title, fontsize=11, y=0.995)
+        self._save_fig(fig, save_as, st.key)
+        return fig
+
+    def plot_tangent_grid(self, values, key=None, ncols=3, cmap="magma", clip=(2, 98), s=4,
+                          panel=(4.8, 4.3), save_as="tangent_grid"):
+        """Grid of tangent-plane views (same coordinates as plot_grassmann), each
+        coloured by one quantity. values: {name: per-window array}. Numeric
+        arrays get a colormap (limits at the `clip` percentiles, NaN = grey);
+        string/object arrays are categorical labels."""
+        st = self._st(key)
+        if not hasattr(st, "mu"):
+            raise RuntimeError("run fit_grassmann() first")
+        idx = st.grassmann_idx
+        C = st.tangent_coords[idx, :2]
+        names = list(values)
+        n = len(names)
+        if n == 0:
+            raise ValueError("values is empty")
+        ncols = max(1, min(int(ncols), n))
+        nrows = int(np.ceil(n / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(panel[0] * ncols, panel[1] * nrows), squeeze=False)
+        for ax in axes.ravel()[n:]:
+            ax.set_axis_off()
+        for ax, name in zip(axes.ravel(), names):
+            v = np.asarray(values[name])
+            if len(v) != len(st.windows):
+                raise ValueError("%r must have one entry per window (%d)" % (name, len(st.windows)))
+            ax.axhline(0, color="0.85", lw=0.8); ax.axvline(0, color="0.85", lw=0.8)
+            if v.dtype.kind in "OUSb":                                        # categorical
+                lab = v.astype(object)[idx]
+                cats = list(dict.fromkeys(lab.tolist()))
+                pal = plt.get_cmap("tab10" if len(cats) <= 10 else "tab20")
+                for i, c in enumerate(cats):
+                    m = lab == c
+                    ax.scatter(C[m, 0], C[m, 1], s=s, color=pal(i % pal.N), linewidths=0, alpha=0.8,
+                               label="%s (%d)" % (c, int(m.sum())))
+                ax.legend(fontsize=7, frameon=False, markerscale=3)
+            else:
+                v = v.astype(float)[idx]
+                fin = np.isfinite(v)
+                ax.scatter(C[~fin, 0], C[~fin, 1], s=s, color="0.82", linewidths=0)
+                if fin.any():
+                    lo, hi = np.nanpercentile(v[fin], clip)
+                    if not hi > lo:
+                        hi = lo + 1e-12
+                    sc = ax.scatter(C[fin, 0], C[fin, 1], c=v[fin], s=s, cmap=cmap, vmin=lo, vmax=hi,
+                                    linewidths=0, alpha=0.85)
+                    cb = plt.colorbar(sc, ax=ax, fraction=0.045, pad=0.02)
+                    cb.ax.tick_params(labelsize=7)
+                ax.text(0.02, 0.02, "%d of %d windows have data" % (int(fin.sum()), len(v)),
+                        transform=ax.transAxes, fontsize=7, color="0.4")
+            ax.plot(0, 0, "o", color="k", ms=4)
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.set_title(name, fontsize=9)
+            ax.tick_params(labelsize=7)
+        vr = st.tangent_var_ratio
+        fig.suptitle("%s%s | tangent plane at the Karcher mean of Gr(%d, %d); PC1 %.0f%%, PC2 %.0f%% of tangent variance"
+                     % (("[%s] " % self.run_name) if self.run_name else "", st.key, st.k, st.U.shape[1],
+                        100 * vr[0], 100 * (vr[1] if len(vr) > 1 else 0)), fontsize=10)
+        fig.tight_layout()
         self._save_fig(fig, save_as, st.key)
         return fig
 
