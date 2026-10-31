@@ -1,0 +1,1635 @@
+[
+ {
+  "b": 25,
+  "tau": 25,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 25,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 25,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 25,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 25,
+  "kind": "delay",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 25,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 25,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 25,
+  "kind": "delay",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "none",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 25,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "det",
+  "K": 10,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 25,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 25,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 25,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 25,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 25,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 25,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 25,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 25,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 50,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 50,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 50,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 100,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 100,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 200,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 300,
+  "kind": "pc12",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 2,
+  "got": [
+   "STILL",
+   "WALK"
+  ],
+  "n": 2
+ },
+ {
+  "b": 200,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 100,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 200,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "none",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "oracle",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "swr",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ },
+ {
+  "b": 200,
+  "tau": 300,
+  "kind": "delay",
+  "routing": "det",
+  "K": 6,
+  "nsets": 1,
+  "got": [
+   "WALK"
+  ],
+  "n": 1
+ }
+]

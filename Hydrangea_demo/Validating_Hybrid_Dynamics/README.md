@@ -1,5 +1,50 @@
 # Overview and Dates
 
+## October 29th
+
+Ok main finding, this won't work directly on PCs.  We need a workaround.
+
+Ok so the main finding is that I should be using a cmgraph library on pipy,
+there is no github for this project as far as I can tell and its underconstruction.  It allows for up to 8d, but realistically this can be quite slow. Not sure how paralizable this is because its quite greedy.  But 2d is computeable, we will circle back to this at the end here.
+
+So the paper that ended up being the most relevant was this, 
+
+Kalies, W., Rivas, B., & Wehbe, T. (2026). Computation of Attractor Lattices for a Class of Hybrid Systems. arXiv preprint arXiv:2610.15123.
+
+For the citation about converting a n-D space into sets of biinary values, and visualization has been provided below. I think though that to do what I indended you also need the persistance diagrams in  Dey, Lipiński, & Soriano-Trigueros (2026).  
+
+Dey, T. K., Lipiński, M., & Soriano-Trigueros, M. (2026). Conley–Morse Persistence Barcode: A Homological Signature of Combinatorial Bifurcations. Foundations of Computational Mathematics, 1-59.
+- gives you persistances in time, CMG is discrete
+
+
+So the two most important publications I think I found were this.
+
+So about how this all works then the important thing to remeber is that the
+squares work because they share a closure but not an interior, any euclidean space that has this property will work, in principle this means squares, cubes, hypercubes.  In practice is another matter, reducing this to binary sets does not buy you cheaper space or time complexity it jsut extends the theorem and O(n) of the dim is pretty bad. Below you cna see how this works visually then there's the explanation of the bit map.  See if you can parse it.
+
+![saddle_conly_index_bitmap](ReadmeImages/saddle_conly_index_bitmap.png)
+
+![unit_square_star_encoding_and_bitmap](ReadmeImages/unit_square_star_encoding_and_bitmap.png)
+
+The reachability is then computed over the step.  Originally we were doing this with time setps on the delay embedding so the delay was itself a dimenaions, this absolutely did not work and for the hybrid system there's no where for the rest maps to "go".  They are means to go off manifold in all the Rivas stuff I was reading.  I thought of them exist at tau equals 0.  
+
+Explaining the Ulam matrix and reachability computation:
+
+![ulam_walkthrough](ReadmeImages/ulam_walkthrough.png)
+
+The end result...
+
+![ulam_sparsity](ReadmeImages/ulam_sparsity.png)
+
+### Grassmanian, a possible solution
+
+-map pca or time-lag CCA to grassmanian, take a chart of 2d euclidean space from the spherical projection.  
+
+So for Rivas & Kalies (2026) this provides a useful method for us to apply, I'm considering potentially looking for regions of sever and almost unsmooth eigenvalue crossings.  Measured by a sufficiently large change in a lipschitz bound between samples.  This would give me reason to apply a suspension I think and define it as a reset map. 
+
+Rivas, B., & Kalies, W. (2026). Conley Index Theory for Hybrid Systems. arXiv preprint arXiv:2606.18501.
+
+Considering a new approach using geomstats and grassmanian manifolds.  
 
 ## October 28th
 

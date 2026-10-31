@@ -1,0 +1,46 @@
+{
+  "mean_rate_hz": {
+    "pyramidal": {
+      "WALK": 3.930749042191371,
+      "STILL": 1.3652750174693493,
+      "SWR": 7.406103286384976
+    },
+    "basket_pv": {
+      "WALK": 7.905654854357333,
+      "STILL": 1.7492036699245868,
+      "SWR": 107.6144366197183
+    },
+    "olm": {
+      "WALK": 3.1995985567158116,
+      "STILL": 0.4131387656203207,
+      "SWR": 0.0
+    },
+    "chandelier": {
+      "WALK": 1.7891705895003465,
+      "STILL": 0.5047961304257076,
+      "SWR": 0.0
+    }
+  },
+  "spatial_info_bits_per_spike_walk": {
+    "pyramidal": 1.5284704811211127,
+    "basket_pv": 0.050441759475248794,
+    "olm": 0.09775066191491902,
+    "chandelier": 0.19828092152121876
+  },
+  "dwell_mean_s": {
+    "WALK": 13.965999999999838,
+    "STILL": 11.50349999999946
+  },
+  "swr": {
+    "n": 34,
+    "duration_ms_mean": 84.01703144109322,
+    "gain_mean": 1.1852581321517939,
+    "kinds": {
+      "sequence": 24,
+      "random": 4,
+      "random_empty_memory": 6
+    },
+    "n_reversed": 13,
+    "sequences_in_memory": 25
+  }
+}

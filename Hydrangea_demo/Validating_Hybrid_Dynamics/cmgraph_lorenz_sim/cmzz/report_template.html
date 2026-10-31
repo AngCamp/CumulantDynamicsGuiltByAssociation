@@ -1,0 +1,220 @@
+<title>CMG Zigzag Persistence</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500;6..72,600&family=Public+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a single reading column (~70ch) with full-width figure plates; numbers in mono. */
+:root {
+  --bg: #f6f7f8; --surface: #ffffff; --plate: #fcfcfb;
+  --fg: #16191d; --fg2: #4a525c; --muted: #77808b; --rule: #dde1e6;
+  --accent: #1f5fa8; --accent-soft: #e5eef8;
+  --ok: #17784a; --ok-soft: #e3f3ea; --bad: #b3261e; --bad-soft: #fbe7e5;
+  --deg0: #2a78d6; --deg1: #eb6834; --deg2: #1baf7a;
+  --font-display: "Newsreader", "Iowan Old Style", Georgia, serif;
+  --font-body: "Public Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #121519; --surface: #1a1e23; --plate: #fcfcfb;
+  --fg: #e8ebee; --fg2: #b5bcc5; --muted: #8b939d; --rule: #2c323a;
+  --accent: #7fb0ec; --accent-soft: #1d2b3c;
+  --ok: #5fcf95; --ok-soft: #173225; --bad: #f08a80; --bad-soft: #3a1d1b;
+  --deg0: #3987e5; --deg1: #d95926; --deg2: #199e70; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #121519; --surface: #1a1e23; --plate: #fcfcfb;
+  --fg: #e8ebee; --fg2: #b5bcc5; --muted: #8b939d; --rule: #2c323a;
+  --accent: #7fb0ec; --accent-soft: #1d2b3c;
+  --ok: #5fcf95; --ok-soft: #173225; --bad: #f08a80; --bad-soft: #3a1d1b;
+  --deg0: #3987e5; --deg1: #d95926; --deg2: #199e70; color-scheme: dark }
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--fg); font: 15px/1.6 var(--font-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+main { max-width: 1060px; margin: 0 auto; padding-block: 40px 80px; display: grid; gap: 48px; }
+.col { max-width: 70ch; }
+h1, h2, h3 { font-family: var(--font-display); font-weight: 600; text-wrap: balance; margin: 0; line-height: 1.2 }
+h1 { font-size: clamp(30px, 5vw, 44px); }
+h2 { font-size: 26px; }
+h3 { font-size: 18px; font-family: var(--font-body); font-weight: 600 }
+p { margin: 0 }
+section { display: grid; gap: 16px; min-width: 0 }
+.eyebrow { font: 500 12px/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--accent) }
+.lede { font-size: 17px; color: var(--fg2); max-width: 68ch }
+.chain { font: 15px/1.5 var(--font-mono); color: var(--fg); background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 8px; padding: 14px 16px; overflow-x: auto; white-space: nowrap }
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px }
+.finding { background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 16px; display: grid; gap: 6px; min-width: 0 }
+.finding b { font-family: var(--font-mono); font-weight: 500; font-size: 22px; color: var(--accent) }
+.finding p { color: var(--fg2); font-size: 14px }
+.tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface) }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); white-space: nowrap }
+th { font: 500 11.5px/1.2 var(--font-mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted) }
+tr:last-child td { border-bottom: 0 }
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums }
+.pill-ok, .pill-bad { font: 500 12px/1 var(--font-mono); padding: 3px 8px; border-radius: 99px }
+.pill-ok { color: var(--ok); background: var(--ok-soft) } .pill-bad { color: var(--bad); background: var(--bad-soft) }
+figure.plate { margin: 0; background: var(--plate); border: 1px solid var(--rule); border-radius: 8px; padding: 10px; overflow-x: auto }
+figure.plate img { display: block; max-width: 100%; height: auto; margin: 0 auto }
+.cap { color: var(--muted); font-size: 13.5px; max-width: 75ch }
+code, .mono { font-family: var(--font-mono); font-size: .92em }
+ul.notes { margin: 0; padding-left: 20px; display: grid; gap: 8px; max-width: 75ch }
+/* explorer */
+.explorer { background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 16px; display: grid; gap: 14px; min-width: 0 }
+.controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center }
+select, input[type=range] { accent-color: var(--accent); font: 14px var(--font-body) }
+select { padding: 6px 8px; border: 1px solid var(--rule); border-radius: 6px; background: var(--bg); color: var(--fg) }
+input[type=range] { flex: 1 1 220px; min-width: 0 }
+.spacelbl { font: 500 15px var(--font-mono); min-width: 7ch }
+.strip { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 4px }
+.strip button { font: 12px var(--font-mono); border: 1px solid var(--rule); background: var(--bg); color: var(--fg2);
+  border-radius: 6px; padding: 5px 8px; cursor: pointer; flex: 0 0 auto }
+.strip button.mid { border-style: dashed }
+.strip button[aria-pressed=true] { background: var(--accent); color: var(--surface); border-color: var(--accent) }
+.strip button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+.blocks { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px }
+.blk { border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px; display: grid; gap: 4px; background: var(--bg) }
+.blk.triv { opacity: .55 }
+.blk .ci { font: 500 20px var(--font-mono) }
+.blk .meta { font-size: 12.5px; color: var(--muted) }
+.evt { font-size: 13.5px; color: var(--fg2) }
+.evt.hit { color: var(--fg); background: var(--accent-soft); border-radius: 6px; padding: 8px 10px }
+@media (prefers-reduced-motion: no-preference) { .strip button { transition: background .12s } }
+</style>
+
+<main>
+  <header class="col" style="display:grid;gap:14px">
+    <span class="eyebrow">Combinatorial dynamics · zigzag persistence</span>
+    <h1>Persistence of Conley–Morse graphs across discrete steps</h1>
+    <p class="lede">One second of a drifting dynamical system is cut into discrete steps. cmgraph builds a Conley–Morse graph for each step, and consecutive graphs are linked through the graph of the shared dynamics, as in Dey, Mrozek and Slechta. Zigzag persistence of the index pairs then reads the bifurcation off as bars that start, end or carry on, which is the Conley–Morse barcode view of Dey, Lipiński and Soriano Trigueros.</p>
+    <div class="chain">S₀ ← M₀|₁ → S₁ ← M₁|₂ → S₂ ← … → S<sub>n−1</sub>   &nbsp; S<sub>k</sub> = CMG of step k, M = CMG of F<sub>k</sub> ∩ F<sub>k+1</sub></div>
+  </header>
+
+  <section>
+    <span class="eyebrow">Results</span>
+    <h2>Hopf normal form, 4 × 250 ms against 10 × 100 ms</h2>
+    <div class="findings">
+      <div class="finding"><b>t = 0.75 s</b><p>4 steps: the stable focus splits into a repeller (index t²) and an attracting periodic orbit (index 1 + t) at the link S₂|S₃. True bifurcation: t = 0.50 s.</p></div>
+      <div class="finding"><b>t = 0.70 s</b><p>10 steps: the split appears earlier, at S₆|S₇, but only on a fine enough grid. At 128² it shows at 0.90 s and at 192² at 0.80 s. It settles at 0.70 s from 256², and 512² gives the same.</p></div>
+      <div class="finding"><b>(1 + t)·t</b><p>At every split, the children's indices minus the parent's equal (1 + t)·t. The Morse equation holds, and one H₀ bar for the whole cluster runs the full second.</p></div>
+    </div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>System</th><th>Steps</th><th>Grid</th><th>Detected</th><th>Error</th><th>Event</th><th>Morse eq.</th><th>Runtime</th></tr></thead>
+      <tbody>{{RUN_ROWS}}</tbody>
+    </table></div>
+    <p class="cap">Detection time is the first link where the Conley index changes. Each step's map is enclosed over its whole parameter interval, so a step whose interval straddles λ = 0 sees one blurred attractor. The split shows only once a step's interval lies far enough past λ = 0 that radial motion beats the parameter blur. Shorter steps narrow the interval, so 10 steps can detect earlier than 4. They also move points less per step, so they need a finer grid before that advantage appears. 4 steps reach their limit of 0.75 s already at 128²; 10 steps need 256² to reach 0.70 s.</p>
+  </section>
+
+  <section>
+    <h3>Conley–Morse barcodes</h3>
+    {{IMG_COMPARISON}}
+    <p class="cap">Blue H₀, orange H₁, green H₂. Each track is one Morse set followed through the zigzag; the cluster row is everything that continues together. The attractor's H₀ bar ends at the bifurcation. The repeller's H₂ bar and the periodic orbit's H₀ + H₁ bars start there. The cluster's H₀ bar is conserved straight through, which is Conley's continuation of the whole isolated invariant set.</p>
+  </section>
+
+  <section>
+    <h3>CMG zigzag, 4 steps and 10 steps</h3>
+    {{IMG_CMG4}}
+    {{IMG_CMG10}}
+    <p class="cap">Filled nodes are step CMGs and rings are middle CMGs. Red dashed arrows show a middle Morse set contained in a side Morse set. Every middle Morse set lands inside one on each side, because each arrow of F<sub>k</sub> ∩ F<sub>k+1</sub> is an arrow of both maps. Grey nodes have zero Conley index: they are resolution artefacts, such as thin rings around the focus, and are not linked.</p>
+  </section>
+
+  <section>
+    <h3>Morse sets per step</h3>
+    {{IMG_PORT4}}
+    {{IMG_PORT10}}
+  </section>
+
+  <section>
+    <span class="eyebrow">Explore</span>
+    <h2>Step through each zigzag</h2>
+    <div class="explorer">
+      <div class="controls">
+        <label for="run">Run</label>
+        <select id="run"></select>
+        <input id="pos" type="range" min="0" max="0" value="0" aria-label="Position in the zigzag">
+        <span class="spacelbl" id="spacelbl"></span>
+      </div>
+      <div class="strip" id="strip" role="group" aria-label="Spaces in the zigzag"></div>
+      <div id="stepinfo" class="cap"></div>
+      <div class="blocks" id="blocks"></div>
+      <div id="events" style="display:grid;gap:6px"></div>
+    </div>
+  </section>
+
+  <section>
+    <span class="eyebrow">Getting ready for 3D</span>
+    <h2>Lorenz, ρ from 0.2 to 6</h2>
+    <p class="col">The same code runs unchanged in 3D. At 40³ cells the step CMGs still see one attractor, because each step's ρ-interval is wide and Lorenz moves fast. The middle CMGs already separate the origin saddle (index t) from the two attractors C± (index 1 each), with the Morse equation 1 + 1 + t − 1 = (1 + t)·1. The package reports this as a middle-only split. With 10 steps at 40³ nothing separates yet, because each 100 ms map moves points less than a cell near the equilibria. Resolving the structure in the step CMGs needs about 10⁶ cells, which means cmgraph's adaptive refinement rather than a uniform grid.</p>
+    {{IMG_LZ_CMG}}
+    {{IMG_LZ_PORT}}
+    {{IMG_LZ_BAR}}
+  </section>
+
+  <section>
+    <span class="eyebrow">Scaling</span>
+    <h2>Where the time goes</h2>
+    {{IMG_SCALING}}
+    <div class="tablewrap"><table>
+      <thead><tr><th>Run</th><th>Grid</th><th>Cells</th><th>Enclosure s</th><th>cmgraph s</th><th>Pairs + homology s</th><th>Zigzag s</th><th>Total s</th><th>Peak MB</th><th>Detected</th></tr></thead>
+      <tbody>{{SCALING_ROWS}}</tbody>
+    </table></div>
+    <ul class="notes">
+      <li>The RK4 enclosure in numpy dominates, and grows with cells × samples per cell (3<sup>d</sup> lattice × 3 parameter values) × substeps. Moving the map to cmgraph's C++ oracle path, or to numba, is the first speed-up for 3D.</li>
+      <li>cmgraph's Morse graph build is cheap. Its own Conley index gets expensive on large Morse sets, about 15 s for 3,700 cells, so it is computed only for sets of up to 1,200 cells as a cross-check. Index-pair homology here handles the rest and agrees wherever both run.</li>
+      <li>Zigzag persistence uses Dey and Hou's fast zigzag (fzz), which is about 5 times faster than Dionysus with identical bars. Cost grows with the size of the triangulated index pairs and the number of steps.</li>
+      <li>Shorter steps need a finer grid. A step must move points by more than about one cell, otherwise rotation plus outward rounding merges structure and makes spurious recurrent rings, which show up as zero-index Morse sets. In the table, 4 steps detect from 128², while 10 steps improve from 0.90 s to 0.80 s to 0.70 s as the grid goes from 128² to 256².</li>
+      <li>In 3D, the middle CMGs resolve the Lorenz saddle and attractors from 32³ on: at 0.75 s at 32³ and 0.50 s at 40³. The step CMGs need finer grids still.</li>
+    </ul>
+  </section>
+
+  <section>
+    <span class="eyebrow">Method notes</span>
+    <h2>How the steps are linked</h2>
+    <ul class="notes">
+      <li><b>One step is one map.</b> F<sub>k</sub> encloses φ<sub>τ</sub>(x; λ) over each cell and over every λ in the step's interval, with τ equal to the step length. The enclosure is sampled and padded, so it is not rigorous.</li>
+      <li><b>Middle map.</b> M<sub>k|k+1</sub> takes the cellwise intersection of the two images, the cell-map analogue of V₁ ∩ V₂. Its Morse sets are recurrent for both maps, so each lies inside a Morse set on each side. Containment held at 100% in every run.</li>
+      <li><b>Index pairs.</b> P is the set of cells reachable from the Morse set inside a collar, and E = P \ S. Homology H(P, E) is computed as the reduced homology of P with a cone over E, triangulated. It matched cmgraph's Leray-reduced Conley index on every node where cmgraph could isolate one.</li>
+      <li><b>Relative zigzag.</b> Consecutive pairs are joined through intersections, (P, E) ⊇ (P ∩ P′, E ∩ E′) ⊆ (P′, E′), as in the SoCG 2020 paper. A middle Morse set can be much thinner than the side set holding it, and then a plain middle pair sits entirely inside the side Morse set, so the intersection loses the exit set and drops the class. When a middle set has an exit and is clearly thinner than its side sets, its pair is therefore grown to cover the side Morse sets, with E the cells that cannot reach the middle set. Bars that live only on the auxiliary intersection terms are dropped.</li>
+      <li><b>Spurious sets.</b> Morse sets with zero Conley index are absorbed into a touching comparable Morse set or shown grey. Two non-zero sets are never merged.</li>
+    </ul>
+  </section>
+</main>
+
+<script>
+const DATA = {{EXPLORER_JSON}};
+const runSel = document.getElementById('run'), pos = document.getElementById('pos');
+const strip = document.getElementById('strip'), blocks = document.getElementById('blocks');
+const lbl = document.getElementById('spacelbl'), info = document.getElementById('stepinfo'), evs = document.getElementById('events');
+for (const [k, r] of Object.entries(DATA)) { const o = document.createElement('option'); o.value = k; o.textContent = r.label; runSel.append(o); }
+function render() {
+  const r = DATA[runSel.value]; if (!r) return;
+  const s = +pos.value, sp = r.spaces[s];
+  lbl.textContent = sp.label;
+  [...strip.children].forEach((b, i) => b.setAttribute('aria-pressed', i === s));
+  const k = Math.floor(s / 2), st = r.steps[k];
+  info.textContent = s % 2 === 0
+    ? `Step ${st.k}: t ∈ [${st.t[0].toFixed(2)}, ${st.t[1].toFixed(2)}] s, parameter ∈ [${st.lam[0].toFixed(2)}, ${st.lam[1].toFixed(2)}]`
+    : `Middle map F${k} ∩ F${k+1} at t = ${st.t[1].toFixed(2)} s, parameter = ${st.lam[1].toFixed(2)}`;
+  blocks.replaceChildren(...sp.blocks.slice().sort((a, b) => b.level - a.level).map(b => {
+    const d = document.createElement('div'); d.className = 'blk' + (b.trivial ? ' triv' : '');
+    const cm = b.cm ? `cmgraph: ${b.cm}` : (b.cmstatus ? `cmgraph: ${b.cmstatus}` : 'merged block');
+    d.innerHTML = `<span class="ci">${b.conley}</span><span class="meta">${b.cells.toLocaleString()} cells · ${b.trivial ? 'zero index' : 'track ' + b.track} · level ${b.level}</span><span class="meta">${cm}</span>`;
+    return d; }));
+  const link = s % 2 === 1 ? k : (s / 2 - 1);
+  const here = r.events.filter(e => e.link === k || e.link === link);
+  evs.replaceChildren(...(here.length ? here : [{none: true}]).map(e => {
+    const p = document.createElement('div');
+    if (e.none) { p.className = 'evt'; p.textContent = 'No bifurcation event at the links around this space.'; return p; }
+    p.className = 'evt hit';
+    p.textContent = `Link S${e.link}|S${e.link + 1} at t = ${e.t.toFixed(2)} s: ${e.kind}. ${e.morse_equation || ''}`;
+    return p; }));
+}
+function build() {
+  const r = DATA[runSel.value]; if (!r) return;
+  pos.max = r.spaces.length - 1;
+  strip.replaceChildren(...r.spaces.map((sp, i) => { const b = document.createElement('button'); b.type = 'button';
+    b.textContent = sp.label; if (i % 2) b.className = 'mid'; b.onclick = () => { pos.value = i; render(); }; return b; }));
+  const firstEv = r.events[0]; pos.value = firstEv ? Math.min(2 * firstEv.link + 1, r.spaces.length - 1) : 0;
+  render();
+}
+runSel.onchange = build; pos.oninput = render; build();
+</script>
