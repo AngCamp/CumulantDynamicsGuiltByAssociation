@@ -534,9 +534,21 @@ class RiemannSpikingAnalysis:
         self._say("  saved figure:", path)
         return path
 
+    def _t_range_desc(self):
+        """t_range as a short JSON-able description (an interval array is summarised + hashed)."""
+        tr = self.t_range
+        if tr is None or isinstance(tr, str):
+            return tr
+        arr = np.atleast_2d(np.asarray(tr, dtype=float))
+        if arr.shape == (1, 2):
+            return [float(arr[0, 0]), float(arr[0, 1])]
+        import hashlib
+        return "intervals(n=%d, %.1f s, sha=%s)" % (len(arr), float((arr[:, 1] - arr[:, 0]).sum()),
+                                                    hashlib.sha1(np.ascontiguousarray(arr).tobytes()).hexdigest()[:10])
+
     def config(self):
         """The run configuration as a JSON-able dict."""
-        return {"run_name": self.run_name, "mode": self.mode, "t_range": self.t_range,
+        return {"run_name": self.run_name, "mode": self.mode, "t_range": self._t_range_desc(),
                 "count_bin_ms": self.count_bin_ms, "mollification_bin_ms": self.mollification_bin_ms,
                 "mollification_step_ms": self.mollification_step_ms,
                 "unit_filter": self._fname(self.unit_filter), "trial_filter": self._fname(self.trial_filter),
@@ -580,7 +592,7 @@ class RiemannSpikingAnalysis:
         print("  figures                     : display only" if not self.save_figures
               else "  figures                     : displayed and saved to output_dir")
         print("  mode                  :", self.mode,
-              "" if self.mode == "trials" else "(t_range=%r)" % (self.t_range,))
+              "" if self.mode == "trials" else "(t_range=%r)" % (self._t_range_desc(),))
         print("  count_bin_ms          :", self.count_bin_ms)
         print("  mollification_bin_ms  :", self.mollification_bin_ms,
               "(one window per whole trial)" if self.mollification_bin_ms is None else "")
@@ -794,7 +806,7 @@ class RiemannSpikingAnalysis:
                       % (len(st.trials), len(rec.trials), self._fname(self.trial_filter), n_seg_used))
         else:
             self._say("  segments: %d (t_range=%r), %.1f min in total"
-                      % (len(segments), self.t_range, np.sum(segments[:, 1] - segments[:, 0]) / 60))
+                      % (len(segments), self._t_range_desc(), np.sum(segments[:, 1] - segments[:, 0]) / 60))
         self._say("  bins: %d x %d units at %g ms (%.1f min of data); transform=%s, normalize=%s"
                   % (st.X.shape[0], st.X.shape[1], self.count_bin_ms, st.X.shape[0] * dt / 60,
                      self._fname(self.count_transform), self._fname(self.normalize)))
@@ -1403,7 +1415,7 @@ class RiemannSpikingAnalysis:
     def summary(self, key=None):
         """One-row Series of the main numbers for the active session."""
         st = self._st(key)
-        s = {"run_name": self.run_name, "session": st.key, "mode": self.mode,
+        s = {"run_name": self.run_name, "session": st.key, "mode": self.mode, "t_range": self._t_range_desc(),
              "units": st.X.shape[1], "bins": st.X.shape[0],
              "count_bin_ms": self.count_bin_ms, "window_ms": self.mollification_bin_ms,
              "step_ms": self.mollification_step_ms}
