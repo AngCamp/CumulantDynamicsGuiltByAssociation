@@ -1,0 +1,65 @@
+{
+  "fs": 1250.0,
+  "lfp_key": "Best_Ripple_channel_LFP_CA1",
+  "fir": {
+    "method": "fir",
+    "fir_design": "firwin",
+    "fir_window": "blackman",
+    "phase": "zero",
+    "filter_length": "auto"
+  },
+  "files": [
+    "fir_beta_1250Hz.npz",
+    "fir_delta_1250Hz.npz",
+    "fir_fast_gamma_1250Hz.npz",
+    "fir_ripple_1250Hz.npz",
+    "fir_slow_gamma_1250Hz.npz",
+    "fir_theta_1250Hz.npz"
+  ],
+  "bands": {
+    "beta": {
+      "lo": 15.0,
+      "hi": 30.0,
+      "l_trans": 3.0,
+      "h_trans": 4.0,
+      "n_taps": 2085
+    },
+    "delta": {
+      "lo": 1.0,
+      "hi": 4.0,
+      "l_trans": 0.5,
+      "h_trans": 1.0,
+      "n_taps": 12501
+    },
+    "fast_gamma": {
+      "lo": 66.0,
+      "hi": 100.0,
+      "l_trans": 5.0,
+      "h_trans": 10.0,
+      "n_taps": 1251
+    },
+    "ripple": {
+      "lo": 130.0,
+      "hi": 250.0,
+      "l_trans": 15.0,
+      "h_trans": 25.0,
+      "n_taps": 417
+    },
+    "slow_gamma": {
+      "lo": 30.0,
+      "hi": 55.0,
+      "l_trans": 5.0,
+      "h_trans": 4.0,
+      "n_taps": 1563
+    },
+    "theta": {
+      "lo": 6.0,
+      "hi": 12.0,
+      "l_trans": 1.5,
+      "h_trans": 2.0,
+      "n_taps": 4167
+    }
+  },
+  "longest_filter": "delta",
+  "cut_s_each_end": 5.0
+}
