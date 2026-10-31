@@ -481,7 +481,9 @@ class RiemannSpikingAnalysis:
     def __init__(self, mode="trials", count_bin_ms=10.0, mollification_bin_ms=500.0,
                  mollification_step_ms=None, unit_filter=keep_all, trial_filter=keep_all,
                  count_transform=identity, normalize=zscore_units, k_rule=None,
-                 k_store=15, center_windows=True, t_range=None, verbose=True):
+                 k_store=15, center_windows=True, t_range=None, verbose=True,
+                 output_dir=None, run_name=None, session_cache_dir=None, use_cache=True,
+                 save_figures=False):
         if mode not in ("trials", "full"):
             raise ValueError("mode must be 'trials' or 'full'")
         self.mode = mode
@@ -497,6 +499,14 @@ class RiemannSpikingAnalysis:
         self.center_windows = bool(center_windows)
         self.t_range = t_range
         self.verbose = verbose
+        self.run_name = run_name
+        # caches only (nothing is written that could not be recomputed):
+        #   output_dir/<session>/spectra_<hash>.npz, grassmann_<hash>.npz   per run
+        #   session_cache_dir/<session>.pkl                                   loaded tables, shared by runs
+        self.output_dir = None if output_dir is None else Path(output_dir)
+        self.session_cache_dir = None if session_cache_dir is None else Path(session_cache_dir)
+        self.use_cache = bool(use_cache)
+        self.save_figures = bool(save_figures)    # off by default: figures only display
         self.session_data: dict[str, SessionRecord] = {}
         self.analysis: dict[str, SimpleNamespace] = {}
         self.active: Optional[str] = None
@@ -510,10 +520,63 @@ class RiemannSpikingAnalysis:
     def _fname(f):
         return getattr(f, "__name__", repr(f))
 
+    def _save_fig(self, fig, name, key):
+        """Save a figure as <output_dir>/<session>/<name>.png. No-op unless
+        save_figures=True and output_dir is set."""
+        if not self.save_figures or self.output_dir is None or not name:
+            return None
+        d = self.output_dir / str(key)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / ("%s.png" % name)
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        self._say("  saved figure:", path)
+        return path
+
+    def config(self):
+        """The run configuration as a JSON-able dict."""
+        return {"run_name": self.run_name, "mode": self.mode, "t_range": self.t_range,
+                "count_bin_ms": self.count_bin_ms, "mollification_bin_ms": self.mollification_bin_ms,
+                "mollification_step_ms": self.mollification_step_ms,
+                "unit_filter": self._fname(self.unit_filter), "trial_filter": self._fname(self.trial_filter),
+                "count_transform": self._fname(self.count_transform), "normalize": self._fname(self.normalize),
+                "k_rule": self._fname(self.k_rule), "k_store": self.k_store,
+                "center_windows": self.center_windows,
+                "output_dir": None if self.output_dir is None else str(self.output_dir),
+                "save_figures": self.save_figures}
+
+    # ------------------------------------------------------------- caches
+    def _data_hash(self, st):
+        """Fingerprint of the prepared data + the settings that shape the spectra.
+        Hashes the data itself (kept unit ids, segments, per-unit counts, a sample
+        of X), so changing REGION / MIN_RATE_HZ inside a filter function is caught
+        even though the function name is unchanged."""
+        import hashlib
+        h = hashlib.sha1()
+        cfg = {k: v for k, v in self.config().items()
+               if k not in ("run_name", "output_dir", "save_figures", "k_rule")}
+        h.update(json.dumps(cfg, sort_keys=True, default=str).encode())
+        h.update(np.asarray(st.units["unit_id"].astype(str).values).astype("U").tobytes())
+        h.update(np.ascontiguousarray(st.segments, dtype=np.float64).tobytes())
+        h.update(st.counts.sum(axis=0, dtype=np.int64).tobytes())
+        step = max(1, st.X.shape[0] // 2000)
+        h.update(np.ascontiguousarray(st.X[::step]).tobytes())
+        return h.hexdigest()[:12]
+
+    def _cache_file(self, key, stage, h):
+        if not self.use_cache or self.output_dir is None:
+            return None
+        d = self.output_dir / str(key)
+        d.mkdir(parents=True, exist_ok=True)
+        return d / ("%s_%s.npz" % (stage, h))
+
     def describe(self):
         """Print the current configuration."""
         step = self.mollification_step_ms
-        print("RiemannSpikingAnalysis")
+        print("RiemannSpikingAnalysis", "| run_name = %r" % self.run_name)
+        print("  run cache (spectra, Gr fit):", self.output_dir if self.use_cache else "off")
+        print("  session cache (loaded data):", self.session_cache_dir if self.use_cache else "off")
+        print("  figures                     : display only" if not self.save_figures
+              else "  figures                     : displayed and saved to output_dir")
         print("  mode                  :", self.mode,
               "" if self.mode == "trials" else "(t_range=%r)" % (self.t_range,))
         print("  count_bin_ms          :", self.count_bin_ms)
@@ -570,13 +633,31 @@ class RiemannSpikingAnalysis:
                   % (n, dandiset_id, version, len(self.session_data)))
         return n
 
-    def load(self, key=None, **loader_kwargs):
-        """Run the record's loader, store the standard tables, mark it loaded."""
+    def load(self, key=None, refresh=False, **loader_kwargs):
+        """Run the record's loader, store the standard tables, mark it loaded.
+
+        With session_cache_dir set, the standard tables (spike trains, trials,
+        epochs, events) are pickled to <session_cache_dir>/<key>.pkl on the
+        first load and read back afterwards, skipping the stream / NWB parse.
+        Not cached when units_df= is given (that table is already filtered).
+        refresh=True ignores and rewrites the cache."""
         rec = self._rec(key)
         kw = dict(rec.loader_kwargs)
         kw.update(loader_kwargs)
         t = time.time()
-        out = rec.loader(rec, **kw)
+        cache = None
+        if self.use_cache and self.session_cache_dir is not None and kw.get("units_df") is None:
+            cache = self.session_cache_dir / ("%s.pkl" % rec.key)
+        if cache is not None and cache.exists() and not refresh:
+            out = pd.read_pickle(cache)
+            self._say("session %r read from cache %s" % (rec.key, cache))
+        else:
+            out = rec.loader(rec, **kw)
+            if cache is not None:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                pd.to_pickle({k: out.get(k) for k in ("units", "trials", "epochs", "events",
+                                                      "t_range", "meta")}, cache)
+                self._say("session %r cached to %s" % (rec.key, cache))
         rec.units = out["units"].reset_index(drop=True)
         rec.trials = out.get("trials")
         rec.epochs = dict(out.get("epochs") or {})
@@ -766,7 +847,14 @@ class RiemannSpikingAnalysis:
         rank = np.zeros(n_win, dtype=int)
 
         t = time.time()
-        for L in np.unique(lens):
+        st.spectra_hash = self._data_hash(st)
+        cache = self._cache_file(st.key, "spectra", st.spectra_hash)
+        hit = cache is not None and cache.exists()
+        if hit:                                    # same data + settings: skip the eigendecompositions
+            with np.load(cache) as z:
+                eigvals, eigvecs, rank = z["eigvals"], z["eigvecs"], z["rank"]
+            self._say("window spectra read from cache %s" % cache)
+        for L in (() if hit else np.unique(lens)):
             idx_w = np.flatnonzero(lens == L)
             per_win = 8 * (3 * L * N + 2 * min(L, N) ** 2)
             chunk = max(1, int(mem_budget_mb * 2 ** 20 // per_win))
@@ -780,6 +868,8 @@ class RiemannSpikingAnalysis:
                 eigvals[ii, :lam.shape[1]] = lam
                 eigvecs[ii, :, :V.shape[2]] = V
                 rank[ii] = rk
+        if cache is not None and not hit:
+            np.savez(cache, eigvals=eigvals, eigvecs=eigvecs, rank=rank)
         st.eigvals = eigvals
         st.eigvecs = eigvecs
         st.rank = rank
@@ -825,7 +915,7 @@ class RiemannSpikingAnalysis:
         return st.k
 
     # ------------------------------------------------------- spectrum plots
-    def plot_participation_ratio(self, key=None, bins=40, ax=None):
+    def plot_participation_ratio(self, key=None, bins=40, ax=None, save_as="participation_ratio"):
         """Histogram of the participation ratio (sum lambda)^2 / sum lambda^2 over windows."""
         st = self._st(key)
         pr = st.participation_ratio[st.valid]
@@ -843,9 +933,10 @@ class RiemannSpikingAnalysis:
         ax.set_title("%s: participation ratio, %d windows" % (st.key, len(pr)), fontsize=10)
         ax.legend(fontsize=8, frameon=False)
         plt.tight_layout()
+        self._save_fig(ax.figure, save_as, st.key)
         return ax
 
-    def plot_explained_variance(self, key=None, n_show=10, ax=None):
+    def plot_explained_variance(self, key=None, n_show=10, ax=None, save_as="explained_variance"):
         """Violin per component of lambda_i / sum(lambda) across windows (descending
         order, NOT cumulative); medians marked and traced by a line."""
         st = self._st(key)
@@ -872,9 +963,10 @@ class RiemannSpikingAnalysis:
                      % (st.key, n_show, len(evr)), fontsize=10)
         ax.legend(fontsize=8, frameon=False)
         plt.tight_layout()
+        self._save_fig(ax.figure, save_as, st.key)
         return ax
 
-    def plot_eigenvalue_spectra(self, key=None, max_lines=3000, log=True, ax=None):
+    def plot_eigenvalue_spectra(self, key=None, max_lines=3000, log=True, ax=None, save_as="eigenvalue_spectra"):
         """Raw eigenvalues over all dimensions: one line per window, coloured by
         window time, median spectrum in black."""
         st = self._st(key)
@@ -915,6 +1007,7 @@ class RiemannSpikingAnalysis:
         cb.set_label("window time (s)")
         ax.legend(fontsize=8, frameon=False, loc="upper right")
         plt.tight_layout()
+        self._save_fig(ax.figure, save_as, st.key)
         return ax
 
     # ------------------------------------------------- 4. Gr(k, N) embedding
@@ -944,12 +1037,22 @@ class RiemannSpikingAnalysis:
         U = st.eigvecs[idx][:, :, :k].astype(np.float64)
         U, _ = np.linalg.qr(U)                                     # re-orthonormalise (batched)
 
-        if mean == "karcher":
-            mu, hist = karcher_mean(U, k, n_iter=karcher_iters, tol=karcher_tol, chunk=chunk)
-        elif mean == "extrinsic":
-            mu, hist = extrinsic_mean(U, k), []
-        else:
+        if mean not in ("karcher", "extrinsic"):
             raise ValueError("mean must be 'karcher' or 'extrinsic'")
+        # the mean is the costly step; cache it (keyed on the spectra + mean settings)
+        mh = "%s_k%d_%s_%d_%g" % (getattr(st, "spectra_hash", "nohash"), k, mean, karcher_iters, karcher_tol)
+        cache = self._cache_file(st.key, "grassmann_mean", mh) if hasattr(st, "spectra_hash") else None
+        if cache is not None and cache.exists():
+            with np.load(cache) as z:
+                mu, hist = z["mu"], list(z["hist"])
+            self._say("Gr mean read from cache %s" % cache)
+        else:
+            if mean == "karcher":
+                mu, hist = karcher_mean(U, k, n_iter=karcher_iters, tol=karcher_tol, chunk=chunk)
+            else:
+                mu, hist = extrinsic_mean(U, k), []
+            if cache is not None:
+                np.savez(cache, mu=mu, hist=np.asarray(hist, dtype=float))
 
         N = U.shape[1]
         Delta = np.empty_like(U)
@@ -1028,7 +1131,8 @@ class RiemannSpikingAnalysis:
 
     # -------------------------------------------------------- 5. the figure
     def plot_grassmann(self, key=None, labels=None, view=(28, -55), connect="auto",
-                       cmap="viridis", max_sphere_lines=600, figsize=(15, 11), title=None):
+                       cmap="viridis", max_sphere_lines=600, figsize=(15, 11), title=None,
+                       save_as="grassmann"):
         """Sphere view + tangent plane + timeline (as in the Gr(3,1) demo).
 
         The tangent space at the Karcher mean has dimension k(N-k); the figure
@@ -1169,14 +1273,18 @@ class RiemannSpikingAnalysis:
                 st.key, self.mode, self.count_bin_ms,
                 "whole-trial" if self.mollification_bin_ms is None else "%g ms" % self.mollification_bin_ms,
                 k, getattr(st, "k_rule_name", "k given"))
+        if self.run_name:
+            title = "[%s] %s" % (self.run_name, title)
         fig.suptitle(title, fontsize=11, y=0.995)
+        self._save_fig(fig, save_as, st.key)
         return fig
 
     # ----------------------------------------------------------- summary
     def summary(self, key=None):
         """One-row Series of the main numbers for the active session."""
         st = self._st(key)
-        s = {"session": st.key, "mode": self.mode, "units": st.X.shape[1], "bins": st.X.shape[0],
+        s = {"run_name": self.run_name, "session": st.key, "mode": self.mode,
+             "units": st.X.shape[1], "bins": st.X.shape[0],
              "count_bin_ms": self.count_bin_ms, "window_ms": self.mollification_bin_ms,
              "step_ms": self.mollification_step_ms}
         if hasattr(st, "windows"):
