@@ -39,7 +39,7 @@ Typical use (see the notebooks):
 
     obj = RiemannSpikingAnalysis(mode="trials", count_bin_ms=10, mollification_bin_ms=500,
                                  unit_filter=my_unit_filter, trial_filter=my_trial_filter,
-                                 normalize=zscore_units, k_rule=k_median_elbow())
+                                 normalize=zscore_units, k_rule=k_global_elbow())
     obj.add_session("alm", loader=load_alm_000363, asset=asset, h5=h5f, nwb=nwb)
     obj.load("alm"); obj.status()
     obj.prepare(); obj.window_spectra(); obj.choose_k(); obj.fit_grassmann()
@@ -64,7 +64,8 @@ __all__ = [
     "RiemannSpikingAnalysis", "SessionRecord",
     "load_alm_000363", "load_hp_001695",
     "zscore_units", "identity", "sqrt_counts", "keep_all",
-    "k_median_elbow", "k_fixed", "elbow_index", "intervals_by_column", "session_key_from_path",
+    "k_global_elbow", "k_median_elbow", "k_fixed", "elbow_index", "global_spectrum",
+    "intervals_by_column", "session_key_from_path",
     "principal_angles", "geodesic_distance", "grassmann_log", "grassmann_exp",
     "extrinsic_mean", "karcher_mean",
 ]
@@ -176,13 +177,14 @@ def keep_all(df):
     return np.ones(len(df), dtype=bool)
 
 
-def elbow_index(y, m=50):
-    """Elbow of a descending curve: the point farthest below the chord through
-    points 1..m (1-based index). Explained-variance curves are the eigenvalues
-    scaled by their sum, so the elbow is the same on either."""
+def elbow_index(y, n_components=None):
+    """Elbow of a descending curve: the point farthest below the chord through the
+    first n_components finite points (None = all of them), as a 1-based index.
+    Explained-variance curves are the eigenvalues scaled by their sum, so the
+    elbow is the same on either."""
     y = np.asarray(y, dtype=float)
     y = y[np.isfinite(y)]
-    m = min(int(m), len(y))
+    m = len(y) if n_components is None else min(int(n_components), len(y))
     if m < 3:
         return 1
     y = y[:m]
@@ -190,23 +192,66 @@ def elbow_index(y, m=50):
     return int(np.argmax(chord - y)) + 1
 
 
-def k_median_elbow(m=50, k_max=None):
-    """k_rule: elbow of every window's explained-variance curve, median across
-    windows (rounded), optionally capped at k_max."""
-    def rule(evr):
-        ks = np.array([elbow_index(row, m) for row in evr])
-        k = int(round(np.median(ks)))
+def _rule_name(base, n_components, k_max):
+    parts = [s for s in ("n_components=%d" % n_components if n_components is not None else "",
+                         "k_max=%d" % k_max if k_max is not None else "") if s]
+    return "%s(%s)" % (base, ", ".join(parts))
+
+
+def global_spectrum(X, chunk=50000):
+    """Eigenvalues (descending) and explained variance of the covariance of ALL rows
+    of X (bins x units): the global / full-data PCA at the run's count bin. Chunked
+    so a large float32 X is never copied whole to float64."""
+    X = np.asarray(X)
+    T, N = X.shape
+    mu = X.mean(axis=0, dtype=np.float64)
+    C = np.zeros((N, N))
+    for a in range(0, T, chunk):
+        Z = X[a:a + chunk].astype(np.float64) - mu
+        C += Z.T @ Z
+    C /= max(T - 1, 1)
+    lam = np.clip(np.linalg.eigvalsh(C)[::-1], 0, None)
+    tot = lam.sum()
+    evr = lam / tot if tot > 0 else np.full_like(lam, np.nan)
+    return lam, evr
+
+
+def k_global_elbow(n_components=None, k_max=None):
+    """k_rule (default): the elbow of the explained-variance curve of the GLOBAL
+    covariance, all retained bins of X at the run's count bin (full rank). Every
+    valid window gets that same k as its per-window value. The global spectrum is
+    stored on st.global_eigvals / st.global_evr."""
+    def rule(st):
+        lam, evr = global_spectrum(st.X)
+        st.global_eigvals, st.global_evr = lam, evr
+        k = elbow_index(evr, n_components)
         if k_max is not None:
             k = min(k, int(k_max))
-        return max(k, 1)
-    rule.__name__ = "median_elbow(m=%d%s)" % (m, "" if k_max is None else ", k_max=%d" % k_max)
+        k = max(k, 1)
+        return k, np.full(int(st.valid.sum()), k, dtype=int)
+    rule.__name__ = _rule_name("global_elbow", n_components, k_max)
+    return rule
+
+
+def k_median_elbow(n_components=None, k_max=None):
+    """k_rule: elbow of every valid window's explained-variance curve, median across
+    windows (rounded), optionally capped at k_max. Per-window value = each window's
+    own elbow (a sampling-shape statistic when windows hold fewer bins than units)."""
+    def rule(st):
+        evr = st.evr[st.valid]
+        ks = np.array([elbow_index(row, n_components) for row in evr], dtype=int)
+        k = int(round(np.median(ks))) if len(ks) else 1
+        if k_max is not None:
+            k = min(k, int(k_max))
+        return max(k, 1), ks
+    rule.__name__ = _rule_name("median_elbow", n_components, k_max)
     return rule
 
 
 def k_fixed(K):
-    """k_rule: always K."""
-    def rule(evr):
-        return int(K)
+    """k_rule: always K (the one way to override the chosen k: obj.choose_k(k_fixed(K)))."""
+    def rule(st):
+        return int(K), np.full(int(st.valid.sum()), int(K), dtype=int)
     rule.__name__ = "fixed(K=%d)" % K
     return rule
 
@@ -472,7 +517,8 @@ class RiemannSpikingAnalysis:
     count_transform         f(counts (T_b, N) float32) -> array, e.g. sqrt_counts.
     normalize               f(transformed counts) -> (T_b, N); default z-score per
                             neuron across all retained bins.
-    k_rule                  f(evr (n_win, n_eig)) -> int; default k_median_elbow().
+    k_rule                  f(st) -> (k, one value per valid window); default
+                            k_global_elbow(). k is set only by choose_k().
     k_store                 eigenvectors kept per window (k must be <= k_store).
     center_windows          subtract each window's own mean before the covariance.
     t_range                 "full" mode only: None = whole recording, (t0, t1), or
@@ -494,7 +540,7 @@ class RiemannSpikingAnalysis:
         self.trial_filter = trial_filter
         self.count_transform = count_transform
         self.normalize = normalize
-        self.k_rule = k_rule if k_rule is not None else k_median_elbow()
+        self.k_rule = k_rule if k_rule is not None else k_global_elbow()
         self.k_store = int(k_store)
         self.center_windows = bool(center_windows)
         self.t_range = t_range
@@ -880,7 +926,6 @@ class RiemannSpikingAnalysis:
             st.participation_ratio = tot ** 2 / np.nansum(eigvals ** 2, axis=1)
         st.total_variance = tot
         st.valid = np.isfinite(tot) & (tot > 0) & (rank >= 1)
-        st.elbow_per_window = np.array([elbow_index(r) if v else 0 for r, v in zip(st.evr, st.valid)])
 
         L_desc = ("whole trial (%d-%d bins)" % (lens.min(), lens.max()) if self.mollification_bin_ms is None
                   else "%g ms = %d bins" % (self.mollification_bin_ms, lens[0]))
@@ -896,51 +941,67 @@ class RiemannSpikingAnalysis:
 
     # --------------------------------------------------------- 3. choose k
     def choose_k(self, rule=None, key=None):
-        """Subspace dimension from k_rule (or `rule`) applied to the explained-
-        variance curves of all valid windows. k is capped at k_store."""
+        """Subspace dimension from k_rule (or `rule`): the rule receives the analysis
+        namespace and returns (k, one value per valid window). k is capped at k_store.
+        This is the only place k is set; to override, call choose_k(k_fixed(K))."""
         st = self._st(key)
         rule = self.k_rule if rule is None else rule
-        evr = st.evr[st.valid]
-        k = int(rule(evr))
+        k, per_window = rule(st)
+        k = int(k)
         k_cap = min(self.k_store, st.eigvecs.shape[2])
         if k > k_cap:
-            self._say("  k=%d capped at k_store=%d (raise k_store and rerun window_spectra for more)" % (k, k_cap))
+            self._say("  k=%d capped at k_store=%d (pass k_store= to the constructor and rerun"
+                      " window_spectra for more)" % (k, k_cap))
             k = k_cap
         st.k = max(1, k)
         st.k_rule_name = self._fname(rule)
-        el = st.elbow_per_window[st.valid]
-        q = np.percentile(el, [25, 50, 75])
-        cum = np.nanmedian(np.nansum(evr[:, :st.k], axis=1))
-        self._say("k = %d by %s | per-window elbows: median %d, IQR %d-%d | median explained"
+        per_window = np.asarray(per_window, dtype=float).ravel()
+        kp = np.full(len(st.windows), np.nan)
+        if len(per_window) == int(st.valid.sum()):
+            kp[st.valid] = per_window
+        elif len(per_window) == len(st.windows):
+            kp = per_window
+        st.k_per_window = kp
+        q = np.nanpercentile(kp, [25, 50, 75]) if np.isfinite(kp).any() else (np.nan,) * 3
+        cum = np.nanmedian(np.nansum(st.evr[st.valid][:, :st.k], axis=1))
+        self._say("k = %d by %s | per-window k: median %g, IQR %g-%g | median explained"
                   " variance in top k: %.1f%%" % (st.k, st.k_rule_name, q[1], q[0], q[2], 100 * cum))
         return st.k
 
     # ------------------------------------------------- 4. Gr(k, N) embedding
-    def fit_grassmann(self, k=None, mean="karcher", n_tangent_pcs=3, karcher_iters=50,
+    def fit_grassmann(self, mean="karcher", n_tangent_pcs=3, karcher_iters=50,
                       karcher_tol=1e-6, chunk=4000, key=None):
-        """Top-k eigenvectors of every valid window as a point of Gr(k, N); Karcher
-        (or extrinsic) mean; log map at the mean; PCA of the tangent vectors;
-        geodesic distance to the mean; angle between consecutive windows."""
+        """Every valid window as a point of Gr(k, N), k = st.k from choose_k() (the only
+        place k is set; override with choose_k(k_fixed(K))).
+
+        Windows of rank >= k: their top-k eigenvectors. Windows of rank r < k pin down
+        only r directions, so they are completed with the k - r directions of the mean
+        orthogonal to their own range (top left singular vectors of (I - U_r U_r^T) mu):
+        the k-plane containing the window's range that lies closest to the mean. They
+        are flagged in st.rank_deficient and drawn hollow by the notebook figures.
+        Karcher mean (or extrinsic: quick look only, the tangent PCA is uncentred and
+        only unbiased at a Karcher mean) from the full-rank windows; log map at the
+        mean; PCA of the tangent vectors; geodesic distance to the mean; angle between
+        consecutive windows."""
         st = self._st(key)
-        if k is None:
-            if not hasattr(st, "k"):
-                raise RuntimeError("run choose_k() first or pass k=")
-            k = st.k
-        else:
-            k = int(k)
-            if k != getattr(st, "k", None):
-                st.k_rule_name = "given k=%d" % k
+        if not hasattr(st, "k"):
+            raise RuntimeError("run choose_k() first (override with choose_k(k_fixed(K)))")
+        k = int(st.k)
         if k > st.eigvecs.shape[2]:
             raise ValueError("k=%d > k_store=%d; rerun window_spectra with a larger k_store" % (k, st.eigvecs.shape[2]))
-        tot = np.where(np.isfinite(st.total_variance), st.total_variance, 0)
-        lam_k = st.eigvals[:, k - 1] if st.eigvals.shape[1] >= k else np.full(len(tot), np.nan)
-        valid = st.valid & (st.rank >= k) & np.isfinite(lam_k) & (lam_k > 1e-8 * tot)
+        # st.rank counts the eigenvalues above 1e-8 of the window's total variance (the
+        # threshold the old lam_k test used); windows with no spikes (rank 0) have no range
+        valid = st.valid & (st.rank >= 1)
         idx = np.flatnonzero(valid)
-        if len(idx) < 2:
-            raise ValueError("fewer than 2 windows have rank >= k=%d" % k)
+        r_of = np.minimum(st.rank[idx], k)
+        is_full = r_of >= k
+        if int(is_full.sum()) < 2:
+            raise ValueError("fewer than 2 windows have rank >= k=%d; lower k" % k)
         t = time.time()
         U = st.eigvecs[idx][:, :, :k].astype(np.float64)
-        U, _ = np.linalg.qr(U)                                     # re-orthonormalise (batched)
+        Q, _ = np.linalg.qr(U[is_full])                            # re-orthonormalise (batched)
+        U[is_full] = Q
+        Uf = U[is_full]                                            # the mean is estimated from these
 
         if mean not in ("karcher", "extrinsic"):
             raise ValueError("mean must be 'karcher' or 'extrinsic'")
@@ -953,11 +1014,22 @@ class RiemannSpikingAnalysis:
             self._say("Gr mean read from cache %s" % cache)
         else:
             if mean == "karcher":
-                mu, hist = karcher_mean(U, k, n_iter=karcher_iters, tol=karcher_tol, chunk=chunk)
+                mu, hist = karcher_mean(Uf, k, n_iter=karcher_iters, tol=karcher_tol, chunk=chunk)
             else:
-                mu, hist = extrinsic_mean(U, k), []
+                mu, hist = extrinsic_mean(Uf, k), []
             if cache is not None:
                 np.savez(cache, mu=mu, hist=np.asarray(hist, dtype=float))
+
+        # rank-deficient windows: keep the r directions they pin down, complete with the
+        # mean's directions orthogonal to them (the closest k-plane containing their range)
+        for r in np.unique(r_of[~is_full]):
+            sel = np.flatnonzero(~is_full & (r_of == r))
+            Ur, _ = np.linalg.qr(U[sel][:, :, :r])                        # (m, N, r)
+            R = mu[None] - Ur @ (np.swapaxes(Ur, 1, 2) @ mu[None])        # (I - Ur Ur^T) mu, (m, N, k)
+            W = np.linalg.svd(R, full_matrices=False)[0][:, :, :k - r]    # top k-r left singular vectors
+            U[sel] = np.concatenate([Ur, W], axis=2)
+        rank_deficient = np.zeros(len(st.windows), dtype=bool)
+        rank_deficient[idx[~is_full]] = True
 
         N = U.shape[1]
         Delta = np.empty_like(U)
@@ -987,6 +1059,7 @@ class RiemannSpikingAnalysis:
 
         st.k = k
         st.grassmann_idx = idx
+        st.rank_deficient = rank_deficient
         st.U = U
         st.mu = mu
         st.mean_type = mean
@@ -998,8 +1071,10 @@ class RiemannSpikingAnalysis:
         st.tangent_var_ratio = var_ratio
         st.velocity = vel
 
-        self._say("Gr(%d, %d) for %r in %.1fs: %d of %d windows (rank >= k)" %
-                  (k, N, st.key, time.time() - t, len(idx), len(st.windows)))
+        self._say("Gr(%d, %d) for %r in %.1fs: %d of %d windows placed; %d of rank >= k, %d of lower rank"
+                  " completed with the mean's directions"
+                  % (k, N, st.key, time.time() - t, len(idx), len(st.windows),
+                     int(is_full.sum()), int((~is_full).sum())))
         if hist:
             self._say("  Karcher mean: %d iterations, final gradient norm %.2e%s"
                       % (len(hist), hist[-1],
@@ -1077,13 +1152,15 @@ class RiemannSpikingAnalysis:
         if hasattr(st, "windows"):
             s.update({"windows": len(st.windows), "valid_windows": int(st.valid.sum()),
                       "median_rank": int(np.median(st.rank)),
-                      "median_PR": float(np.median(st.participation_ratio[st.valid])),
-                      "median_elbow": float(np.median(st.elbow_per_window[st.valid]))})
+                      "median_PR": float(np.median(st.participation_ratio[st.valid]))})
         if hasattr(st, "k"):
             s["k"] = st.k
             s["k_rule"] = getattr(st, "k_rule_name", "")
+            if hasattr(st, "k_per_window") and np.isfinite(st.k_per_window).any():
+                s["median_k_per_window"] = float(np.nanmedian(st.k_per_window))
         if hasattr(st, "mu"):
             s.update({"windows_on_Gr": len(st.grassmann_idx),
+                      "n_rank_deficient": int(st.rank_deficient.sum()),
                       "median_dist_to_mean_rad": float(np.nanmedian(st.distance)),
                       "tangent_PC_var": ", ".join("%.2f" % v for v in st.tangent_var_ratio),
                       "median_velocity_rad": float(np.nanmedian(st.velocity))})
