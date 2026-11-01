@@ -1,0 +1,1 @@
+This methos uses the binarization methods

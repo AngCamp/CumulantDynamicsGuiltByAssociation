@@ -31,7 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from neurosim import (BackgroundInput, DriveStimulus, GaussianTuning, LIFPopulation,
+from Hydrangea_demo.Validating_Hybrid_Dynamics.Simulations_drafts.HippocampusSim.neurosim import (BackgroundInput, DriveStimulus, GaussianTuning, LIFPopulation,
                       Oscillator, PoissonEvents, Projection, SpikeRecorder, SpikeTrace,
                       StateMachine, StateParams, Stimulus, covariance_fc, smoothed_rate,
                       tuning_curve)
