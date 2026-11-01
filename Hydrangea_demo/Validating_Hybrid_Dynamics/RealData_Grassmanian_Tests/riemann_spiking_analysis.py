@@ -65,6 +65,7 @@ __all__ = [
     "load_alm_000363", "load_hp_001695",
     "zscore_units", "identity", "sqrt_counts", "keep_all",
     "k_global_elbow", "k_median_elbow", "k_fixed", "elbow_index", "global_spectrum",
+    "participation_ratio", "spectral_entropy",
     "intervals_by_column", "session_key_from_path",
     "principal_angles", "geodesic_distance", "grassmann_log", "grassmann_exp",
     "extrinsic_mean", "karcher_mean",
@@ -254,6 +255,27 @@ def k_fixed(K):
         return int(K), np.full(int(st.valid.sum()), int(K), dtype=int)
     rule.__name__ = "fixed(K=%d)" % K
     return rule
+
+
+def participation_ratio(lam, axis=-1):
+    """(sum lambda)^2 / sum lambda^2 along `axis`; NaN where the sum is 0."""
+    lam = np.asarray(lam, dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s1 = np.nansum(lam, axis=axis)
+        s2 = np.nansum(lam ** 2, axis=axis)
+        return np.where(s2 > 0, s1 ** 2 / np.where(s2 > 0, s2, 1.0), np.nan)
+
+
+def spectral_entropy(lam, axis=-1):
+    """Shannon entropy -sum p ln p (nats) of p = lambda / sum lambda along `axis`;
+    exp(entropy) is an effective dimension comparable to the participation ratio."""
+    lam = np.asarray(lam, dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        tot = np.nansum(lam, axis=axis, keepdims=True)
+        p = np.where(tot > 0, lam / np.where(tot > 0, tot, 1.0), 0.0)
+        p = np.where(np.isfinite(p) & (p > 0), p, 0.0)
+        h = -np.sum(np.where(p > 0, p * np.log(np.where(p > 0, p, 1.0)), 0.0), axis=axis)
+        return np.where(np.squeeze(tot, axis=axis) > 0, h, np.nan)
 
 
 def intervals_by_column(trials, col, start="start_time", stop="stop_time"):
@@ -844,6 +866,171 @@ class RiemannSpikingAnalysis:
                   % (st.X.shape[0], st.X.shape[1], self.count_bin_ms, st.X.shape[0] * dt / 60,
                      self._fname(self.count_transform), self._fname(self.normalize)))
         return st
+
+    # ------------------------------------- 0. timescale sweep (preprocessing)
+    def timescale_sweep(self, timesteps_ms=(10, 30, 50, 100, 150, 200, 250),
+                        windows_ms=(250, 200, 150, 100, 50, 30), min_samples=3,
+                        mollify_ms=10.0, key=None, mem_budget_mb=256):
+        """How the timescale choices change the picture, before any Grassmannian run
+        (pipeline_edit_prompt.md, E0). Everything computed is kept on st.sweep.
+
+        Spikes of the prepared session (same units, same segments as prepare()) are
+        counted at `mollify_ms` inside every segment; each timestep is a sum of
+        consecutive mollifier bins (the trailing remainder of a segment is dropped);
+        counts go through count_transform and normalize exactly as the pipeline's X.
+
+        Per timestep (st.sweep.glob[timestep_ms], the "global" row): the covariance of
+        ALL bins (full rank), its eigenvalues / eigenvectors / explained variance,
+        participation ratio, spectral entropy, the elbow k, the scores of every bin
+        on every eigenvector (bins x N, float32), and the two instantaneous Lipschitz
+        quotients of the trajectory on the top-k PCs, NaN across a segment edge:
+            speed(t) = |x(t) - x(t - dt)| / dt,   accel(t) = |x(t+dt) - 2x(t) + x(t-dt)| / dt^2
+
+        Per (window_ms, timestep_ms) cell (st.sweep.local): windows of floor(W/dt)
+        samples moved forward by one sample, inside one segment, computed when that
+        is >= min_samples (2 samples give rank 1 and a participation ratio of 1 by
+        construction); per window all eigenvalues (Gram route), participation ratio,
+        spectral entropy, and the largest speed / acceleration quotient inside it.
+        st.sweep.grid summarises every cell (one row each, 'global' included).
+        """
+        st = self._st(key)
+        timesteps_ms = [float(d) for d in timesteps_ms]
+        windows_ms = [float(w) for w in windows_ms]
+        mollify_ms = float(mollify_ms)
+        dt0 = mollify_ms / 1000.0
+        t_all = time.time()
+
+        # 1. mollified counts, one block per segment
+        spikes = [np.asarray(s, dtype=float) for s in st.units["spike_times"]]
+        N = len(spikes)
+        blocks, seg_info = [], []
+        for si, (s, e) in enumerate(st.segments):
+            n = int(np.floor((e - s) / dt0 + 1e-9))
+            if n < 1:
+                continue
+            blocks.append(_bin_segment(spikes, s, n, dt0))
+            seg_info.append((si, float(s)))
+        if not blocks:
+            raise ValueError("no segment is at least one mollifier bin long")
+        sw = SimpleNamespace(timesteps_ms=timesteps_ms, windows_ms=windows_ms, min_samples=int(min_samples),
+                             mollify_ms=mollify_ms, glob={}, local={}, k={})
+        rows = []
+        self._say("timescale sweep for %r: %d units, %d segments, mollifier %g ms"
+                  % (st.key, N, len(blocks), mollify_ms))
+        for d_ms in timesteps_ms:
+            f = int(round(d_ms / mollify_ms))
+            if f < 1 or abs(f * mollify_ms - d_ms) > 1e-9:
+                raise ValueError("timestep %g ms is not a multiple of mollify_ms=%g ms" % (d_ms, mollify_ms))
+            dt = d_ms / 1000.0
+            t = time.time()
+            # 2. counts at this timestep: consecutive mollifier bins summed inside each segment
+            cnt, centers, segs = [], [], []
+            for blk, (si, s) in zip(blocks, seg_info):
+                n = blk.shape[0] // f
+                if n < 1:
+                    continue
+                cnt.append(blk[:n * f].reshape(n, f, N).sum(axis=1, dtype=np.int64).astype(np.float32))
+                centers.append(s + dt * (np.arange(n) + 0.5))
+                segs.append(np.full(n, si, dtype=np.int64))
+            if not cnt:
+                raise ValueError("no segment holds one bin of %g ms" % d_ms)
+            counts = np.concatenate(cnt, axis=0)
+            X = np.ascontiguousarray(np.asarray(self.normalize(self.count_transform(counts)), dtype=np.float32))
+            t_center = np.concatenate(centers)
+            seg = np.concatenate(segs)
+            T = X.shape[0]
+            # 3. global PCA at this timestep
+            mu = X.mean(axis=0, dtype=np.float64)
+            C = np.zeros((N, N))
+            for a in range(0, T, 50000):
+                Z = X[a:a + 50000].astype(np.float64) - mu
+                C += Z.T @ Z
+            C /= max(T - 1, 1)
+            lam, V = np.linalg.eigh(C)
+            lam = np.clip(lam[::-1], 0, None)
+            V = np.ascontiguousarray(V[:, ::-1])
+            tot = float(lam.sum())
+            evr = lam / tot if tot > 0 else np.full_like(lam, np.nan)
+            k = max(1, elbow_index(evr))
+            scores = np.empty((T, N), dtype=np.float32)
+            for a in range(0, T, 50000):
+                scores[a:a + 50000] = ((X[a:a + 50000].astype(np.float64) - mu) @ V).astype(np.float32)
+            # 4. Lipschitz quotients of the trajectory on the top-k global PCs, never across a segment edge
+            x = scores[:, :k].astype(np.float64)
+            same_prev = np.r_[False, seg[1:] == seg[:-1]]
+            same_next = np.r_[seg[:-1] == seg[1:], False]
+            speed = np.full(T, np.nan)
+            if T > 1:
+                speed[1:] = np.linalg.norm(x[1:] - x[:-1], axis=1) / dt
+            speed[~same_prev] = np.nan
+            accel = np.full(T, np.nan)
+            if T > 2:
+                accel[1:-1] = np.linalg.norm(x[2:] - 2 * x[1:-1] + x[:-2], axis=1) / dt ** 2
+            accel[~(same_prev & same_next)] = np.nan
+            g = SimpleNamespace(timestep_ms=d_ms, n_bins=T, N=N, t_center=t_center, seg=seg,
+                                eigvals=lam, eigvecs=V, evr=evr,
+                                participation_ratio=float(participation_ratio(lam)),
+                                entropy=float(spectral_entropy(lam)), k=int(k),
+                                scores=scores, speed=speed, accel=accel)
+            sw.glob[d_ms] = g
+            sw.k[d_ms] = int(k)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                rows.append(dict(row="global", window_ms=np.inf, timestep_ms=d_ms, n_samples=T,
+                                 window_ms_actual=np.nan, n_windows=1, k=int(k),
+                                 median_pr=g.participation_ratio, median_entropy=g.entropy,
+                                 median_lipschitz_speed=float(np.nanmedian(speed)),
+                                 median_lipschitz_accel=float(np.nanmedian(accel))))
+            self._say("  %6g ms: %7d bins | global PCA: k = %2d, PR %.1f, entropy %.2f" %
+                      (d_ms, T, k, g.participation_ratio, g.entropy))
+            # 5. local windows of every length, moved forward by one sample
+            seg_ids, seg_first, seg_count = np.unique(seg, return_index=True, return_counts=True)
+            for w_ms in windows_ms:
+                L = int(np.floor(w_ms / d_ms + 1e-9))
+                if L < sw.min_samples:
+                    continue
+                parts = [b0 + np.arange(n - L + 1) for b0, n in zip(seg_first, seg_count) if n >= L]
+                if not parts:
+                    continue
+                starts = np.concatenate(parts).astype(np.int64)
+                n_win = len(starts)
+                eig = np.empty((n_win, L), dtype=np.float32)
+                chunk = max(1, int(mem_budget_mb * 2 ** 20 // (8 * L * N * 3)))
+                for a in range(0, n_win, chunk):
+                    ss = starts[a:a + chunk]
+                    Xw = X[ss[:, None] + np.arange(L)[None, :]].astype(np.float64)
+                    Xw -= Xw.mean(axis=1, keepdims=True)
+                    w = np.linalg.eigvalsh(Xw @ np.swapaxes(Xw, 1, 2))[:, ::-1]
+                    eig[a:a + chunk] = (np.clip(w, 0, None) / max(L - 1, 1)).astype(np.float32)
+                e64 = eig.astype(np.float64)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    lip_s = np.nanmax(speed[starts[:, None] + np.arange(1, L)[None, :]], axis=1)
+                    lip_a = (np.nanmax(accel[starts[:, None] + np.arange(1, L - 1)[None, :]], axis=1)
+                             if L >= 3 else np.full(n_win, np.nan))
+                loc = SimpleNamespace(window_ms=w_ms, timestep_ms=d_ms, n_samples=L, window_ms_actual=L * d_ms,
+                                      start=starts, t_center=0.5 * (t_center[starts] + t_center[starts + L - 1]),
+                                      seg=seg[starts], eigvals=eig,
+                                      participation_ratio=participation_ratio(e64),
+                                      entropy=spectral_entropy(e64),
+                                      lipschitz_speed=lip_s, lipschitz_accel=lip_a)
+                sw.local[(w_ms, d_ms)] = loc
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    rows.append(dict(row="%g ms" % w_ms, window_ms=w_ms, timestep_ms=d_ms, n_samples=L,
+                                     window_ms_actual=L * d_ms, n_windows=n_win, k=int(k),
+                                     median_pr=float(np.nanmedian(loc.participation_ratio)),
+                                     median_entropy=float(np.nanmedian(loc.entropy)),
+                                     median_lipschitz_speed=float(np.nanmedian(lip_s)),
+                                     median_lipschitz_accel=float(np.nanmedian(lip_a))))
+                self._say("      window %4g ms = %2d samples: %7d windows, median PR %.2f" %
+                          (w_ms, L, n_win, rows[-1]["median_pr"]))
+            self._say("    (%.1fs)" % (time.time() - t))
+        sw.grid = pd.DataFrame(rows)
+        st.sweep = sw
+        self._say("timescale sweep done in %.1fs: %d global PCAs, %d local cells"
+                  % (time.time() - t_all, len(sw.glob), len(sw.local)))
+        return sw
 
     # ------------------------------------------- 2. windowed eigenspectra
     def window_spectra(self, key=None, mem_budget_mb=256, min_eig_frac=1e-8):
