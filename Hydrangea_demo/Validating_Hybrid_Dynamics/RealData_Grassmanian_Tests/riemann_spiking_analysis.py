@@ -10,10 +10,13 @@ Standardised pipeline shared by the real-data Grassmannian notebooks
                      -> per-neuron normalisation        (z-score across all retained bins)
                      -> one covariance per window       (mollification_bin_ms = window length)
                         and its full eigendecomposition
-                     -> k selection                     (median elbow of the explained-variance
-                                                         curves, or a fixed k)
+                     -> k selection                     (a k_rule: elbow of the global covariance,
+                                                         median of per-window elbows, or fixed)
                      -> points U_w in Gr(k, N): Karcher mean, log map, tangent PCA
-                     -> sphere / tangent-plane / timeline figure
+
+This module only computes. Figures are built in the notebooks from `obj.state()`,
+the per-session namespace holding X, the windows, the spectra, k and the Gr(k, N)
+fit, so plot code can be changed with the data in memory.
 
 Every preprocessing decision is a *function handed to the object*, so the
 notebook decides what is done; the only dataset-specific code is the loaders.
@@ -39,9 +42,8 @@ Typical use (see the notebooks):
                                  normalize=zscore_units, k_rule=k_median_elbow())
     obj.add_session("alm", loader=load_alm_000363, asset=asset, h5=h5f, nwb=nwb)
     obj.load("alm"); obj.status()
-    obj.prepare(); obj.window_spectra(); obj.choose_k()
-    obj.plot_participation_ratio(); obj.plot_explained_variance(); obj.plot_eigenvalue_spectra()
-    obj.fit_grassmann(); obj.plot_grassmann()
+    obj.prepare(); obj.window_spectra(); obj.choose_k(); obj.fit_grassmann()
+    st = obj.state()            # -> the notebook's plot functions read from here
 """
 
 from __future__ import annotations
@@ -57,9 +59,6 @@ from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
-from matplotlib.lines import Line2D
 
 __all__ = [
     "RiemannSpikingAnalysis", "SessionRecord",
@@ -484,8 +483,7 @@ class RiemannSpikingAnalysis:
                  mollification_step_ms=None, unit_filter=keep_all, trial_filter=keep_all,
                  count_transform=identity, normalize=zscore_units, k_rule=None,
                  k_store=15, center_windows=True, t_range=None, verbose=True,
-                 output_dir=None, run_name=None, session_cache_dir=None, use_cache=True,
-                 save_figures=False):
+                 output_dir=None, run_name=None, session_cache_dir=None, use_cache=True):
         if mode not in ("trials", "full"):
             raise ValueError("mode must be 'trials' or 'full'")
         self.mode = mode
@@ -508,7 +506,6 @@ class RiemannSpikingAnalysis:
         self.output_dir = None if output_dir is None else Path(output_dir)
         self.session_cache_dir = None if session_cache_dir is None else Path(session_cache_dir)
         self.use_cache = bool(use_cache)
-        self.save_figures = bool(save_figures)    # off by default: figures only display
         self.session_data: dict[str, SessionRecord] = {}
         self.analysis: dict[str, SimpleNamespace] = {}
         self.active: Optional[str] = None
@@ -521,18 +518,6 @@ class RiemannSpikingAnalysis:
     @staticmethod
     def _fname(f):
         return getattr(f, "__name__", repr(f))
-
-    def _save_fig(self, fig, name, key):
-        """Save a figure as <output_dir>/<session>/<name>.png. No-op unless
-        save_figures=True and output_dir is set."""
-        if not self.save_figures or self.output_dir is None or not name:
-            return None
-        d = self.output_dir / str(key)
-        d.mkdir(parents=True, exist_ok=True)
-        path = d / ("%s.png" % name)
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        self._say("  saved figure:", path)
-        return path
 
     def _t_range_desc(self):
         """t_range as a short JSON-able description (an interval array is summarised + hashed)."""
@@ -555,8 +540,7 @@ class RiemannSpikingAnalysis:
                 "count_transform": self._fname(self.count_transform), "normalize": self._fname(self.normalize),
                 "k_rule": self._fname(self.k_rule), "k_store": self.k_store,
                 "center_windows": self.center_windows,
-                "output_dir": None if self.output_dir is None else str(self.output_dir),
-                "save_figures": self.save_figures}
+                "output_dir": None if self.output_dir is None else str(self.output_dir)}
 
     # ------------------------------------------------------------- caches
     def _data_hash(self, st):
@@ -567,7 +551,7 @@ class RiemannSpikingAnalysis:
         import hashlib
         h = hashlib.sha1()
         cfg = {k: v for k, v in self.config().items()
-               if k not in ("run_name", "output_dir", "save_figures", "k_rule")}
+               if k not in ("run_name", "output_dir", "k_rule")}
         h.update(json.dumps(cfg, sort_keys=True, default=str).encode())
         h.update(np.asarray(st.units["unit_id"].astype(str).values).astype("U").tobytes())
         h.update(np.ascontiguousarray(st.segments, dtype=np.float64).tobytes())
@@ -589,8 +573,6 @@ class RiemannSpikingAnalysis:
         print("RiemannSpikingAnalysis", "| run_name = %r" % self.run_name)
         print("  run cache (spectra, Gr fit):", self.output_dir if self.use_cache else "off")
         print("  session cache (loaded data):", self.session_cache_dir if self.use_cache else "off")
-        print("  figures                     : display only" if not self.save_figures
-              else "  figures                     : displayed and saved to output_dir")
         print("  mode                  :", self.mode,
               "" if self.mode == "trials" else "(t_range=%r)" % (self._t_range_desc(),))
         print("  count_bin_ms          :", self.count_bin_ms)
@@ -743,6 +725,11 @@ class RiemannSpikingAnalysis:
         if rec.key not in self.analysis:
             raise RuntimeError("session %r: run prepare() first" % rec.key)
         return self.analysis[rec.key]
+
+    def state(self, key=None):
+        """The analysis namespace of a session (default: the active one): units, X,
+        windows, spectra, k, the Gr(k, N) fit ... everything the notebook figures read."""
+        return self._st(key)
 
     # ------------------------------------------------- 1. units, bins, X
     def prepare(self, key=None):
@@ -928,102 +915,6 @@ class RiemannSpikingAnalysis:
                   " variance in top k: %.1f%%" % (st.k, st.k_rule_name, q[1], q[0], q[2], 100 * cum))
         return st.k
 
-    # ------------------------------------------------------- spectrum plots
-    def plot_participation_ratio(self, key=None, bins=40, ax=None, save_as="participation_ratio"):
-        """Histogram of the participation ratio (sum lambda)^2 / sum lambda^2 over windows."""
-        st = self._st(key)
-        pr = st.participation_ratio[st.valid]
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(6, 3.5))
-        ax.hist(pr, bins=bins, color="0.55", edgecolor="white")
-        med = np.median(pr)
-        ax.axvline(med, color="k", ls="--", lw=1.2, label="median = %.1f" % med)
-        ax.axvline(np.percentile(pr, 25), color="0.3", ls=":", lw=0.8)
-        ax.axvline(np.percentile(pr, 75), color="0.3", ls=":", lw=0.8, label="quartiles")
-        if hasattr(st, "k"):
-            ax.axvline(st.k, color="tab:red", lw=1, label="k = %d" % st.k)
-        ax.set_xlabel("participation ratio of the window covariance")
-        ax.set_ylabel("windows")
-        ax.set_title("%s: participation ratio, %d windows" % (st.key, len(pr)), fontsize=10)
-        ax.legend(fontsize=8, frameon=False)
-        plt.tight_layout()
-        self._save_fig(ax.figure, save_as, st.key)
-        return ax
-
-    def plot_explained_variance(self, key=None, n_show=10, ax=None, save_as="explained_variance"):
-        """Violin per component of lambda_i / sum(lambda) across windows (descending
-        order, NOT cumulative); medians marked and traced by a line."""
-        st = self._st(key)
-        evr = st.evr[st.valid]
-        n_show = int(min(n_show, evr.shape[1]))
-        data = [evr[:, i][np.isfinite(evr[:, i])] for i in range(n_show)]
-        n_show = sum(len(d) >= 2 for d in data)          # drop components no window reaches
-        data = data[:n_show]
-        pos = np.arange(1, n_show + 1)
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(8, 4))
-        parts = ax.violinplot(data, positions=pos, widths=0.85, showmeans=False,
-                              showmedians=False, showextrema=False)
-        for b in parts["bodies"]:
-            b.set_facecolor("tab:blue"); b.set_edgecolor("none"); b.set_alpha(0.35)
-        med = np.array([np.median(d) for d in data])
-        ax.plot(pos, med, "o-", color="k", ms=4, lw=1.2, label="median across windows")
-        if hasattr(st, "k"):
-            ax.axvline(st.k + 0.5, color="tab:red", ls="--", lw=1, label="k = %d" % st.k)
-        ax.set_xticks(pos)
-        ax.set_xlabel("eigenvector rank (largest eigenvalue first)")
-        ax.set_ylabel("explained variance  $\\lambda_i / \\sum_j \\lambda_j$")
-        ax.set_title("%s: explained variance of the top %d components, %d windows"
-                     % (st.key, n_show, len(evr)), fontsize=10)
-        ax.legend(fontsize=8, frameon=False)
-        plt.tight_layout()
-        self._save_fig(ax.figure, save_as, st.key)
-        return ax
-
-    def plot_eigenvalue_spectra(self, key=None, max_lines=3000, log=True, ax=None, save_as="eigenvalue_spectra"):
-        """Raw eigenvalues over all dimensions: one line per window, coloured by
-        window time, median spectrum in black."""
-        st = self._st(key)
-        ok = np.flatnonzero(st.valid)
-        if len(ok) > max_lines:
-            ok = ok[np.linspace(0, len(ok) - 1, max_lines).astype(int)]
-        ev = st.eigvals[ok]
-        tt = st.windows["t_center"].values[ok]
-        x = np.arange(1, ev.shape[1] + 1)
-        if log:   # numerically-zero eigenvalues (rank-deficient windows) are not drawn
-            floor = 1e-10 * np.nanmax(ev, axis=1, keepdims=True)
-            ev = np.where(ev > floor, ev, np.nan)
-        segs = [np.column_stack([x[np.isfinite(r)], r[np.isfinite(r)]]) for r in ev]
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(8, 4))
-        lc = LineCollection(segs, cmap="viridis", linewidths=0.4, alpha=0.35)
-        lc.set_array(tt)
-        ax.add_collection(lc)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            med = np.nanmedian(st.eigvals[st.valid], axis=0)
-        if log:
-            med = np.where(med > 1e-10 * np.nanmax(med), med, np.nan)
-        ax.plot(x, med, color="k", lw=1.5, label="median spectrum")
-        if hasattr(st, "k"):
-            ax.axvline(st.k, color="tab:red", ls="--", lw=1, label="k = %d" % st.k)
-        ax.set_xlim(1, ev.shape[1])
-        finite = ev[np.isfinite(ev)]
-        if finite.size:
-            ax.set_ylim(finite.min() * 0.8, finite.max() * 1.2)
-        if log:
-            ax.set_yscale("log")
-        ax.set_xlabel("component (all %d dimensions of the window covariance)" % ev.shape[1])
-        ax.set_ylabel("eigenvalue" + (" (log; zeros not drawn)" if log else ""))
-        ax.set_title("%s: eigenvalue spectrum of every window (%d of %d shown)"
-                     % (st.key, len(ok), int(st.valid.sum())), fontsize=10)
-        cb = plt.colorbar(lc, ax=ax, pad=0.01)
-        cb.set_label("window time (s)")
-        ax.legend(fontsize=8, frameon=False, loc="upper right")
-        plt.tight_layout()
-        self._save_fig(ax.figure, save_as, st.key)
-        return ax
-
     # ------------------------------------------------- 4. Gr(k, N) embedding
     def fit_grassmann(self, k=None, mean="karcher", n_tangent_pcs=3, karcher_iters=50,
                       karcher_tol=1e-6, chunk=4000, key=None):
@@ -1148,7 +1039,7 @@ class RiemannSpikingAnalysis:
         number per window, NaN where fewer than min_samples samples fall in it.
         agg: "mean" (vectorised), "median", "max" or "min". Use it to turn
         running speed, LFP band power, pupil size ... into a colour for
-        plot_grassmann(values=) / plot_tangent_grid()."""
+        the notebook's plot_grassmann(obj, values=) / plot_tangent_grid(obj, ...)."""
         st = self._st(key)
         t = np.asarray(times, dtype=float).ravel()
         v = np.asarray(values, dtype=float).ravel()
@@ -1174,242 +1065,6 @@ class RiemannSpikingAnalysis:
         else:
             raise ValueError("agg must be 'mean', 'median', 'max' or 'min'")
         return out
-
-    # -------------------------------------------------------- 5. the figure
-    def plot_grassmann(self, key=None, labels=None, values=None, values_label="", values_cmap="magma",
-                       values_clip=(2, 98), view=(28, -55), connect="auto",
-                       cmap="viridis", max_sphere_lines=600, figsize=(15, 11), title=None,
-                       save_as="grassmann"):
-        """Sphere view + tangent plane + timeline (as in the Gr(3,1) demo).
-
-        The tangent space at the Karcher mean has dimension k(N-k); the figure
-        shows its top-2 principal directions. Sphere: each window's 2-D tangent
-        coordinates are wrapped onto a unit sphere by the exponential map at the
-        pole (= Karcher mean), with the polar angle equal to the projected
-        tangent norm / sqrt(k) (an RMS principal angle), so the equator is the
-        largest distance Gr(k, N) allows. Plane: the same coordinates flat.
-        Colour: by time (default); `labels` = one categorical label per window
-        (see window_labels()); `values` = one number per window (see
-        window_values()), colour limits at the `values_clip` percentiles, NaN
-        drawn grey.
-        """
-        from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
-
-        st = self._st(key)
-        if not hasattr(st, "mu"):
-            raise RuntimeError("run fit_grassmann() first")
-        idx = st.grassmann_idx
-        k = st.k
-        C = st.tangent_coords[idx, :2]
-        tt = st.windows["t_center"].values
-        seg = st.windows["seg"].values
-
-        # colours
-        color_label = "window time (s)"
-        order = np.arange(len(idx))
-        if values is not None:
-            values = np.asarray(values, dtype=float).ravel()
-            if len(values) != len(st.windows):
-                raise ValueError("values must have one entry per window (%d)" % len(st.windows))
-            fin = np.isfinite(values)
-            lo, hi = (np.nanpercentile(values[fin], values_clip) if fin.any() else (0.0, 1.0))
-            if not hi > lo:
-                hi = lo + 1e-12
-            norm = plt.Normalize(lo, hi)
-            cm = plt.get_cmap(values_cmap)
-            colors = np.tile(np.array([0.82, 0.82, 0.82, 1.0]), (len(values), 1))     # grey = no data
-            colors[fin] = cm(norm(values[fin]))
-            legend_handles = None
-            color_label = (values_label or "value") + ("" if fin.all() else "   (grey: no data)")
-            order = np.argsort(fin[idx], kind="stable")                                # grey drawn first
-        elif labels is None:
-            norm = plt.Normalize(tt.min(), tt.max())
-            cm = plt.get_cmap(cmap)
-            colors = cm(norm(tt))
-            legend_handles = None
-        else:
-            labels = np.asarray(labels, dtype=object)
-            if len(labels) != len(st.windows):
-                raise ValueError("labels must have one entry per window (%d)" % len(st.windows))
-            cats = list(dict.fromkeys(labels.tolist()))
-            pal = plt.get_cmap("tab10" if len(cats) <= 10 else "tab20")
-            cmap_cat = {c: pal(i % pal.N) for i, c in enumerate(cats)}
-            colors = np.array([cmap_cat[l] for l in labels])
-            legend_handles = [Line2D([0], [0], marker="o", ls="", color=cmap_cat[c], label=str(c)) for c in cats]
-
-        fig = plt.figure(figsize=figsize)
-        gs = fig.add_gridspec(3, 2, height_ratios=[4, 0.35, 1.1], width_ratios=[1, 1], hspace=0.35, wspace=0.15)
-        ax3 = fig.add_subplot(gs[0, 0], projection="3d")
-        ax2 = fig.add_subplot(gs[0, 1])
-        axs = fig.add_subplot(gs[1, :])
-        axv = fig.add_subplot(gs[2, :], sharex=axs)
-
-        # ---- sphere: exp map of the 2-D tangent coordinates at the pole
-        sk = np.sqrt(k)
-        r = np.linalg.norm(C, axis=1)
-        theta = np.minimum(r / sk, np.pi / 2)
-        phi = np.arctan2(C[:, 1], C[:, 0])
-        P = np.column_stack([np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)])
-        Q = np.column_stack([C[:, 0] / sk, C[:, 1] / sk, np.ones(len(C))])     # on the tangent plane z = 1
-        hw = max(0.35, 1.08 * np.abs(Q[:, :2]).max())
-
-        uu = np.linspace(0, 2 * np.pi, 80)
-        vv = np.linspace(0, np.pi, 40)
-        ax3.plot_surface(np.outer(np.cos(uu), np.sin(vv)), np.outer(np.sin(uu), np.sin(vv)),
-                         np.outer(np.ones_like(uu), np.cos(vv)), color="0.9", alpha=0.18,
-                         linewidth=0, shade=False)
-        circ = np.linspace(0, 2 * np.pi, 200)
-        ax3.plot(np.cos(circ), np.sin(circ), np.zeros_like(circ), color="0.45", lw=0.7, ls="--")
-        for a in (0.0, np.pi / 2):                                            # two meridians
-            ax3.plot(np.cos(a) * np.sin(circ), np.sin(a) * np.sin(circ), np.cos(circ), color="0.8", lw=0.4)
-        plane = [[(-hw, -hw, 1), (hw, -hw, 1), (hw, hw, 1), (-hw, hw, 1)]]
-        ax3.add_collection3d(Poly3DCollection(plane, facecolors="0.6", edgecolors="0.35",
-                                              linewidths=0.8, alpha=0.18))
-        sub = np.arange(len(P))
-        if len(sub) > max_sphere_lines:
-            sub = np.linspace(0, len(P) - 1, max_sphere_lines).astype(int)
-        ax3.add_collection3d(Line3DCollection(np.stack([P[sub], Q[sub]], axis=1), colors="0.5",
-                                              linewidths=0.3, alpha=0.3))
-        ax3.scatter(Q[sub, 0], Q[sub, 1], Q[sub, 2], c=colors[idx][sub], s=4, alpha=0.5, depthshade=False)
-        ax3.scatter(P[order, 0], P[order, 1], P[order, 2], c=colors[idx][order], s=8, alpha=0.9, depthshade=False)
-        ax3.scatter([0], [0], [1], c="k", s=35, depthshade=False)
-        ax3.text(0.06, 0.06, 1.1, "Karcher mean", fontsize=9)
-        lim = max(1.15, hw * 1.05)
-        ax3.set_xlim(-lim, lim); ax3.set_ylim(-lim, lim); ax3.set_zlim(-1.1, max(1.2, hw * 0.3 + 1))
-        ax3.set_box_aspect((1, 1, 1))
-        ax3.view_init(elev=view[0], azim=view[1])
-        ax3.set_axis_off()
-        ax3.set_title("Gr(%d, %d) through the top-2 tangent directions\n"
-                      "exp map onto a sphere, pole = Karcher mean; dashed = max distance (all angles 90°)"
-                      % (k, st.U.shape[1]), fontsize=9)
-
-        # ---- tangent plane
-        if connect == "auto":
-            connect = len(idx) <= 3000
-        if connect:
-            same = (seg[idx][1:] == seg[idx][:-1]) & (np.diff(idx) == 1)
-            if same.any():
-                j = np.flatnonzero(same)
-                ax2.add_collection(LineCollection(np.stack([C[j], C[j + 1]], axis=1),
-                                                  colors="0.6", linewidths=0.4, alpha=0.5))
-        ax2.scatter(C[order, 0], C[order, 1], c=colors[idx][order], s=8, alpha=0.85, linewidths=0)
-        ax2.axhline(0, color="0.8", lw=0.8); ax2.axvline(0, color="0.8", lw=0.8)
-        ax2.plot(0, 0, "o", color="k", ms=6)
-        ax2.set_aspect("equal", adjustable="datalim")
-        vr = st.tangent_var_ratio
-        ax2.set_xlabel("tangent PC 1 (%.0f%% of tangent variance)" % (100 * vr[0]))
-        ax2.set_ylabel("tangent PC 2 (%.0f%%)" % (100 * (vr[1] if len(vr) > 1 else 0)))
-        ax2.set_title("Tangent space at the mean (log map), %d windows\norigin = mean subspace; "
-                      "radius in rad, max possible sqrt(k)·pi/2 = %.2f" % (len(idx), sk * np.pi / 2), fontsize=9)
-        if legend_handles is not None:
-            ax2.legend(handles=legend_handles, fontsize=8, frameon=False, loc="best")
-        else:
-            sm = plt.cm.ScalarMappable(norm=norm, cmap=cm)
-            sm.set_array([])
-            cb = plt.colorbar(sm, ax=ax2, pad=0.02, fraction=0.04)
-            cb.set_label(color_label)
-
-        # ---- timeline: label strip + angle between consecutive windows
-        t0, t1 = tt.min(), tt.max()
-        if values is not None:
-            width = float(np.nanmedian(np.diff(tt))) if len(tt) > 1 else 1.0
-            axs.bar(tt[fin], np.ones(int(fin.sum())), width=width, color=colors[fin], align="center", linewidth=0)
-            axs.set_yticks([]); axs.set_ylabel("value", fontsize=8, rotation=0, ha="right", va="center")
-        elif labels is None:
-            axs.imshow(np.linspace(0, 1, 512)[None, :], aspect="auto", cmap=cm,
-                       extent=[t0, t1, 0, 1], interpolation="nearest")
-            axs.set_yticks([]); axs.set_ylabel("time", fontsize=8, rotation=0, ha="right", va="center")
-        else:
-            w = st.windows
-            for cidx, c in enumerate(cats):
-                m = labels == c
-                if not m.any():
-                    continue
-                spans = _runs_to_spans(w["t_start"].values[m], w["t_stop"].values[m])
-                axs.broken_barh(spans, (0, 1), facecolors=cmap_cat[c], edgecolors="none")
-            axs.set_yticks([]); axs.set_ylabel("label", fontsize=8, rotation=0, ha="right", va="center")
-        axs.set_ylim(0, 1)
-        plt.setp(axs.get_xticklabels(), visible=False)
-
-        axv.plot(tt, st.velocity, color="0.25", lw=0.6)
-        axv.axhline(np.nanmedian(st.velocity), color="tab:red", lw=0.8, ls="--")
-        axv.set_xlim(t0, t1)
-        axv.set_xlabel("session time (s)")
-        axv.set_ylabel("angle between\nconsecutive windows (rad)", fontsize=8)
-        axv.set_title("Timeline: label strip (top) and subspace velocity, geodesic angle between consecutive windows "
-                      "(bottom; red dashed = median)", fontsize=9, loc="left")
-        if title is None:
-            title = "%s | %s mode | %g ms count bins, %s windows, k = %d (%s)" % (
-                st.key, self.mode, self.count_bin_ms,
-                "whole-trial" if self.mollification_bin_ms is None else "%g ms" % self.mollification_bin_ms,
-                k, getattr(st, "k_rule_name", "k given"))
-        if values is not None and values_label:
-            title += " | colour: %s" % values_label
-        if self.run_name:
-            title = "[%s] %s" % (self.run_name, title)
-        fig.suptitle(title, fontsize=11, y=0.995)
-        self._save_fig(fig, save_as, st.key)
-        return fig
-
-    def plot_tangent_grid(self, values, key=None, ncols=3, cmap="magma", clip=(2, 98), s=4,
-                          panel=(4.8, 4.3), save_as="tangent_grid"):
-        """Grid of tangent-plane views (same coordinates as plot_grassmann), each
-        coloured by one quantity. values: {name: per-window array}. Numeric
-        arrays get a colormap (limits at the `clip` percentiles, NaN = grey);
-        string/object arrays are categorical labels."""
-        st = self._st(key)
-        if not hasattr(st, "mu"):
-            raise RuntimeError("run fit_grassmann() first")
-        idx = st.grassmann_idx
-        C = st.tangent_coords[idx, :2]
-        names = list(values)
-        n = len(names)
-        if n == 0:
-            raise ValueError("values is empty")
-        ncols = max(1, min(int(ncols), n))
-        nrows = int(np.ceil(n / ncols))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(panel[0] * ncols, panel[1] * nrows), squeeze=False)
-        for ax in axes.ravel()[n:]:
-            ax.set_axis_off()
-        for ax, name in zip(axes.ravel(), names):
-            v = np.asarray(values[name])
-            if len(v) != len(st.windows):
-                raise ValueError("%r must have one entry per window (%d)" % (name, len(st.windows)))
-            ax.axhline(0, color="0.85", lw=0.8); ax.axvline(0, color="0.85", lw=0.8)
-            if v.dtype.kind in "OUSb":                                        # categorical
-                lab = v.astype(object)[idx]
-                cats = list(dict.fromkeys(lab.tolist()))
-                pal = plt.get_cmap("tab10" if len(cats) <= 10 else "tab20")
-                for i, c in enumerate(cats):
-                    m = lab == c
-                    ax.scatter(C[m, 0], C[m, 1], s=s, color=pal(i % pal.N), linewidths=0, alpha=0.8,
-                               label="%s (%d)" % (c, int(m.sum())))
-                ax.legend(fontsize=7, frameon=False, markerscale=3)
-            else:
-                v = v.astype(float)[idx]
-                fin = np.isfinite(v)
-                ax.scatter(C[~fin, 0], C[~fin, 1], s=s, color="0.82", linewidths=0)
-                if fin.any():
-                    lo, hi = np.nanpercentile(v[fin], clip)
-                    if not hi > lo:
-                        hi = lo + 1e-12
-                    sc = ax.scatter(C[fin, 0], C[fin, 1], c=v[fin], s=s, cmap=cmap, vmin=lo, vmax=hi,
-                                    linewidths=0, alpha=0.85)
-                    cb = plt.colorbar(sc, ax=ax, fraction=0.045, pad=0.02)
-                    cb.ax.tick_params(labelsize=7)
-                ax.text(0.02, 0.02, "%d of %d windows have data" % (int(fin.sum()), len(v)),
-                        transform=ax.transAxes, fontsize=7, color="0.4")
-            ax.plot(0, 0, "o", color="k", ms=4)
-            ax.set_aspect("equal", adjustable="datalim")
-            ax.set_title(name, fontsize=9)
-            ax.tick_params(labelsize=7)
-        vr = st.tangent_var_ratio
-        fig.suptitle("%s%s | tangent plane at the Karcher mean of Gr(%d, %d); PC1 %.0f%%, PC2 %.0f%% of tangent variance"
-                     % (("[%s] " % self.run_name) if self.run_name else "", st.key, st.k, st.U.shape[1],
-                        100 * vr[0], 100 * (vr[1] if len(vr) > 1 else 0)), fontsize=10)
-        fig.tight_layout()
-        self._save_fig(fig, save_as, st.key)
-        return fig
 
     # ----------------------------------------------------------- summary
     def summary(self, key=None):
@@ -1511,19 +1166,3 @@ def _scatter(values, idx, n):
     out = np.full((n,) + values.shape[1:], np.nan)
     out[idx] = values
     return out
-
-
-def _runs_to_spans(t_start, t_stop, gap=1e-9):
-    """Merge sorted, touching/overlapping [start, stop) intervals -> [(start, width)]."""
-    order = np.argsort(t_start)
-    s, e = t_start[order], t_stop[order]
-    spans = []
-    cs, ce = s[0], e[0]
-    for a, b in zip(s[1:], e[1:]):
-        if a <= ce + gap:
-            ce = max(ce, b)
-        else:
-            spans.append((cs, ce - cs))
-            cs, ce = a, b
-    spans.append((cs, ce - cs))
-    return spans
